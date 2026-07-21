@@ -44,6 +44,17 @@ def build_parser() -> argparse.ArgumentParser:
     # Backend and device
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
+    parser.add_argument(
+        "--kernel-cache-dir",
+        default=None,
+        help=(
+            "Directory of precompiled kernels to reuse across launches (Qwen3 only). "
+            "If unset, kernels are JIT-compiled and their device binaries built every launch. "
+            "If set: reuse kernels already cached there (skipping both the JIT and the ~30s "
+            "device-binary compile), and compile+store any that are missing. A pypto version "
+            "change invalidates the cache and triggers a rebuild."
+        ),
+    )
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
     parser.add_argument(
         "--devices",
@@ -144,6 +155,15 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         executor_kwargs["enable_mtp"] = args.enable_mtp
     elif args.enable_mtp:
         raise ValueError("--enable-mtp is only supported for DeepSeek V4")
+    if model_family != "deepseek_v4" and args.kernel_cache_dir:
+        cache_dir = Path(args.kernel_cache_dir).resolve()
+        if not cache_dir.exists() or not any(cache_dir.iterdir()):
+            print(
+                f"[kernel-cache] {cache_dir} is empty or missing; kernels will be compiled "
+                "this launch and stored there for reuse next time.",
+                flush=True,
+            )
+        executor_kwargs["kernel_cache_dir"] = str(cache_dir)
     parallel_config = ParallelConfig(
         data_parallel_size=args.data_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,

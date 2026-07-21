@@ -113,6 +113,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         device_ids: Sequence[int] = (0,),
         save_kernels_dir: str | None = None,
         pypto_root: str | None = None,
+        kernel_cache_dir: str | None = None,
     ) -> None:
         super().__init__(
             kv_cache_manager,
@@ -121,6 +122,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             save_kernels_dir=save_kernels_dir,
         )
         self._pypto_root = pypto_root
+        self._kernel_cache_dir = kernel_cache_dir
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -139,6 +141,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return Qwen314BModelRunner(
             compiled=compiled,
             device_id=self._device_ids[0],
+            kernel_cache_dir=self._kernel_cache_dir,
         )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
@@ -503,6 +506,19 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             block_dim=_QWEN14B_BLOCK_DIM,
             aicpu_thread_num=4,
         )
+        if self._kernel_cache_dir is not None:
+            cache_slot = Path(self._kernel_cache_dir) / name
+            cached = self._reuse_cached_kernel(name, cache_slot, distributed_config)
+            if cached is not None:
+                # output_dir points at the cache slot, which also holds the
+                # compiled device binaries (cache/*.bin + kernels/*.o); the L3
+                # worker's compile_and_assemble finds them and skips recompiling.
+                return _L3Callable(
+                    compiled=cached,
+                    name=name,
+                    block_dim=_QWEN14B_BLOCK_DIM,
+                    aicpu_thread_num=4,
+                )
         run_config = RunConfig(
             platform=config.platform,
             device_id=config.device_id,
@@ -528,6 +544,59 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             block_dim=_QWEN14B_BLOCK_DIM,
             aicpu_thread_num=4,
         )
+
+    #: Marker file in each cache slot recording the pypto version the kernel was
+    #: built with; a version change invalidates the slot (rebuild + restore).
+    KERNEL_CACHE_VERSION_FILE = "pypto_version.txt"
+
+    @staticmethod
+    def _pypto_version() -> str:
+        try:
+            import pypto  # noqa: PLC0415
+
+            return str(getattr(pypto, "__version__", "unknown"))
+        except Exception:
+            return "unknown"
+
+    def _reuse_cached_kernel(self, name, cache_slot, distributed_config):
+        """Reload a compiled kernel (IR + device binaries) from ``cache_slot``.
+
+        Returns a ``DistributedCompiledProgram`` whose ``output_dir`` is the
+        cache slot -- so the L3 worker reuses the cached ``cache/*.bin`` device
+        binaries and skips recompilation -- or ``None`` on miss/stale/error.
+        Reuse is best-effort and never fatal: any failure falls back to a fresh
+        compile.
+        """
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+
+        meta = cache_slot / "distributed_meta.json"
+        if not meta.exists():
+            print(f"[kernel-cache] MISS: {name} not cached under {cache_slot}; compiling", flush=True)
+            return None
+        version_file = cache_slot / self.KERNEL_CACHE_VERSION_FILE
+        cached_version = version_file.read_text().strip() if version_file.exists() else None
+        current_version = self._pypto_version()
+        if cached_version != current_version:
+            print(
+                f"[kernel-cache] STALE: {name} cached for pypto {cached_version!r} "
+                f"!= current {current_version!r}; recompiling",
+                flush=True,
+            )
+            return None
+        try:
+            compiled = DistributedCompiledProgram.from_dir(
+                str(cache_slot),
+                platform=self._platform,
+                distributed_config=distributed_config,
+            )
+            print(f"[kernel-cache] HIT: reused {name} from {cache_slot}", flush=True)
+            return compiled
+        except Exception as exc:  # noqa: BLE001 - reuse must never be fatal
+            print(
+                f"[kernel-cache] WARN: reuse of {name} failed ({type(exc).__name__}: {exc}); recompiling",
+                flush=True,
+            )
+            return None
 
     @staticmethod
     def _load_runtime_config(output_dir: Path) -> dict[str, Any]:

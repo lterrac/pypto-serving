@@ -159,10 +159,12 @@ class Qwen314BModelRunner(ModelRunner):
         *,
         compiled: _CompiledKernels,
         device_id: int = 0,
+        kernel_cache_dir: str | None = None,
     ) -> None:
         super().__init__()
         self._compiled = compiled
         self._device_id = device_id
+        self._kernel_cache_dir = kernel_cache_dir
         self._l3_worker: Any | None = None
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
         # Device-resident decode output scratch (greedy path): allocated directly on
@@ -205,6 +207,10 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info("[init_kv_cache] creating L3 worker …")
         with profile_span("Qwen314BModelRunner.prepare_l3_worker", cat="executor"):
             self._shared_l3_worker()
+        # Worker creation compiled the device kernel binaries into each build
+        # dir; persist them to the kernel cache so a later launch reloads them
+        # (via DistributedCompiledProgram.from_dir) and skips the ~30s recompile.
+        self._store_kernel_binaries()
 
         logger.info("[init_kv_cache] uploading static tensors …")
         with profile_span("Qwen314BModelRunner.upload_static_tensors", cat="executor"):
@@ -827,6 +833,52 @@ class Qwen314BModelRunner(ModelRunner):
                 _add_run_timing_args(worker_run_args, timing)
             _add_run_timing_args(span_args, timing)
             return timing
+
+    def _store_kernel_binaries(self) -> None:
+        """Persist each kernel's build dir into the kernel cache.
+
+        Called right after the L3 worker is created, i.e. after
+        ``compile_and_assemble`` has written the device binaries
+        (``cache/*.bin`` + ``kernels/*.o``) into each build dir. Copying the
+        whole dir means a later launch can reload it via
+        ``DistributedCompiledProgram.from_dir`` and skip both the JIT and the
+        ~30s device-binary compile.
+
+        No-op when caching is disabled or when a kernel was itself loaded from
+        the cache (its build dir already IS the cache slot). Best-effort: a
+        copy failure is logged, never raised.
+        """
+        if self._kernel_cache_dir is None:
+            return
+        import shutil  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        try:
+            import pypto  # noqa: PLC0415
+
+            version = str(getattr(pypto, "__version__", "unknown"))
+        except Exception:
+            version = "unknown"
+
+        cache_root = Path(self._kernel_cache_dir)
+        for spec in (self._compiled.prefill, self._compiled.decode, self._compiled.greedy_sample):
+            name = spec.name
+            slot = cache_root / name
+            try:
+                src = Path(str(spec.compiled.output_dir))
+                if src.resolve() == slot.resolve():
+                    continue  # reused from cache -> already stored
+                if not src.exists():
+                    print(f"[kernel-cache] WARN: build dir missing for {name}; not cached", flush=True)
+                    continue
+                if slot.exists():
+                    shutil.rmtree(slot)
+                slot.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(src, slot)
+                (slot / "pypto_version.txt").write_text(version)
+                print(f"[kernel-cache] STORED: {name} (+ device binaries) -> {slot}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - caching must never be fatal
+                print(f"[kernel-cache] WARN: failed to store {name} ({type(exc).__name__}: {exc})", flush=True)
 
     def _shared_l3_worker(self) -> Any:
         """Return the worker shared by the generation prefill/decode path."""
