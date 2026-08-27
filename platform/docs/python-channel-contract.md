@@ -126,3 +126,38 @@ order, so rank 0 is `engine` and rank 1 is `worker`.
 Moving per-step token traffic onto device-side channels; heartbeat; multiple replicas;
 dynamic scale-up. The first three are deferred modules that do not exist in this tree; the
 last one the MPI backend cannot do at all.
+
+## Building and running the extension
+
+The extension is opt-in; the default `platform-build` configuration does not build it.
+
+```bash
+meson setup platform/build platform/ -Dengines=mpi -DbuildTests=true -DbuildPythonBindings=true
+ninja -C platform/build
+meson test -C platform/build --suite examples
+```
+
+`-DpythonInterpreter=<name-or-path>` selects the interpreter to build against (default
+`python3`); its development headers must be installed. pybind11 is used for the binding
+because it is already vendored in this tree, at
+`platform/extern/TaskR/extern/tracr/extern/pybind11`.
+
+The build tree mirrors the package the module must be importable as, so
+`<builddir>/python` is the only thing that needs to be on `PYTHONPATH`:
+
+    <builddir>/python/pypto_serving/platform/_native.<abi>.so
+    <builddir>/python/pypto_serving/platform/__init__.py
+
+`platform/examples/python/roundTrip.py` is the worked example: `mpirun -np 2` over a
+two-partition, two-edge policy, rank 0 = `engine`, rank 1 = `worker`.
+
+Two things the object model forces, beyond what is written above:
+
+* **Channels must be opened before `Platform.start()`.** `channelController::reconcile()`
+  only enters `exchangeGlobalMemorySlots`/`fence` when *it* has channels to create, and
+  those are collective over the whole communicator. Opening an edge on one rank after the
+  others have moved on would hang them. `start()` therefore closes the set.
+* **Release every channel before `Runtime.finalize()`.** The channels hold MPI RMA
+  windows; freeing them after `MPI_Finalize` is undefined. `Platform.stop()` drops the
+  desired channels and awaits the engine, which destroys them, and the `Input`/`Output`
+  handles hold their channel weakly so they cannot resurrect one afterwards.
