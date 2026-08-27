@@ -19,6 +19,7 @@ Stale extensions built for another interpreter ABI are removed, so switching
 
 from __future__ import annotations
 
+import filecmp
 import shutil
 import sys
 from pathlib import Path
@@ -41,7 +42,10 @@ def main(argv: list[str]) -> int:
         if stale != destination:
             stale.unlink()
 
-    if not destination.exists() or destination.stat().st_mtime_ns < source.stat().st_mtime_ns:
+    # Compared by content, not by timestamp: an mtime guard cannot tell "already staged"
+    # from "staged from the other build tree", and it refuses to re-stage a newer build that
+    # happens to be older than what is sitting there.
+    if not destination.exists() or not filecmp.cmp(source, destination, shallow=False):
         shutil.copy2(source, destination)
 
     stamp.write_text(str(destination) + "\n", encoding="utf-8")

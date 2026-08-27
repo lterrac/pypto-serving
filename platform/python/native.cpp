@@ -64,9 +64,12 @@ class TimeoutError final : public std::runtime_error
 /**
  * py::gil_scoped_release, but tolerant of not holding the GIL in the first place.
  *
- * The teardown paths run from destructors, which pybind11 normally invokes with the GIL
- * held -- but not reliably so during interpreter finalization, and PyEval_SaveThread on a
- * thread that does not hold the GIL is a fatal error rather than a no-op.
+ * The teardown paths run from destructors. pybind11 invokes those with the GIL held, but
+ * they are also reachable from an unwind or from interpreter shutdown, and PyEval_SaveThread
+ * on a thread that does not hold the GIL is a fatal error rather than a no-op. Ask the one
+ * question that actually answers that -- do we hold it -- rather than whether the
+ * interpreter is initialized, which is a different question with a misleading answer during
+ * finalization.
  */
 class gilRelease_t final
 {
@@ -74,7 +77,7 @@ class gilRelease_t final
 
   gilRelease_t()
   {
-    if (Py_IsInitialized() != 0 && PyGILState_Check() != 0) _state = PyEval_SaveThread();
+    if (PyGILState_Check() != 0) _state = PyEval_SaveThread();
   }
 
   gilRelease_t(const gilRelease_t &)            = delete;
@@ -158,6 +161,11 @@ class PyRuntime final
 
   explicit PyRuntime(const size_t computeResourceCount)
   {
+    // makeRuntime() hands exactly two compute resources to TaskR and throws otherwise, and
+    // it walks the device's compute resource iterator without a bound, so a larger value
+    // runs off the end before it ever gets to that check. Refuse here where it can be said.
+    if (computeResourceCount != 2) HICR_THROW_LOGIC("compute_resource_count must be 2; the underlying runtime supports no other value.");
+
     auto *arguments = makeProcessArguments();
     auto *argv      = arguments->pointers.data();
 
@@ -208,7 +216,22 @@ class PyRuntime final
   [[nodiscard]] __INLINE__ bool                         isRoot() const { return _isRoot; }
   [[nodiscard]] __INLINE__ size_t                       getInstanceCount() const { return _instanceCount; }
 
-  __INLINE__ void registerPlatform(const std::shared_ptr<PyPlatform> &platform) { _platforms.push_back(platform); }
+  /**
+   * Weakly, so a dropped Platform does not keep the runtime's teardown list growing, and
+   * pruning as we go so a long-lived runtime does not accumulate dead control blocks.
+   */
+  __INLINE__ void registerPlatform(const std::shared_ptr<PyPlatform> &platform)
+  {
+    std::erase_if(_platforms, [](const std::weak_ptr<PyPlatform> &entry) { return entry.expired(); });
+    _platforms.push_back(platform);
+    _anyPlatformCreated = true;
+  }
+
+  [[nodiscard]] __INLINE__ bool hasAnyPlatformCreated() const { return _anyPlatformCreated; }
+
+  __INLINE__ void notePlatformStarted() { _anyPlatformStarted = true; }
+
+  [[nodiscard]] __INLINE__ bool hasAnyPlatformStarted() const { return _anyPlatformStarted; }
 
   /**
    * MPI_Finalize, after stopping every platform still standing on top of this runtime.
@@ -255,9 +278,11 @@ class PyRuntime final
   __INLINE__ void stopPlatforms();
 
   std::unique_ptr<::Runtime>             _runtime;
-  HiCR::Instance::instanceId_t           _instanceId    = 0;
-  bool                                   _isRoot        = false;
-  size_t                                 _instanceCount = 0;
+  HiCR::Instance::instanceId_t           _instanceId         = 0;
+  bool                                   _isRoot             = false;
+  size_t                                 _instanceCount      = 0;
+  bool                                   _anyPlatformCreated = false;
+  bool                                   _anyPlatformStarted = false;
   std::vector<std::weak_ptr<PyPlatform>> _platforms;
 };
 
@@ -529,7 +554,7 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
   [[nodiscard]] __INLINE__ std::shared_ptr<PyInput> openInput(const std::string &edgeName)
   {
     checkUsable();
-    if (_started) HICR_THROW_LOGIC("Channels must be opened before Platform.start().");
+    if (_startAttempted) HICR_THROW_LOGIC("Channels must be opened before Platform.start().");
     if (_openedInputs.contains(edgeName) == false)
     {
       if (_localInputs.contains(edgeName) == false) HICR_THROW_LOGIC("Edge '%s' is not consumed by this instance's partition.", edgeName.c_str());
@@ -542,7 +567,7 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
   [[nodiscard]] __INLINE__ std::shared_ptr<PyOutput> openOutput(const std::string &edgeName)
   {
     checkUsable();
-    if (_started) HICR_THROW_LOGIC("Channels must be opened before Platform.start().");
+    if (_startAttempted) HICR_THROW_LOGIC("Channels must be opened before Platform.start().");
     if (_openedOutputs.contains(edgeName) == false)
     {
       if (_localOutputs.contains(edgeName) == false) HICR_THROW_LOGIC("Edge '%s' is not produced by this instance's partition.", edgeName.c_str());
@@ -560,10 +585,11 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
   __INLINE__ void start()
   {
     checkUsable();
-    if (_started) HICR_THROW_LOGIC("Platform.start() called twice.");
+    if (_startAttempted) HICR_THROW_LOGIC("Platform.start() called twice.");
 
-    agreeOnChannelCount();
-    _started = true;
+    agreeOnChannelClaims();
+    _startAttempted = true;
+    _runtime->notePlatformStarted();
 
     auto &runtimeObject = _runtime->raw();
 
@@ -573,9 +599,16 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
     runtimeObject.serving->addModule("ChannelController", _channelController);
     runtimeObject.serving->addModule("Service", _serviceModule);
 
-    py::gil_scoped_release release;
-    runtimeObject.serving->initialize();
-    runtimeObject.serving->run();
+    {
+      py::gil_scoped_release release;
+      runtimeObject.serving->initialize();
+      runtimeObject.serving->run();
+    }
+
+    // Only now is there TaskR state to unwind. Setting this before the calls above would
+    // make a throwing initialize() look like a running engine, and stop() would then await
+    // a TaskR runtime that was never started.
+    _engineRunning = true;
   }
 
   __INLINE__ void waitUntilReady(const double timeoutSeconds)
@@ -608,37 +641,54 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
   }
 
   /**
-   * Idempotent teardown. Drops the desired channels, then -- if the engine was ever
-   * started -- terminates it (root only) and awaits it, which joins the TaskR workers and
-   * destroys every channel this platform created.
+   * Idempotent teardown, and re-entrant on failure. Drops the desired channels, then -- if
+   * the engine actually got running -- terminates it (root only) and awaits it, which joins
+   * the TaskR workers and destroys every channel this platform created.
    *
    * Safe before start() too: open_input/open_output already allocated MPI memory slots, so
    * an opened-then-abandoned platform must still release them before MPI_Finalize.
+   *
+   * The completion flag is set at the end, not the start: if the await below throws, the
+   * destructor's last-resort stop() has to be able to run the rest of the unwind rather
+   * than see a platform that claims to be stopped and return.
    */
   __INLINE__ void stop()
   {
     if (_stopped) return;
-    _stopped = true;
+    _stopRequested = true;
 
-    for (const auto &[edgeName, _] : _openedOutputs) _channelController->removeDesiredProducer(edgeName);
-    for (const auto &[edgeName, _] : _openedInputs) _channelController->removeDesiredConsumer(edgeName);
+    if (_channelController != nullptr)
+    {
+      for (const auto &[edgeName, _] : _openedOutputs) _channelController->removeDesiredProducer(edgeName);
+      for (const auto &[edgeName, _] : _openedInputs) _channelController->removeDesiredConsumer(edgeName);
+    }
     _openedOutputs.clear();
     _openedInputs.clear();
 
-    if (_started == false)
+    if (_engineRunning && _runtime->isFinalized() == false)
     {
-      // Never ran, so there is no engine or TaskR state to unwind; dropping the channel
-      // controller releases the memory slots the open_* calls allocated.
-      _channelController.reset();
-      return;
+      // Consumed before the call that can throw, so a retry from the destructor takes the
+      // branch below instead of awaiting an engine that has already been torn down.
+      _engineRunning      = false;
+      auto &runtimeObject = _runtime->raw();
+
+      gilRelease_t release;
+      if (_isRoot) runtimeObject.serving->terminate();
+      runtimeObject.serving->await();
+    }
+    else if (_channelController != nullptr)
+    {
+      // The engine never ran, so nothing has cleared the controller -- and if start() threw
+      // after addModule(), the Engine is holding it with no removeModule to take it back.
+      // Emptying it here is what releases the MPI memory slots before MPI_Finalize; the
+      // husk the Engine keeps owns nothing.
+      _channelController->finalize();
     }
 
-    if (_runtime->isFinalized()) return;
-    auto &runtimeObject = _runtime->raw();
-
-    gilRelease_t release;
-    if (_isRoot) runtimeObject.serving->terminate();
-    runtimeObject.serving->await();
+    _engineRunning = false;
+    _channelController.reset();
+    _serviceModule.reset();
+    _stopped = true;
   }
 
   [[nodiscard]] __INLINE__ bool isStopped() const { return _stopped; }
@@ -650,48 +700,93 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
 
   __INLINE__ void checkUsable() const
   {
-    if (_stopped) HICR_THROW_LOGIC("This Platform has been stopped and cannot be reused.");
+    if (_stopRequested) HICR_THROW_LOGIC("This Platform has been stopped and cannot be reused.");
   }
 
   /**
-   * channelController::reconcile() only enters exchangeGlobalMemorySlots/fence when *this*
-   * rank has channels to create, but those calls are collective over the whole
-   * communicator. A rank that opened nothing therefore sails past a collective its peers
-   * are sitting in, and the job wedges with no error anywhere.
+   * Agree who is opening what, before anyone commits to the collective that acts on it.
    *
-   * Agree the answer before committing to it. MPI is used directly because the runtime
-   * these bindings wrap is the MPI backend by construction (makeRuntime hardcodes it), and
-   * HiCR exposes no allreduce.
+   * channelController::reconcile() runs exchangeGlobalMemorySlots/fence, which is collective
+   * over the whole communicator, but it only enters them when *this* rank has channels to
+   * create -- and the slots it registers are per edge. Two different disagreements follow:
+   * a rank that opened nothing skips a collective its peers are sitting in and the job
+   * wedges silently; and a rank that opened a *different set* of edges than its peer enters
+   * the collective and then asks for a global key nobody registered, which is a
+   * segmentation fault rather than an exception.
+   *
+   * Counting channels only catches the first. Agreeing the claim set catches both, in the
+   * same single collective: every rank walks the deployment's edges in the same order (same
+   * JSON), marks the ones it opened as producer and as consumer, and sums. An edge must
+   * then be claimed by exactly one producer and exactly one consumer, or by neither side --
+   * skipping an edge entirely is legitimate and consistent, as long as *both* ends skip it.
+   *
+   * MPI is used directly because the runtime these bindings wrap is the MPI backend by
+   * construction (makeRuntime hardcodes it), and HiCR exposes no allreduce.
    */
-  __INLINE__ void agreeOnChannelCount() const
+  __INLINE__ void agreeOnChannelClaims() const
   {
-    const int localChannelCount = static_cast<int>(_openedInputs.size() + _openedOutputs.size());
-    int       minimumCount      = 0;
-    int       maximumCount      = 0;
+    const auto  &edges     = _deployment->raw().getEdges();
+    const size_t edgeCount = edges.size();
+
+    // [2i] = producers of edge i, [2i + 1] = consumers of edge i, [2 * edgeCount] = ranks
+    // that opened anything at all.
+    const size_t     participationIndex = 2 * edgeCount;
+    std::vector<int> localClaims(participationIndex + 1, 0);
+    std::vector<int> globalClaims(participationIndex + 1, 0);
+
+    for (size_t edgeIndex = 0; edgeIndex < edgeCount; edgeIndex++)
+    {
+      const auto &edgeName = edges[edgeIndex]->getName();
+      if (_openedOutputs.contains(edgeName)) localClaims[2 * edgeIndex] = 1;
+      if (_openedInputs.contains(edgeName)) localClaims[2 * edgeIndex + 1] = 1;
+    }
+    localClaims[participationIndex] = (_openedInputs.empty() && _openedOutputs.empty()) ? 0 : 1;
 
     {
       py::gil_scoped_release release;
-      MPI_Allreduce(&localChannelCount, &minimumCount, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-      MPI_Allreduce(&localChannelCount, &maximumCount, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+      MPI_Allreduce(localClaims.data(), globalClaims.data(), static_cast<int>(localClaims.size()), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     }
 
-    if (maximumCount == 0)
+    const int participatingInstances = globalClaims[participationIndex];
+    const int instanceCount          = static_cast<int>(_runtime->getInstanceCount());
+
+    if (participatingInstances == 0)
       HICR_THROW_LOGIC("No instance opened any channel before Platform.start(); there is nothing to reconcile. Check the deployment policy's partitions and edges.");
 
-    if (minimumCount == 0)
-      HICR_THROW_LOGIC("Instance %lu: some instance opened no channels (per-instance channel count ranges from %d to %d), but the channel exchange is collective over all "
-                       "instances. Every instance must own at least one edge. Check the deployment policy's partitions and edges.",
+    if (participatingInstances != instanceCount)
+      HICR_THROW_LOGIC("Instance %lu: only %d of %d instances opened any channel, but the channel exchange is collective over all of them, and the ones that opened nothing "
+                       "would never enter it. Every instance must own and open at least one edge. Check the deployment policy's partitions and edges.",
                        _instanceId,
-                       minimumCount,
-                       maximumCount);
+                       participatingInstances,
+                       instanceCount);
+
+    for (size_t edgeIndex = 0; edgeIndex < edgeCount; edgeIndex++)
+    {
+      const int producerClaims = globalClaims[2 * edgeIndex];
+      const int consumerClaims = globalClaims[2 * edgeIndex + 1];
+
+      // Opened by both ends, or by neither. Anything else means the ranks disagree about
+      // which memory slots exist.
+      if (producerClaims == consumerClaims && producerClaims <= 1) continue;
+
+      HICR_THROW_LOGIC("Instance %lu: edge '%s' was opened by %d producer(s) and %d consumer(s) across the deployment, but every edge must be opened by exactly one of each, "
+                       "or by neither. The instances disagree about which channels exist, and the memory slot exchange would fault rather than fail. Open the edge on both "
+                       "ends or on neither.",
+                       _instanceId,
+                       edges[edgeIndex]->getName().c_str(),
+                       producerClaims,
+                       consumerClaims);
+    }
   }
 
   std::shared_ptr<PyRuntime>    _runtime;
   std::shared_ptr<PyDeployment> _deployment;
-  HiCR::Instance::instanceId_t  _instanceId = 0;
-  bool                          _isRoot     = false;
-  bool                          _started    = false;
-  bool                          _stopped    = false;
+  HiCR::Instance::instanceId_t  _instanceId     = 0;
+  bool                          _isRoot         = false;
+  bool                          _startAttempted = false;
+  bool                          _engineRunning  = false;
+  bool                          _stopRequested  = false;
+  bool                          _stopped        = false;
 
   std::shared_ptr<serving::modules::channelController::Module> _channelController;
   std::shared_ptr<serving::modules::service::Module>           _serviceModule;
@@ -710,7 +805,21 @@ __INLINE__ void PyRuntime::stopPlatforms()
     auto platform = weakPlatform.lock();
     if (platform == nullptr || platform->isStopped()) continue;
     fprintf(stderr, "[serving/platform] Runtime.finalize() with a live Platform; stopping it first.\n");
-    platform->stop();
+
+    // Best effort, per platform. This runs on the way to MPI_Finalize, and one platform
+    // that cannot unwind must not stop the others from trying or leave MPI un-finalized.
+    try
+    {
+      platform->stop();
+    }
+    catch (const std::exception &error)
+    {
+      fprintf(stderr, "[serving/platform] Ignoring error while stopping a platform during finalize: %s\n", error.what());
+    }
+    catch (...)
+    {
+      fprintf(stderr, "[serving/platform] Ignoring unknown error while stopping a platform during finalize.\n");
+    }
   }
   _platforms.clear();
 }
@@ -741,7 +850,12 @@ PYBIND11_MODULE(_native, module)
     .def("finalize", &PyRuntime::finalize)
     .def("abort", &PyRuntime::abort, py::arg("exit_code") = -1)
     .def("__enter__", [](const std::shared_ptr<PyRuntime> &runtime) { return runtime; })
-    .def("__exit__", [](PyRuntime &runtime, const py::object &, const py::object &, const py::object &) {
+    .def("__exit__", [](PyRuntime &runtime, const py::object &exceptionType, const py::object &, const py::object &) {
+      // Leaving the block on an exception once a Platform exists means this rank is walking
+      // away from collectives its peers are already in -- the claim agreement in start(),
+      // the slot exchange, or MPI_Finalize itself. Finalizing here would park them forever,
+      // so take the job down instead. abort() does not return.
+      if (exceptionType.is_none() == false && runtime.hasAnyPlatformCreated()) runtime.abort(1);
       runtime.finalize();
       return false;
     });
