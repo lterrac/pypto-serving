@@ -12,7 +12,10 @@ Run under ``mpirun -np 2``. Rank 0 takes the ``engine`` partition, rank 1 the ``
 partition; rank 0 pushes bytes on the ``commands`` edge, rank 1 echoes them back on the
 ``results`` edge, and rank 0 asserts the payload survived the round trip.
 
-This is the Python equivalent of ``examples/modules/channelController``.
+This is the Python equivalent of ``examples/modules/channelController``, and it is the
+reference for the teardown shape: ``with`` on both the runtime and the platform, and
+``Runtime.abort()`` on any error, because a rank that merely exits leaves its peers
+blocked in ``Engine::await()`` and in the collective ``MPI_Finalize``.
 """
 
 from __future__ import annotations
@@ -39,18 +42,8 @@ def await_message(channel, label: str) -> bytes:
     return channel.read()
 
 
-def main() -> int:
+def round_trip(runtime: Runtime, policy_path: str) -> int:
     """Bring up the platform, exchange one message each way, and tear it down."""
-    if len(sys.argv) != 2:
-        print("Usage: roundTrip.py <policy.json>", file=sys.stderr)
-        return 1
-    policy_path = sys.argv[1]
-
-    runtime = Runtime(compute_resource_count=2)
-    if runtime.instance_count != 2:
-        print(f"Error: this example needs exactly 2 instances, got {runtime.instance_count}", file=sys.stderr)
-        return 1
-
     deployment = Deployment.from_json_file(policy_path)
     deployment.assign_edge_managers(runtime)
     deployment.assign_instances(runtime)
@@ -59,43 +52,65 @@ def main() -> int:
     is_root = runtime.is_root
     print(f"[Instance {instance_id}] edges: {deployment.edge_names()}, root: {is_root}", flush=True)
 
-    platform = Platform(runtime, deployment)
-
-    # Rank assignment follows the partition declaration order: rank 0 is "engine".
-    if is_root:
-        commands = platform.open_output("commands")
-        results = platform.open_input("results")
-    else:
-        commands = platform.open_input("commands")
-        results = platform.open_output("results")
-
-    platform.start()
-    platform.wait_until_ready(timeout_s=READY_TIMEOUT_S)
-    print(f"[Instance {instance_id}] channels ready", flush=True)
-
-    exit_code = 0
-    if is_root:
-        print(f"[Instance {instance_id}] sending {len(PAYLOAD)} bytes on 'commands'", flush=True)
-        commands.push(PAYLOAD, message_type=7, group_id=3, sequence_id=11)
-
-        echoed = await_message(results, "results")
-        print(f"[Instance {instance_id}] received {len(echoed)} bytes on 'results'", flush=True)
-
-        if echoed != PAYLOAD:
-            print(f"Error: round trip mismatch: {echoed!r} != {PAYLOAD!r}", file=sys.stderr, flush=True)
-            exit_code = 1
+    with Platform(runtime, deployment) as platform:
+        # Rank assignment follows the partition declaration order: rank 0 is "engine".
+        if is_root:
+            commands = platform.open_output("commands")
+            results = platform.open_input("results")
         else:
+            commands = platform.open_input("commands")
+            results = platform.open_output("results")
+
+        platform.start()
+        platform.wait_until_ready(timeout_s=READY_TIMEOUT_S)
+        print(f"[Instance {instance_id}] channels ready", flush=True)
+
+        if is_root:
+            print(
+                f"[Instance {instance_id}] sending {len(PAYLOAD)} bytes on 'commands' "
+                f"(max {commands.max_message_size} bytes, capacity {commands.capacity})",
+                flush=True,
+            )
+            commands.push(PAYLOAD, message_type=7, group_id=3, sequence_id=11)
+
+            echoed = await_message(results, "results")
+            print(f"[Instance {instance_id}] received {len(echoed)} bytes on 'results'", flush=True)
+
+            if echoed != PAYLOAD:
+                raise AssertionError(f"round trip mismatch: {echoed!r} != {PAYLOAD!r}")
             assert isinstance(echoed, bytes)
             print(f"[Instance {instance_id}] round trip OK: {echoed!r}", flush=True)
-    else:
-        received = await_message(commands, "commands")
-        print(f"[Instance {instance_id}] received {len(received)} bytes on 'commands', echoing", flush=True)
-        results.push(received)
+        else:
+            received = await_message(commands, "commands")
+            print(f"[Instance {instance_id}] received {len(received)} bytes on 'commands', echoing", flush=True)
+            results.push(received)
 
-    platform.stop()
-    runtime.finalize()
     print(f"[Instance {instance_id}] done", flush=True)
-    return exit_code
+    return 0
+
+
+def main() -> int:
+    """Parse arguments, run the round trip, and abort the whole job on any failure."""
+    if len(sys.argv) != 2:
+        print("Usage: roundTrip.py <policy.json>", file=sys.stderr)
+        return 1
+    policy_path = sys.argv[1]
+
+    with Runtime(compute_resource_count=2) as runtime:
+        if runtime.instance_count != 2:
+            print(f"Error: this example needs exactly 2 instances, got {runtime.instance_count}", file=sys.stderr)
+            runtime.abort(1)
+
+        try:
+            return round_trip(runtime, policy_path)
+        except Exception:
+            # One rank failing on its own is not survivable: its peers are either blocked in
+            # Engine::await() waiting for a STOP RPC, or in the collective MPI_Finalize.
+            import traceback
+
+            traceback.print_exc()
+            sys.stderr.flush()
+            runtime.abort(1)
 
 
 if __name__ == "__main__":
