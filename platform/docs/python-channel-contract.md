@@ -212,13 +212,17 @@ one from a segmentation fault or a silent hang into an exception.
   has channels to create, and those calls are collective over the whole communicator.
   Opening an edge on one rank after the others have moved on would hang them.
 
-* **`start()` agrees the channel count across ranks before committing to the collective.**
-  Same asymmetry, reached two other ways: a policy that leaves a partition with no edges, and
-  a `Deployment` that never had `assign_instances()` called on it -- after which every
-  partition keeps coordinator id 0, rank 0 owns every edge and every other rank owns none.
-  `start()` does an allreduce of the local channel count and refuses on *every* rank if any
-  rank has none, and `Platform.__init__` rejects a deployment that has not had both
-  `assign_edge_managers()` and `assign_instances()` called on it.
+* **`start()` agrees the channel *claim set* across ranks before committing to the
+  collective.** Counting is not enough. A rank that opened nothing skips a collective its
+  peers are in and the job wedges; a rank that opened a *different set* of edges passes any
+  count-based check, enters the exchange, and then asks for a global key nobody registered --
+  a segmentation fault, not an exception. Since every rank walks the same edge list in the
+  same order, one allreduce over a producer/consumer claim vector settles both: an edge must
+  be opened by exactly one producer and exactly one consumer, or by neither end. Skipping an
+  edge is legitimate as long as both ends skip it, which is what lets the serving layer open
+  only the edges it needs. `Platform.__init__` separately rejects a deployment that has not
+  had both `assign_edge_managers()` and `assign_instances()` called on it, since skipping the
+  latter leaves every partition on coordinator id 0 and produces the same asymmetry.
 
 * **Teardown is ordered, and the binding orders it.** The channels are MPI RMA windows and
   the channel controller runs on TaskR fibers. Unwinding into `~Engine` while a service
@@ -231,9 +235,15 @@ one from a segmentation fault or a silent hang into an exception.
   outlives `stop()` raises instead of freeing MPI memory late.
 
 * **A rank that fails alone must abort the job.** Its peers are otherwise blocked in
-  `Engine::await()` waiting for a STOP RPC, or in the collective `MPI_Finalize`.
-  `Runtime.abort(code)` is `InstanceManager::abort`; `roundTrip.py` calls it from its
-  exception handler, and that is the pattern to copy.
+  `Engine::await()` waiting for a STOP RPC, in the claim agreement's allreduce, or in the
+  collective `MPI_Finalize`. `Runtime.abort(code)` is `InstanceManager::abort`; `roundTrip.py`
+  calls it from its exception handler, and that is the pattern to copy.
+
+  `with Runtime() as runtime:` alone is *not* that pattern and is not sufficient on its own.
+  It does abort rather than finalize when the block exits on an exception and a `Platform`
+  was created -- because finalizing there parks the peers -- but it cannot see a failure you
+  catch yourself, and it cannot help before the first `Platform` exists. Keep the explicit
+  `except Exception: runtime.abort(1)` around anything a single rank can fail at.
 
 * **`push()` rejects a payload that can never fit.** `pushMessageLocking` spins while
   `isFull` is true, and for `len(payload) > max_message_size` that is true forever -- with the
@@ -244,7 +254,11 @@ one from a segmentation fault or a silent hang into an exception.
   producer reads the buffer after the GIL is released, so it must not be something the caller
   can mutate underneath it.
 
-* **One handle per edge per thread.** The channels are SPSC by construction. The binding
-  takes the channel's own mutex around the polled and blocking calls, so a violation degrades
-  to contention rather than corruption -- but two threads sharing one edge is still outside
-  the contract, and nothing detects it.
+* **`is_full()` and `push()` on one edge must run on the same thread.** Not merely one
+  handle per edge per thread: `Output::pushMessageLocking` holds the channel mutex across its
+  own `isFull` check and re-takes it every microsecond while it spins, and `std::mutex` is not
+  fair. In Layer 2, `put()` calls `is_full()` on the asyncio event-loop thread; if a worker
+  thread is spinning inside `push()` on that same edge, the loop thread queues behind it. The
+  channels are SPSC by construction, so keep both sides of one edge on one thread. The binding
+  takes the channel mutex around the polled and blocking calls, so a violation degrades to
+  contention rather than corruption -- but nothing detects it.
