@@ -81,7 +81,7 @@ SCENARIOS = (
         3,
         "zeroChannelPolicy.json",
         False,
-        ("some instance opened no channels",),
+        ("only 2 of 3 instances opened any channel",),
         "D4a: a rank with no edges must refuse to start, not wedge the collective",
     ),
     Scenario(
@@ -91,6 +91,14 @@ SCENARIOS = (
         False,
         ("assign_instances(runtime) must be called",),
         "D4b: a deployment without instance assignment must be rejected up front",
+    ),
+    Scenario(
+        "partial-open",
+        2,
+        "policy.json",
+        False,
+        ("edge 'results' was opened by 0 producer(s) and 1 consumer(s)",),
+        "asymmetric: ranks opening different edge sets must be refused, not fault in the slot exchange",
     ),
     Scenario(
         "oversized-push",

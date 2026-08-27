@@ -30,18 +30,29 @@ def prepare(runtime: Runtime, policy_path: str, *, assign_instances: bool = True
     return deployment
 
 
-def open_all(platform: Platform, deployment: Deployment, runtime: Runtime) -> tuple[list, list]:
+def open_side(open_call, name: str, not_ours: str, opened: list) -> None:
+    """Open one edge, tolerating only "this instance does not own that side of it".
+
+    Both HICR_THROW_LOGIC and HICR_THROW_RUNTIME surface as RuntimeError, so a bare
+    ``except RuntimeError: pass`` would hide a real failure as "not ours".
+    """
+    try:
+        opened.append(open_call(name))
+    except RuntimeError as error:
+        if not_ours not in str(error):
+            raise
+
+
+def open_all(
+    platform: Platform, deployment: Deployment, runtime: Runtime, *, skip: tuple[str, ...] = ()
+) -> tuple[list, list]:
     """Open every edge this instance owns, without needing to know which side it is on."""
     inputs, outputs = [], []
     for name in deployment.edge_names():
-        try:
-            outputs.append(platform.open_output(name))
-        except RuntimeError:
-            pass
-        try:
-            inputs.append(platform.open_input(name))
-        except RuntimeError:
-            pass
+        if name in skip:
+            continue
+        open_side(platform.open_output, name, "is not produced by this instance", outputs)
+        open_side(platform.open_input, name, "is not consumed by this instance", inputs)
     print(f"[Instance {runtime.instance_id}] opened {len(inputs)} inputs, {len(outputs)} outputs", flush=True)
     return inputs, outputs
 
@@ -97,6 +108,23 @@ def scenario_missing_assign_instances(runtime: Runtime, policy_path: str) -> int
     deployment = prepare(runtime, policy_path, assign_instances=False)
     platform = Platform(runtime, deployment)
     open_all(platform, deployment, runtime)
+    platform.start()
+    platform.stop()
+    return 0
+
+
+def scenario_partial_open(runtime: Runtime, policy_path: str) -> int:
+    """Ranks that open DIFFERENT edge sets.
+
+    The peers agree on how many channels exist but not on which, so both pass a count-based
+    guard, both enter the memory slot exchange, and one then asks for a global key nobody
+    registered -- which faults rather than raising. Rank 0 opens both its edges, rank 1 skips
+    the "results" edge it is the producer of, which is exactly the shape the serving layer
+    produces when it opens only the edges it needs.
+    """
+    deployment = prepare(runtime, policy_path)
+    platform = Platform(runtime, deployment)
+    open_all(platform, deployment, runtime, skip=() if runtime.is_root else ("results",))
     platform.start()
     platform.stop()
     return 0
@@ -167,6 +195,7 @@ SCENARIOS = {
     "finalize-live-platform": scenario_finalize_live_platform,
     "zero-channels": scenario_zero_channels,
     "missing-assign-instances": scenario_missing_assign_instances,
+    "partial-open": scenario_partial_open,
     "oversized-push": scenario_oversized_push,
     "open-then-bail": scenario_open_then_bail,
     "worker-abort": scenario_worker_abort,
