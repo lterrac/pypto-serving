@@ -22,6 +22,9 @@ Issues = "https://github.com/hw-native-sys/pypto-serving/issues"
 pypto-serving = "pypto_serving.cli.main:main"
 pypto-prepack-deepseek-v4 = "pypto_serving.tools.prepack_deepseek_v4:main"
 
+[tool.setuptools.package-data]
+"pypto_serving.platform" = ["*.so"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pypto_serving*"]

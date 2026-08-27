@@ -5,20 +5,28 @@
  * See platform/docs/python-channel-contract.md for the rationale and the interface
  * this file implements.
  *
- * Two rules are load-bearing here:
+ * Three rules are load-bearing here:
  *   1. Input::read() copies the payload into a Python `bytes` object and pops in a
  *      single call, because Message::getData() points into the consumer ring buffer
  *      and is only valid until popMessage().
- *   2. Every call that can block (pushing to a full channel, the collective run by
- *      the channel controller's reconciliation, the readiness spin, MPI finalize)
- *      releases the GIL, or the caller's asyncio loop deadlocks against it.
+ *   2. Every call that blocks, or that a caller may poll, releases the GIL. See the
+ *      per-method table in the contract document.
+ *   3. Teardown is ordered and enforced, not assumed. The channels are MPI RMA windows
+ *      and the channel controller runs on TaskR fibers; destroying either out of order
+ *      is a segmentation fault rather than an exception. Platform.stop() is therefore
+ *      idempotent, runs from the destructor as a last resort, and Runtime.finalize()
+ *      stops every live platform before MPI_Finalize.
  */
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <mpi.h>
+
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -54,6 +62,66 @@ class TimeoutError final : public std::runtime_error
 };
 
 /**
+ * py::gil_scoped_release, but tolerant of not holding the GIL in the first place.
+ *
+ * The teardown paths run from destructors, which pybind11 normally invokes with the GIL
+ * held -- but not reliably so during interpreter finalization, and PyEval_SaveThread on a
+ * thread that does not hold the GIL is a fatal error rather than a no-op.
+ */
+class gilRelease_t final
+{
+  public:
+
+  gilRelease_t()
+  {
+    if (Py_IsInitialized() != 0 && PyGILState_Check() != 0) _state = PyEval_SaveThread();
+  }
+
+  gilRelease_t(const gilRelease_t &)            = delete;
+  gilRelease_t &operator=(const gilRelease_t &) = delete;
+
+  ~gilRelease_t()
+  {
+    if (_state != nullptr) PyEval_RestoreThread(_state);
+  }
+
+  private:
+
+  PyThreadState *_state = nullptr;
+};
+
+/**
+ * RAII wrapper over serving::system::channels::Base::lock()/unlock().
+ *
+ * Output::pushMessageLocking takes that same mutex, but Output::isFull and the whole of
+ * Input do not. As long as the GIL was held for the duration of every channel call, the
+ * interpreter serialised them for free; now that the polled and blocking methods release
+ * it, two Python threads on one handle would race for real. The channels are SPSC by
+ * construction -- one producer thread, one consumer thread, per edge -- and that is still
+ * the contract, but taking the channel mutex here means a misuse degrades to contention
+ * instead of to corruption.
+ */
+class channelLock_t final
+{
+  public:
+
+  explicit channelLock_t(serving::system::channels::Base &channel)
+    : _channel(channel)
+  {
+    _channel.lock();
+  }
+
+  channelLock_t(const channelLock_t &)            = delete;
+  channelLock_t &operator=(const channelLock_t &) = delete;
+
+  ~channelLock_t() { _channel.unlock(); }
+
+  private:
+
+  serving::system::channels::Base &_channel;
+};
+
+/**
  * MPI_Init requires an argv that outlives the call, and the interpreter's own argv
  * is not stable C storage. Keep a process-wide copy of sys.argv for that purpose.
  */
@@ -79,6 +147,8 @@ __INLINE__ processArguments_t *makeProcessArguments()
   return arguments;
 }
 
+class PyPlatform;
+
 /**
  * MPI + HiCR bootstrap. Thin wrapper over the shared example helper makeRuntime().
  */
@@ -92,11 +162,37 @@ class PyRuntime final
     auto *argv      = arguments->pointers.data();
 
     // MPI_Init_thread is collective and taskr/hwloc bring-up is not instantaneous.
-    py::gil_scoped_release release;
-    _runtime = std::make_unique<::Runtime>(makeRuntime(&arguments->count, &argv, computeResourceCount));
+    {
+      py::gil_scoped_release release;
+      _runtime = std::make_unique<::Runtime>(makeRuntime(&arguments->count, &argv, computeResourceCount));
+    }
+
+    const auto &instance = _runtime->instanceManager->getCurrentInstance();
+    _instanceId          = instance->getId();
+    _isRoot              = instance->isRootInstance();
+    _instanceCount       = _runtime->instanceManager->getInstances().size();
   }
 
-  ~PyRuntime() = default;
+  /**
+   * Last-resort cleanup for a runtime the caller never finalized. Anything that throws
+   * here would terminate the process, and the interpreter may already be shutting down,
+   * so this is strictly best effort.
+   */
+  ~PyRuntime()
+  {
+    try
+    {
+      finalize();
+    }
+    catch (const std::exception &error)
+    {
+      fprintf(stderr, "[serving/platform] Ignoring error while finalizing the runtime from its destructor: %s\n", error.what());
+    }
+    catch (...)
+    {
+      fprintf(stderr, "[serving/platform] Ignoring unknown error while finalizing the runtime from its destructor.\n");
+    }
+  }
 
   [[nodiscard]] __INLINE__ ::Runtime &raw() const
   {
@@ -104,26 +200,69 @@ class PyRuntime final
     return *_runtime;
   }
 
-  [[nodiscard]] __INLINE__ HiCR::Instance::instanceId_t getInstanceId() const { return raw().instanceManager->getCurrentInstance()->getId(); }
-  [[nodiscard]] __INLINE__ bool                         isRoot() const { return raw().instanceManager->getCurrentInstance()->isRootInstance(); }
-  [[nodiscard]] __INLINE__ size_t                       getInstanceCount() const { return raw().instanceManager->getInstances().size(); }
+  [[nodiscard]] __INLINE__ bool isFinalized() const { return _runtime == nullptr; }
 
+  // Cached at construction: these are immutable facts about this rank, and error paths need
+  // to be able to name the rank they are reporting on after the runtime has been finalized.
+  [[nodiscard]] __INLINE__ HiCR::Instance::instanceId_t getInstanceId() const { return _instanceId; }
+  [[nodiscard]] __INLINE__ bool                         isRoot() const { return _isRoot; }
+  [[nodiscard]] __INLINE__ size_t                       getInstanceCount() const { return _instanceCount; }
+
+  __INLINE__ void registerPlatform(const std::shared_ptr<PyPlatform> &platform) { _platforms.push_back(platform); }
+
+  /**
+   * MPI_Finalize, after stopping every platform still standing on top of this runtime.
+   *
+   * The channels are MPI RMA windows and the channel controller runs on TaskR fibers, so
+   * finalizing underneath a live platform does not raise -- it segfaults, either here or
+   * later when the channels are freed past MPI_Finalize. The contract states the ordering
+   * rule; this enforces it.
+   */
   __INLINE__ void finalize()
   {
     if (_runtime == nullptr) return;
-    _runtime->instanceManager->finalize();
-    // The Engine holds RPC targets registered on the RPC engine, so it must go first;
-    // that is the member destruction order of ::Runtime.
+
+    stopPlatforms();
+
+    {
+      gilRelease_t release;
+      _runtime->instanceManager->finalize();
+    }
+
+    // Member destruction order of ::Runtime puts the Engine before the RPC engine it
+    // registered targets on, which is the order this must happen in.
     _runtime.reset();
+  }
+
+  /**
+   * MPI_Abort. The only way for one rank to fail without wedging the others: its peers
+   * would otherwise sit in Engine::await() forever, or in the collective MPI_Finalize.
+   */
+  [[noreturn]] __INLINE__ void abort(const int exitCode)
+  {
+    if (_runtime == nullptr)
+    {
+      fprintf(stderr, "[serving/platform] Runtime.abort() after finalize; exiting with %d.\n", exitCode);
+      std::exit(exitCode);
+    }
+    gilRelease_t release;
+    _runtime->instanceManager->abort(exitCode);
+    std::exit(exitCode); // Not reached; abort() does not return.
   }
 
   private:
 
-  std::unique_ptr<::Runtime> _runtime;
+  __INLINE__ void stopPlatforms();
+
+  std::unique_ptr<::Runtime>             _runtime;
+  HiCR::Instance::instanceId_t           _instanceId    = 0;
+  bool                                   _isRoot        = false;
+  size_t                                 _instanceCount = 0;
+  std::vector<std::weak_ptr<PyPlatform>> _platforms;
 };
 
 /**
- * The parsed policy plus the rank -> partition assignment.
+ * The parsed policy, its runtime managers and the rank -> partition assignment.
  */
 class PyDeployment final
 {
@@ -144,9 +283,26 @@ class PyDeployment final
   {
     auto &runtimeObject = runtime->raw();
     assignEdgeManagers(_deployment, runtimeObject.communicationManager.get(), runtimeObject.memoryManager.get(), runtimeObject.bufferMemorySpace);
+    _edgeManagersAssigned = true;
   }
 
-  __INLINE__ void assignInstancesFrom(const std::shared_ptr<PyRuntime> &runtime) { assignInstancesToPartitions(_deployment, runtime->raw().instanceManager); }
+  __INLINE__ void assignInstancesFrom(const std::shared_ptr<PyRuntime> &runtime)
+  {
+    assignInstancesToPartitions(_deployment, runtime->raw().instanceManager);
+    _instancesAssigned = true;
+  }
+
+  /**
+   * Both steps are silent when skipped and fatal when needed: without edge managers the
+   * channels have no memory manager to allocate from, and without instances every
+   * partition keeps coordinator id 0, so rank 0 owns every edge and every other rank owns
+   * none -- which deadlocks the reconciliation collective rather than reporting anything.
+   */
+  __INLINE__ void checkPrepared() const
+  {
+    if (_edgeManagersAssigned == false) HICR_THROW_LOGIC("Deployment.assign_edge_managers(runtime) must be called before creating a Platform.");
+    if (_instancesAssigned == false) HICR_THROW_LOGIC("Deployment.assign_instances(runtime) must be called before creating a Platform.");
+  }
 
   [[nodiscard]] __INLINE__ std::vector<std::string> getEdgeNames() const
   {
@@ -159,9 +315,9 @@ class PyDeployment final
   private:
 
   serving::configuration::Deployment _deployment;
+  bool                               _edgeManagersAssigned = false;
+  bool                               _instancesAssigned    = false;
 };
-
-class PyPlatform;
 
 /**
  * Consumer-side handle. Holds the channel weakly: the channel controller owns it, and
@@ -171,16 +327,21 @@ class PyInput final
 {
   public:
 
-  PyInput(std::shared_ptr<PyPlatform> platform, std::weak_ptr<serving::system::channels::Input> channel, std::string edgeName)
+  PyInput(std::shared_ptr<PyPlatform> platform, std::weak_ptr<serving::system::channels::Input> channel, std::string edgeName, const size_t bufferSize, const size_t capacity)
     : _platform(std::move(platform)),
       _channel(std::move(channel)),
-      _edgeName(std::move(edgeName))
+      _edgeName(std::move(edgeName)),
+      _bufferSize(bufferSize),
+      _capacity(capacity)
   {}
 
   [[nodiscard]] __INLINE__ bool hasMessage() const
   {
-    auto                   channel = lock();
+    auto channel = lock();
+    // Order matters: the channel mutex is taken after the GIL is dropped and released
+    // before it is reacquired, so no thread ever waits on the channel while holding the GIL.
     py::gil_scoped_release release;
+    channelLock_t          guard(*channel);
     return channel->hasMessage();
   }
 
@@ -191,7 +352,9 @@ class PyInput final
    */
   [[nodiscard]] __INLINE__ py::bytes read() const
   {
-    auto       channel = lock();
+    auto          channel = lock();
+    channelLock_t guard(*channel);
+
     const auto message = channel->getMessage();
     py::bytes  payload(reinterpret_cast<const char *>(message.getData()), message.getSize());
     channel->popMessage();
@@ -201,6 +364,8 @@ class PyInput final
   [[nodiscard]] __INLINE__ bool isReady() const { return lock()->isReady(); }
 
   [[nodiscard]] __INLINE__ const std::string &getEdgeName() const { return _edgeName; }
+  [[nodiscard]] __INLINE__ size_t             getBufferSize() const { return _bufferSize; }
+  [[nodiscard]] __INLINE__ size_t             getCapacity() const { return _capacity; }
 
   private:
 
@@ -214,6 +379,8 @@ class PyInput final
   std::shared_ptr<PyPlatform>                     _platform;
   std::weak_ptr<serving::system::channels::Input> _channel;
   const std::string                               _edgeName;
+  const size_t                                    _bufferSize;
+  const size_t                                    _capacity;
 };
 
 /**
@@ -223,10 +390,12 @@ class PyOutput final
 {
   public:
 
-  PyOutput(std::shared_ptr<PyPlatform> platform, std::weak_ptr<serving::system::channels::Output> channel, std::string edgeName)
+  PyOutput(std::shared_ptr<PyPlatform> platform, std::weak_ptr<serving::system::channels::Output> channel, std::string edgeName, const size_t bufferSize, const size_t capacity)
     : _platform(std::move(platform)),
       _channel(std::move(channel)),
-      _edgeName(std::move(edgeName))
+      _edgeName(std::move(edgeName)),
+      _bufferSize(bufferSize),
+      _capacity(capacity)
   {}
 
   /**
@@ -238,6 +407,7 @@ class PyOutput final
   {
     auto                   channel = lock();
     py::gil_scoped_release release;
+    channelLock_t          guard(*channel);
     return channel->isFull(messageSize);
   }
 
@@ -245,6 +415,9 @@ class PyOutput final
    * pushMessageLocking spins with a 1 us sleep until the ring has room, so the GIL is
    * released around it. The payload pointer stays valid: `payload` keeps a reference to
    * the (immutable) bytes object alive across the release.
+   *
+   * Only `bytes` is accepted. bytearray and memoryview raise TypeError -- deliberately, so
+   * that nothing mutable can be handed to a producer that reads it after the GIL is gone.
    */
   __INLINE__ void push(const py::bytes                                        &payload,
                        const serving::system::channels::Message::messageType_t messageType,
@@ -256,6 +429,13 @@ class PyOutput final
     char      *data = nullptr;
     Py_ssize_t size = 0;
     if (PYBIND11_BYTES_AS_STRING_AND_SIZE(payload.ptr(), &data, &size) != 0) throw py::error_already_set();
+
+    // A payload larger than the whole payload ring can never fit, so pushMessageLocking
+    // would spin on it forever -- and with the GIL released the interpreter never reaches a
+    // bytecode boundary, so not even SIGINT would get the caller out of it.
+    if (static_cast<size_t>(size) > _bufferSize)
+      throw std::invalid_argument("Payload of " + std::to_string(size) + " bytes exceeds the '" + _edgeName + "' edge buffer size of " + std::to_string(_bufferSize) +
+                                  " bytes; it can never be pushed. Raise 'Buffer Size' for this edge in the deployment policy.");
 
     const serving::system::channels::Message::metadata_t metadata{.type = messageType, .groupId = groupId, .sequenceId = sequenceId};
     if (metadata.isValid() == false) throw std::invalid_argument("Message metadata out of range (type/group/sequence).");
@@ -269,6 +449,8 @@ class PyOutput final
   [[nodiscard]] __INLINE__ bool isReady() const { return lock()->isReady(); }
 
   [[nodiscard]] __INLINE__ const std::string &getEdgeName() const { return _edgeName; }
+  [[nodiscard]] __INLINE__ size_t             getBufferSize() const { return _bufferSize; }
+  [[nodiscard]] __INLINE__ size_t             getCapacity() const { return _capacity; }
 
   private:
 
@@ -282,6 +464,8 @@ class PyOutput final
   std::shared_ptr<PyPlatform>                      _platform;
   std::weak_ptr<serving::system::channels::Output> _channel;
   const std::string                                _edgeName;
+  const size_t                                     _bufferSize;
+  const size_t                                     _capacity;
 };
 
 /**
@@ -296,6 +480,8 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
     : _runtime(std::move(runtime)),
       _deployment(std::move(deployment))
   {
+    _deployment->checkPrepared();
+
     auto &runtimeObject = _runtime->raw();
     _instanceId         = _runtime->getInstanceId();
     _isRoot             = _runtime->isRoot();
@@ -318,28 +504,52 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
     }
   }
 
-  ~PyPlatform() = default;
+  /**
+   * Last-resort teardown. Without it, an uncaught Python exception between start() and
+   * stop() unwinds straight into ~Engine while TaskR service workers are still inside
+   * reconcile() on boost fibers, which is a segmentation fault, not an exception -- and
+   * the peers then wait forever for a STOP RPC that the dead root never sends.
+   */
+  ~PyPlatform()
+  {
+    try
+    {
+      stop();
+    }
+    catch (const std::exception &error)
+    {
+      fprintf(stderr, "[serving/platform] Ignoring error while stopping the platform from its destructor: %s\n", error.what());
+    }
+    catch (...)
+    {
+      fprintf(stderr, "[serving/platform] Ignoring unknown error while stopping the platform from its destructor.\n");
+    }
+  }
 
   [[nodiscard]] __INLINE__ std::shared_ptr<PyInput> openInput(const std::string &edgeName)
   {
+    checkUsable();
     if (_started) HICR_THROW_LOGIC("Channels must be opened before Platform.start().");
     if (_openedInputs.contains(edgeName) == false)
     {
       if (_localInputs.contains(edgeName) == false) HICR_THROW_LOGIC("Edge '%s' is not consumed by this instance's partition.", edgeName.c_str());
       _openedInputs[edgeName] = createDesiredInput(_channelController, _localInputs.at(edgeName), defaultChannelKeyBuilder);
     }
-    return std::make_shared<PyInput>(shared_from_this(), _openedInputs.at(edgeName), edgeName);
+    const auto &edge = _localInputs.at(edgeName).edge;
+    return std::make_shared<PyInput>(shared_from_this(), _openedInputs.at(edgeName), edgeName, edge->getBufferSize(), edge->getBufferCapacity());
   }
 
   [[nodiscard]] __INLINE__ std::shared_ptr<PyOutput> openOutput(const std::string &edgeName)
   {
+    checkUsable();
     if (_started) HICR_THROW_LOGIC("Channels must be opened before Platform.start().");
     if (_openedOutputs.contains(edgeName) == false)
     {
       if (_localOutputs.contains(edgeName) == false) HICR_THROW_LOGIC("Edge '%s' is not produced by this instance's partition.", edgeName.c_str());
       _openedOutputs[edgeName] = createDesiredOutput(_channelController, _localOutputs.at(edgeName), defaultChannelKeyBuilder);
     }
-    return std::make_shared<PyOutput>(shared_from_this(), _openedOutputs.at(edgeName), edgeName);
+    const auto &edge = _localOutputs.at(edgeName).edge;
+    return std::make_shared<PyOutput>(shared_from_this(), _openedOutputs.at(edgeName), edgeName, edge->getBufferSize(), edge->getBufferCapacity());
   }
 
   /**
@@ -349,7 +559,10 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
    */
   __INLINE__ void start()
   {
+    checkUsable();
     if (_started) HICR_THROW_LOGIC("Platform.start() called twice.");
+
+    agreeOnChannelCount();
     _started = true;
 
     auto &runtimeObject = _runtime->raw();
@@ -367,6 +580,8 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
 
   __INLINE__ void waitUntilReady(const double timeoutSeconds)
   {
+    checkUsable();
+
     std::vector<std::shared_ptr<serving::system::channels::Base>> channels;
     for (const auto &[_, input] : _openedInputs) channels.push_back(input);
     for (const auto &[_, output] : _openedOutputs) channels.push_back(output);
@@ -393,31 +608,83 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
   }
 
   /**
-   * Drops the desired channels, terminates the engine (root only) and awaits it. After
-   * this returns every channel this platform created is destroyed, so the runtime can be
-   * finalized without freeing MPI memory past MPI_Finalize.
+   * Idempotent teardown. Drops the desired channels, then -- if the engine was ever
+   * started -- terminates it (root only) and awaits it, which joins the TaskR workers and
+   * destroys every channel this platform created.
+   *
+   * Safe before start() too: open_input/open_output already allocated MPI memory slots, so
+   * an opened-then-abandoned platform must still release them before MPI_Finalize.
    */
   __INLINE__ void stop()
   {
-    if (_started == false || _stopped) return;
+    if (_stopped) return;
     _stopped = true;
-
-    auto &runtimeObject = _runtime->raw();
 
     for (const auto &[edgeName, _] : _openedOutputs) _channelController->removeDesiredProducer(edgeName);
     for (const auto &[edgeName, _] : _openedInputs) _channelController->removeDesiredConsumer(edgeName);
     _openedOutputs.clear();
     _openedInputs.clear();
 
-    py::gil_scoped_release release;
+    if (_started == false)
+    {
+      // Never ran, so there is no engine or TaskR state to unwind; dropping the channel
+      // controller releases the memory slots the open_* calls allocated.
+      _channelController.reset();
+      return;
+    }
+
+    if (_runtime->isFinalized()) return;
+    auto &runtimeObject = _runtime->raw();
+
+    gilRelease_t release;
     if (_isRoot) runtimeObject.serving->terminate();
     runtimeObject.serving->await();
   }
+
+  [[nodiscard]] __INLINE__ bool isStopped() const { return _stopped; }
 
   [[nodiscard]] __INLINE__ HiCR::Instance::instanceId_t getInstanceId() const { return _instanceId; }
   [[nodiscard]] __INLINE__ bool                         isRoot() const { return _isRoot; }
 
   private:
+
+  __INLINE__ void checkUsable() const
+  {
+    if (_stopped) HICR_THROW_LOGIC("This Platform has been stopped and cannot be reused.");
+  }
+
+  /**
+   * channelController::reconcile() only enters exchangeGlobalMemorySlots/fence when *this*
+   * rank has channels to create, but those calls are collective over the whole
+   * communicator. A rank that opened nothing therefore sails past a collective its peers
+   * are sitting in, and the job wedges with no error anywhere.
+   *
+   * Agree the answer before committing to it. MPI is used directly because the runtime
+   * these bindings wrap is the MPI backend by construction (makeRuntime hardcodes it), and
+   * HiCR exposes no allreduce.
+   */
+  __INLINE__ void agreeOnChannelCount() const
+  {
+    const int localChannelCount = static_cast<int>(_openedInputs.size() + _openedOutputs.size());
+    int       minimumCount      = 0;
+    int       maximumCount      = 0;
+
+    {
+      py::gil_scoped_release release;
+      MPI_Allreduce(&localChannelCount, &minimumCount, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+      MPI_Allreduce(&localChannelCount, &maximumCount, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    }
+
+    if (maximumCount == 0)
+      HICR_THROW_LOGIC("No instance opened any channel before Platform.start(); there is nothing to reconcile. Check the deployment policy's partitions and edges.");
+
+    if (minimumCount == 0)
+      HICR_THROW_LOGIC("Instance %lu: some instance opened no channels (per-instance channel count ranges from %d to %d), but the channel exchange is collective over all "
+                       "instances. Every instance must own at least one edge. Check the deployment policy's partitions and edges.",
+                       _instanceId,
+                       minimumCount,
+                       maximumCount);
+  }
 
   std::shared_ptr<PyRuntime>    _runtime;
   std::shared_ptr<PyDeployment> _deployment;
@@ -435,6 +702,18 @@ class PyPlatform final : public std::enable_shared_from_this<PyPlatform>
   std::map<std::string, std::shared_ptr<serving::system::channels::Input>>  _openedInputs;
   std::map<std::string, std::shared_ptr<serving::system::channels::Output>> _openedOutputs;
 };
+
+__INLINE__ void PyRuntime::stopPlatforms()
+{
+  for (const auto &weakPlatform : _platforms)
+  {
+    auto platform = weakPlatform.lock();
+    if (platform == nullptr || platform->isStopped()) continue;
+    fprintf(stderr, "[serving/platform] Runtime.finalize() with a live Platform; stopping it first.\n");
+    platform->stop();
+  }
+  _platforms.clear();
+}
 
 } // namespace
 
@@ -458,7 +737,14 @@ PYBIND11_MODULE(_native, module)
     .def_property_readonly("instance_id", &PyRuntime::getInstanceId)
     .def_property_readonly("is_root", &PyRuntime::isRoot)
     .def_property_readonly("instance_count", &PyRuntime::getInstanceCount)
-    .def("finalize", &PyRuntime::finalize, py::call_guard<py::gil_scoped_release>());
+    .def_property_readonly("is_finalized", &PyRuntime::isFinalized)
+    .def("finalize", &PyRuntime::finalize)
+    .def("abort", &PyRuntime::abort, py::arg("exit_code") = -1)
+    .def("__enter__", [](const std::shared_ptr<PyRuntime> &runtime) { return runtime; })
+    .def("__exit__", [](PyRuntime &runtime, const py::object &, const py::object &, const py::object &) {
+      runtime.finalize();
+      return false;
+    });
 
   py::class_<PyDeployment, std::shared_ptr<PyDeployment>>(module, "Deployment")
     .def_static("from_json_file", &PyDeployment::fromJsonFile, py::arg("path"))
@@ -470,21 +756,39 @@ PYBIND11_MODULE(_native, module)
     .def("has_message", &PyInput::hasMessage)
     .def("read", &PyInput::read)
     .def("is_ready", &PyInput::isReady)
-    .def_property_readonly("edge_name", &PyInput::getEdgeName);
+    .def_property_readonly("edge_name", &PyInput::getEdgeName)
+    .def_property_readonly("buffer_size", &PyInput::getBufferSize)
+    .def_property_readonly("max_message_size", &PyInput::getBufferSize)
+    .def_property_readonly("capacity", &PyInput::getCapacity);
 
   py::class_<PyOutput, std::shared_ptr<PyOutput>>(module, "Output")
     .def("is_full", &PyOutput::isFull, py::arg("message_size"))
     .def("push", &PyOutput::push, py::arg("payload"), py::arg("message_type") = 0, py::arg("group_id") = 0, py::arg("sequence_id") = 0)
     .def("is_ready", &PyOutput::isReady)
-    .def_property_readonly("edge_name", &PyOutput::getEdgeName);
+    .def_property_readonly("edge_name", &PyOutput::getEdgeName)
+    .def_property_readonly("buffer_size", &PyOutput::getBufferSize)
+    .def_property_readonly("max_message_size", &PyOutput::getBufferSize)
+    .def_property_readonly("capacity", &PyOutput::getCapacity);
 
   py::class_<PyPlatform, std::shared_ptr<PyPlatform>>(module, "Platform")
-    .def(py::init<std::shared_ptr<PyRuntime>, std::shared_ptr<PyDeployment>>(), py::arg("runtime"), py::arg("deployment"))
+    .def(py::init([](const std::shared_ptr<PyRuntime> &runtime, const std::shared_ptr<PyDeployment> &deployment) {
+           auto platform = std::make_shared<PyPlatform>(runtime, deployment);
+           runtime->registerPlatform(platform);
+           return platform;
+         }),
+         py::arg("runtime"),
+         py::arg("deployment"))
     .def("open_input", &PyPlatform::openInput, py::arg("edge_name"))
     .def("open_output", &PyPlatform::openOutput, py::arg("edge_name"))
     .def("start", &PyPlatform::start)
     .def("wait_until_ready", &PyPlatform::waitUntilReady, py::arg("timeout_s") = 30.0)
     .def("stop", &PyPlatform::stop)
+    .def_property_readonly("is_stopped", &PyPlatform::isStopped)
     .def_property_readonly("instance_id", &PyPlatform::getInstanceId)
-    .def_property_readonly("is_root", &PyPlatform::isRoot);
+    .def_property_readonly("is_root", &PyPlatform::isRoot)
+    .def("__enter__", [](const std::shared_ptr<PyPlatform> &platform) { return platform; })
+    .def("__exit__", [](PyPlatform &platform, const py::object &, const py::object &, const py::object &) {
+      platform.stop();
+      return false;
+    });
 }
