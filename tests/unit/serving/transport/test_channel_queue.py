@@ -21,6 +21,7 @@ import time
 import pytest
 
 from pypto_serving.serving.transport.channel_queue import (
+    BlockingPlatformOutputQueue,
     ChannelNotReadyError,
     MessageTooLargeError,
     PlatformInputQueue,
@@ -247,3 +248,105 @@ def test_message_too_large_error_is_not_a_queue_full() -> None:
     # Distinguishable by type: callers that catch queue.Full for retry logic
     # must NOT accidentally catch this and retry a payload that can never fit.
     assert not issubclass(MessageTooLargeError, queue.Full)
+
+
+# -- the byte dimension of the sizing rule ---------------------------------
+
+
+def test_full_for_worst_case_is_exact_across_the_byte_dimension():
+    """The rule that makes it exact is Buffer Size = capacity x max_message.
+    With that, room for one worst-case message means room for ANY accepted
+    payload -- and that is a statement about bytes, not slots."""
+    channel = FakeChannel(capacity=3, buffer_size=3 * 100)
+    output = PlatformOutputQueue(channel, edge_name="commands", max_message_size=100)
+
+    assert output.full_for_worst_case() is False
+    # Two worst-case messages in: 100 bytes of ring left, one slot left.
+    assert output.try_put(b"x" * 100) is True
+    assert output.try_put(b"x" * 100) is True
+    assert output.full_for_worst_case() is False
+    # Anything up to max_message_size still fits, which is the guarantee.
+    assert output.try_put(b"x" * 100) is True
+    assert output.full_for_worst_case() is True
+
+
+def test_a_slot_free_but_no_bytes_free_still_reports_full():
+    """A slot-count-only check would say "room" here and then fail the push."""
+    channel = FakeChannel(capacity=8, buffer_size=250)
+    output = PlatformOutputQueue(channel, edge_name="commands", max_message_size=100)
+
+    assert output.try_put(b"x" * 100) is True
+    assert output.try_put(b"x" * 100) is True
+    assert channel.used_bytes() == 200
+    # 6 slots free, but only 50 bytes -- not enough for a worst-case message.
+    assert output.full_for_worst_case() is True
+    assert output.try_put(b"x" * 100) is False
+    # A payload that does fit is still accepted; the refusal was not global.
+    assert output.try_put(b"x" * 50) is True
+
+
+# -- BlockingPlatformOutputQueue -------------------------------------------
+
+
+def test_blocking_put_waits_for_the_consumer_and_then_succeeds():
+    channel = FakeChannel(capacity=1)
+    output = BlockingPlatformOutputQueue(
+        channel, edge_name="results", max_message_size=64, put_timeout=5.0
+    )
+    output.put(b"first")
+    assert output.full(len(b"second")) is True
+
+    def _drain_soon():
+        time.sleep(0.05)
+        channel.read()
+
+    reader = threading.Thread(target=_drain_soon)
+    reader.start()
+    output.put(b"second")  # must block, then go through
+    reader.join()
+    assert channel.read() == b"second"
+
+
+def test_blocking_put_gives_up_rather_than_wedging_forever():
+    """The reviewed F2 hang: the native push spins with the GIL released and
+    cannot be interrupted, so an unbounded wait is unrecoverable."""
+    channel = FakeChannel(capacity=1)
+    channel.force_fill(1)
+    output = BlockingPlatformOutputQueue(
+        channel, edge_name="results", max_message_size=64, put_timeout=0.05
+    )
+
+    started = time.monotonic()
+    with pytest.raises(queue.Full, match="still full after"):
+        output.put(b"payload")
+    assert time.monotonic() - started < 2.0
+
+
+def test_blocking_put_never_enters_the_native_spin():
+    """It polls is_full() from Python and only calls push() once there is room;
+    the FakeChannel asserts if push() is reached on a full channel."""
+    channel = FakeChannel(capacity=1)
+    channel.force_fill(1)
+    output = BlockingPlatformOutputQueue(
+        channel, edge_name="results", max_message_size=64, put_timeout=0.05
+    )
+    with pytest.raises(queue.Full):
+        output.put(b"payload")
+    assert channel.push_calls == []
+
+
+def test_blocking_put_still_refuses_a_payload_that_can_never_fit():
+    channel = FakeChannel(capacity=4)
+    output = BlockingPlatformOutputQueue(
+        channel, edge_name="results", max_message_size=8, put_timeout=0.05
+    )
+    with pytest.raises(MessageTooLargeError):
+        output.put(b"x" * 9)
+
+
+def test_blocking_put_reports_a_channel_that_never_became_ready():
+    channel = FakeChannel(capacity=4)
+    channel.ready = False
+    output = BlockingPlatformOutputQueue(channel, edge_name="results", put_timeout=0.05)
+    with pytest.raises(ChannelNotReadyError):
+        output.put(b"payload")

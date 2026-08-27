@@ -18,7 +18,7 @@ import uuid
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, ProfilingUnsupportedError
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException
     from fastapi.responses import JSONResponse, Response, StreamingResponse
     from pydantic import BaseModel
 except ImportError as e:
@@ -167,6 +167,12 @@ class ServingServer:
             main_started = start_sa_profile()
             try:
                 await self.engine.start_profile()
+            except ProfilingUnsupportedError as exc:
+                if main_started:
+                    stop_sa_profile()
+                # The deployment does not offer worker profiling; that is a bad
+                # request, not a server fault, so do not answer 500.
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             except Exception:
                 if main_started:
                     stop_sa_profile()
@@ -180,6 +186,9 @@ class ServingServer:
             stop_error = None
             try:
                 await self.engine.stop_profile()
+            except ProfilingUnsupportedError as exc:
+                stop_sa_profile()
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             except Exception as exc:
                 stop_error = exc
             stop_sa_profile()
@@ -438,6 +447,10 @@ class ServingServer:
             "FINISHED_LENGTH": "length",
             "FINISHED_STOP": "stop",
             "FINISHED_ABORTED": "aborted",
+            # _handle_step_error's reason for a worker error/timeout. Without this
+            # entry it fell through to "stop", telling a client whose request was
+            # killed by a worker failure that it completed normally.
+            "error": "aborted",
         }
         return mapping.get(reason, "stop")
 

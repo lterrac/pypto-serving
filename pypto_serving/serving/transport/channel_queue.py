@@ -34,6 +34,15 @@ from pypto_serving.serving.transport.protocols import ChannelInput, ChannelOutpu
 
 DEFAULT_GET_POLL_INTERVAL_SECONDS = 0.0005
 
+# A blocking put must never be unbounded. ``Output.push`` is
+# ``pushMessageLocking``, which spins with the GIL released, so a producer that
+# enters it against a consumer that has stopped draining cannot be interrupted
+# by anything -- not SIGINT, not a shutdown command it would have to read from
+# another channel to see. That was a reproduced hang; see
+# ``BlockingPlatformOutputQueue``.
+DEFAULT_BLOCKING_PUT_TIMEOUT_SECONDS = 300.0
+DEFAULT_PUT_POLL_INTERVAL_SECONDS = 0.0005
+
 
 class ChannelNotReadyError(RuntimeError):
     """Raised when ``put``/``get``/``full`` is called before the channel has
@@ -137,6 +146,31 @@ class PlatformOutputQueue:
             )
         return self._output.is_full(message_size)
 
+    def full_for_worst_case(self) -> bool:
+        """Would a push of the largest payload this queue accepts fail right now?
+
+        The backpressure check for a caller that must decide *before* it knows
+        the payload -- which is the engine's situation:
+        ``ReplicaEngineCore._try_dispatch_step`` has to know whether it may
+        dispatch before ``scheduler.schedule()`` runs, and ``schedule()``
+        allocates KV blocks and moves requests between queues, so a step that
+        is built and then refused cannot be rolled back.
+
+        If this returns ``False``, every payload this queue accepts (i.e. every
+        payload up to ``max_message_size``, larger ones being
+        ``MessageTooLargeError``) is guaranteed to fit, because only the
+        producer thread pushes and the consumer can only free space. That makes
+        the check exact rather than advisory, which is what lets the caller
+        commit to scheduling a step once it has passed.
+
+        Requires an explicit ``max_message_size`` to be exact. Without one it
+        degrades to ``full(0)`` -- "is there a free message slot" -- which is
+        still a correct *necessary* condition (a full channel is always
+        reported) but no longer sufficient, since a free slot says nothing
+        about the payload ring having room for the bytes.
+        """
+        return self.full(self._max_message_size if self._max_message_size is not None else 0)
+
     def try_put(self, payload: bytes) -> bool:
         """Push ``payload`` if there is room; return ``False`` instead of
         raising if the channel is full. Never sleeps, never retries.
@@ -197,6 +231,17 @@ class PlatformInputQueue:
     Raises ``ChannelNotReadyError`` if the channel has not finished its
     startup handshake -- checked once, before the poll loop starts, matching
     the ordering precondition documented on ``ChannelNotReadyError``.
+
+    One hazard this class does NOT defend against, recorded because it is
+    currently avoided by accident rather than by design: cancelling an
+    ``asyncio.to_thread(queue.get, ...)`` cancels only the *await*, never the
+    thread, which keeps polling and can still consume a message. A caller that
+    then issues a second ``get`` has two readers on one SPSC edge, which the
+    contract forbids. Nothing in ``ReplicaEngineCore`` cancels a ``get`` today
+    -- the only path that would (replica-level cancellation) needs two or more
+    replicas, and the platform transport rejects those outright -- so the
+    invariant holds, but for a reason unrelated to this class. Any future
+    caller that cancels a ``get`` must not reuse the queue afterwards.
     """
 
     def __init__(
@@ -230,3 +275,81 @@ class PlatformInputQueue:
                 )
             time.sleep(min(self._poll_interval, remaining))
         return self._input.read()
+
+
+class BlockingPlatformOutputQueue(PlatformOutputQueue):
+    """``PlatformOutputQueue`` whose ``put()`` waits for room instead of raising.
+
+    The non-blocking ``put()`` of the base class exists because the engine calls
+    it synchronously on the asyncio event loop. The worker rank is the opposite
+    situation: its output lane is a plain thread that has nothing else to do
+    until the result is handed over (``serving_worker.py`` :240, :446, :533),
+    and it has no caller to hand a ``queue.Full`` to -- dropping a StepResult
+    would desync the engine's one-result-per-command invariant permanently.
+
+    So here ``put()`` delegates straight to ``Output.push``, i.e.
+    ``pushMessageLocking``, which spins with a 1 us sleep until the ring has
+    room, with the GIL released. Never use this on an event-loop thread.
+
+    ``MessageTooLargeError`` is still raised rather than spun on: above
+    ``max_message_size`` the channel is full forever and ``pushMessageLocking``
+    would never return (the native binding raises ``ValueError`` for the same
+    reason once the payload exceeds the whole ring).
+    """
+
+    def __init__(
+        self,
+        output: ChannelOutput,
+        *,
+        edge_name: str = "",
+        max_message_size: int | None = None,
+        put_timeout: float | None = DEFAULT_BLOCKING_PUT_TIMEOUT_SECONDS,
+        poll_interval: float = DEFAULT_PUT_POLL_INTERVAL_SECONDS,
+    ) -> None:
+        super().__init__(output, edge_name=edge_name, max_message_size=max_message_size)
+        self._put_timeout = put_timeout
+        self._poll_interval = poll_interval
+
+    def put(self, payload: bytes) -> None:
+        """Push ``payload``, waiting up to ``put_timeout`` for room.
+
+        Waits by polling ``full()`` from Python rather than handing the wait to
+        ``pushMessageLocking``. That is the whole point: the native spin
+        releases the GIL and has no timeout, so a producer that enters it
+        against a consumer which has stopped draining is unrecoverable -- the
+        reproduced hang where the engine called ``Platform.stop()`` while this
+        rank sat inside ``push`` with SIGINT ignored, and the job had to be
+        SIGKILLed. Polling keeps the wait bounded and interruptible.
+
+        The poll-then-push sequence is race-free because the channel is SPSC:
+        this is the only producer, so once ``full()`` reports room nothing can
+        take it away before ``push`` runs, and ``push`` therefore returns
+        without spinning.
+
+        Raises ``queue.Full`` on timeout. That is a hard failure, not
+        backpressure: on the worker rank it propagates out of the busy loop and
+        takes the job down, which is the right outcome for "the engine stopped
+        reading and is never coming back".
+        """
+        message_size = len(payload)
+        if self._max_message_size is not None and message_size > self._max_message_size:
+            raise MessageTooLargeError(
+                f"payload of {message_size} bytes exceeds platform output "
+                f"channel {self._edge_name!r}'s configured max_message_size="
+                f"{self._max_message_size} bytes; this channel can never "
+                "accept it, regardless of backlog"
+            )
+        deadline = (
+            None if self._put_timeout is None else time.monotonic() + self._put_timeout
+        )
+        # full() also raises ChannelNotReadyError before the handshake completes.
+        while self.full(message_size):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise queue.Full(
+                    f"platform output channel {self._edge_name!r} still full after "
+                    f"{self._put_timeout:g}s (message_size={message_size}); the consumer "
+                    "has stopped draining it. Refusing to wait forever: the native push "
+                    "spins with the GIL released and cannot be interrupted."
+                )
+            time.sleep(self._poll_interval)
+        self._output.push(payload)

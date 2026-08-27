@@ -143,6 +143,16 @@ startup handshakes, consumed only in `start()` and never stored on the object
 that sizes a model-support structure; carrying it semantically through the platform is how the
 platform turns into another model-execution abstraction layer, which issue #32 forbids.
 
+With a worker *rank* rather than a worker *process* there is no shared memory to keep them in,
+so they ride the `results` edge as one **opaque msgpack payload** -- bytes the platform cannot
+tell apart from a `StepResult` (`serving/transport/handshake.py`). That keeps `num_pages` out of
+the platform's semantic surface, as #32 requires. It is safe to overload that edge because the
+message is strictly ordered outside the request stream: the worker pushes it as the first thing
+it ever puts on `results`, before its busy loop starts, and the engine consumes it inside
+`start()`, before `_engine_loop` exists. One object (`PlatformStartupHandshake`) satisfies both
+`ready_event.wait(timeout=...) -> bool` and `num_pages_value.value -> int`, so `start()`'s
+six-tuple unpacking is unchanged and the queue path keeps exactly the code it had.
+
 ## Layer 3 — the topology
 
 One edge is one unidirectional SPSC channel between two partitions' coordinator instances,
@@ -159,6 +169,49 @@ and one output. The two-edge cycle above satisfies all of it.
 
 Rank assignment follows `readAndParseConfiguration`: partitions take instances in declaration
 order, so rank 0 is `engine` and rank 1 is `worker`.
+
+`serving/transport/platform_launch.py` generates exactly this policy (rather than shipping it
+as a file) so the edge sizing can follow one rule: **`Buffer Size` = `Buffer Capacity` x the
+largest message the adapter will accept.** That is what makes a producer's "is there room?"
+question answerable *before* it knows the payload -- and the engine has to ask it before
+`scheduler.schedule()` runs, because `schedule()` allocates KV blocks and promotes requests and
+cannot be rolled back if the dispatch is then refused. With a full worst-case message's worth of
+ring free, whatever the step turns out to be will fit. Note that `Output::isFull` is
+two-dimensional -- a metadata slot count *and* the payload ring's free bytes -- so the rule has
+to hold in bytes, not just in slots.
+
+Two sizing constraints follow, and both are enforced rather than documented:
+
+* **`Buffer Capacity` >= `ReplicaEngineCore._max_in_flight`** (2 under async scheduling). At
+  capacity 1 the engine can hold the only slot while the worker is inside a blocking push on
+  `results`, and the only thing that would free the worker is the engine reading -- which it
+  has stopped doing. That is a hang no signal can break, because the native push spins with
+  the GIL released.
+* **`Buffer Size` must cover a real worst-case `StepCommand`.** ipc.py's "~1 KB steady state"
+  counts only the per-request deltas; `_build_step_command` also ships `block_ids` *and*
+  `block_ids_by_group`, and DeepSeek V4 declares six cache groups, so the block tables are sent
+  seven times over. Measured, at page_size 16: 0.74 MiB for 32 requests x 8192 blocks on a
+  single generic pool, **5.17 MiB** for the same batch with DeepSeek V4's groups, and 21.16 MiB
+  if 32 fresh 128K-token prompts are admitted in one step. The default per-message limit is
+  16 MiB. A step that still does not fit fails *its requests* through `_handle_step_error`, not
+  the replica.
+
+Profiling has no place in this topology. `_set_profile_active` needs a third worker->engine
+channel for its acknowledgement; multiplexing acks onto `results` would break the engine's
+one-result-per-command invariant (`async_engine.py:539-547`), so the platform transport raises
+`ProfilingUnsupportedError`, which the HTTP layer answers with 400.
+
+Two lifecycle rules the launcher owns, because nothing else can:
+
+* **The worker rank must be told to stop, and the launcher checks.** A worker blocked in
+  `get(timeout=None)` looks identical whether it is idle or abandoned, so `_run_role` refuses to
+  return normally unless a `ShutdownCommand` actually reached the channel. Any path where
+  `run_serve` *returns* rather than raises without its lifespan shutdown having run -- a uvicorn
+  startup-event failure being the obvious one -- would otherwise leave rank 1 blocked forever.
+* **A dead engine loop must not exit 0.** `_engine_loop` runs under a guard that logs, fails
+  the in-flight requests and SIGTERMs the process; `run_serve` then returns 1 and
+  `run_platform_replica` propagates it. Without that the process exits cleanly and no supervisor
+  restarts it.
 
 ## What is deliberately not in scope
 
@@ -183,6 +236,10 @@ because it is already vendored in this tree, at
 
 `platform/examples/python/roundTrip.py` is the worked example: `mpirun -np 2` over a
 two-partition, two-edge policy, rank 0 = `engine`, rank 1 = `worker`.
+`tests/platform/two_rank_replica.py` is the same shape carrying a real `ReplicaEngineCore` and a
+real serving worker busy loop over those channels (`pytest tests/platform -q`, or under `mpirun`
+directly); only `init_device_and_model`, `_execute_step` and the tokenizer are stubbed, because
+nothing there may touch an NPU.
 `platform/examples/python/failureModes.py` is the counter-example: it drives every misuse
 below under mpirun and asserts each one fails loudly rather than fatally.
 
