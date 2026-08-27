@@ -21,11 +21,23 @@ import time
 import pytest
 
 from pypto_serving.serving.transport.channel_queue import (
+    ChannelNotReadyError,
+    MessageTooLargeError,
     PlatformInputQueue,
     PlatformOutputQueue,
 )
+from pypto_serving.serving.transport.protocols import ChannelInput, ChannelOutput
 
 from .fakes import FakeChannel
+
+
+def test_fake_channel_conforms_to_the_protocols() -> None:
+    # The one thing that guarantees this adapter binds to the real native
+    # extension: it must accept anything structurally shaped like the
+    # contract, and the contract's shape is expressed as these Protocols.
+    channel = FakeChannel()
+    assert isinstance(channel, ChannelOutput)
+    assert isinstance(channel, ChannelInput)
 
 
 def test_round_trip_of_opaque_bytes() -> None:
@@ -97,34 +109,53 @@ def test_get_blocks_until_message_arrives_within_timeout() -> None:
     assert result == b"late-arrival"
 
 
-def test_put_raises_queue_full_when_channel_stays_full() -> None:
-    channel = FakeChannel(capacity=1)
-    channel.force_fill(1)
-    output = PlatformOutputQueue(channel, put_timeout=0.05, poll_interval=0.001)
+def test_get_default_timeout_is_none_and_blocks_indefinitely() -> None:
+    # serving_worker.py:232,281 call get() with no arguments at all -- the
+    # default must exist and must mean "block until a message arrives",
+    # matching stdlib queue.Queue.get semantics.
+    channel = FakeChannel()
+    input_ = PlatformInputQueue(channel, poll_interval=0.001)
 
-    with pytest.raises(queue.Full):
-        output.put(b"no-room")
-
-
-def test_put_waits_for_room_then_succeeds() -> None:
-    """put() polls is_full() and only calls push() once there is room --
-    never calls push() while full (FakeChannel.push asserts this itself)."""
-    channel = FakeChannel(capacity=1)
-    channel.force_fill(1)
-    output = PlatformOutputQueue(channel, put_timeout=2.0, poll_interval=0.001)
-
-    def _free_room_after_delay() -> None:
+    def _delayed_push() -> None:
         time.sleep(0.05)
-        channel.read()  # drains the one slot, freeing room
+        channel.push(b"no-timeout-given")
 
-    thread = threading.Thread(target=_free_room_after_delay)
+    thread = threading.Thread(target=_delayed_push)
     thread.start()
     try:
-        output.put(b"fits-eventually")
+        result = input_.get()  # no timeout argument
     finally:
         thread.join()
 
-    assert channel.push_calls == [(b"fits-eventually", 0, 0, 0)]
+    assert result == b"no-timeout-given"
+
+
+def test_get_raises_channel_not_ready_error() -> None:
+    channel = FakeChannel()
+    channel.ready = False
+    input_ = PlatformInputQueue(channel)
+
+    with pytest.raises(ChannelNotReadyError):
+        input_.get(timeout=0.01)
+
+
+def test_put_raises_queue_full_immediately_with_zero_wait() -> None:
+    """The load-bearing fix: put() must never sleep. A full channel that
+    never drains must fail in effectively zero time, not after some bounded
+    wait -- any sleep here stalls the asyncio event loop that calls put()
+    synchronously."""
+    channel = FakeChannel(capacity=1)
+    channel.force_fill(1)
+    output = PlatformOutputQueue(channel)
+
+    start = time.monotonic()
+    with pytest.raises(queue.Full):
+        output.put(b"no-room")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.01
+    # push() must never have been called while full.
+    assert channel.push_calls == []
 
 
 def test_put_uses_push_defaults() -> None:
@@ -134,3 +165,85 @@ def test_put_uses_push_defaults() -> None:
     output.put(b"payload")
 
     assert channel.push_calls == [(b"payload", 0, 0, 0)]
+
+
+def test_put_raises_channel_not_ready_error() -> None:
+    channel = FakeChannel()
+    channel.ready = False
+    output = PlatformOutputQueue(channel)
+
+    with pytest.raises(ChannelNotReadyError):
+        output.put(b"payload")
+
+
+def test_full_is_a_non_blocking_predicate_matching_put_outcome() -> None:
+    channel = FakeChannel(capacity=1)
+    output = PlatformOutputQueue(channel)
+
+    assert output.full(len(b"x")) is False
+    output.put(b"x")
+    assert output.full(len(b"y")) is True
+
+
+def test_full_raises_channel_not_ready_error() -> None:
+    channel = FakeChannel()
+    channel.ready = False
+    output = PlatformOutputQueue(channel)
+
+    with pytest.raises(ChannelNotReadyError):
+        output.full(1)
+
+
+def test_try_put_returns_false_on_full_channel_without_raising() -> None:
+    """The non-blocking surface S3 needs: check before dispatching, get False
+    back, and fall through to draining instead -- no exception, no wait."""
+    channel = FakeChannel(capacity=1)
+    channel.force_fill(1)
+    output = PlatformOutputQueue(channel)
+
+    start = time.monotonic()
+    accepted = output.try_put(b"no-room")
+    elapsed = time.monotonic() - start
+
+    assert accepted is False
+    assert elapsed < 0.01
+    assert channel.push_calls == []
+
+
+def test_try_put_returns_true_and_pushes_when_room_available() -> None:
+    channel = FakeChannel()
+    output = PlatformOutputQueue(channel)
+
+    accepted = output.try_put(b"fits")
+
+    assert accepted is True
+    assert channel.push_calls == [(b"fits", 0, 0, 0)]
+
+
+def test_put_raises_message_too_large_error_without_touching_is_full() -> None:
+    channel = FakeChannel(capacity=8)
+    output = PlatformOutputQueue(channel, max_message_size=4)
+
+    with pytest.raises(MessageTooLargeError):
+        output.put(b"way-too-long")
+
+    # Oversize is a hard, permanent condition -- distinct from queue.Full,
+    # and detected before ever calling push().
+    assert channel.push_calls == []
+
+
+def test_try_put_raises_message_too_large_error_even_though_channel_has_room() -> None:
+    channel = FakeChannel(capacity=8)
+    output = PlatformOutputQueue(channel, max_message_size=4)
+
+    # Plenty of room in the fake's ring, but the payload itself can never
+    # fit -- must raise, not return False (False would suggest "try again
+    # later", which is never true here).
+    with pytest.raises(MessageTooLargeError):
+        output.try_put(b"way-too-long")
+
+
+def test_message_too_large_error_is_not_a_queue_full() -> None:
+    # Distinguishable by type: callers that catch queue.Full for retry logic
+    # must NOT accidentally catch this and retry a payload that can never fit.
+    assert not issubclass(MessageTooLargeError, queue.Full)

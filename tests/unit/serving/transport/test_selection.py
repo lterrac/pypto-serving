@@ -8,19 +8,21 @@
 # -----------------------------------------------------------------------------------------------------------
 """Unit tests for PYPTO_SERVING_TRANSPORT selection.
 
-This workstation has neither torch nor the native platform extension, which
-is exactly the condition the availability check exists to handle -- so these
-tests exercise the real (not mocked) unavailable-extension path.
+Whether the native extension is actually importable is environment- and
+build-dependent (it may be built in one worktree/container and not another),
+so these tests do not assert on the ambient environment. Tests of the
+availability-dependent behaviour monkeypatch
+``selection.is_platform_extension_available`` to pin the case under test.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from pypto_serving.serving.transport import selection
 from pypto_serving.serving.transport.selection import (
     TRANSPORT_ENV_VAR,
     TransportKind,
-    is_platform_extension_available,
     require_platform_extension_available,
     resolve_transport_kind,
     transport_kind_from_env,
@@ -57,31 +59,41 @@ def test_invalid_env_value_raises_value_error() -> None:
         transport_kind_from_env({TRANSPORT_ENV_VAR: "raw_pipe"})
 
 
-def test_platform_extension_is_not_available_in_this_environment() -> None:
-    # This workstation has no torch and no native extension built: the
-    # availability check must report False rather than raising ImportError
-    # itself, and must not have imported anything at module load time.
-    assert is_platform_extension_available() is False
-
-
-def test_require_platform_extension_available_raises_when_missing() -> None:
+def test_require_platform_extension_available_raises_when_extension_missing(monkeypatch) -> None:
+    monkeypatch.setattr(selection, "is_platform_extension_available", lambda: False)
     with pytest.raises(RuntimeError, match="native"):
         require_platform_extension_available()
+
+
+def test_require_platform_extension_available_is_a_noop_when_extension_present(monkeypatch) -> None:
+    monkeypatch.setattr(selection, "is_platform_extension_available", lambda: True)
+    require_platform_extension_available()  # must not raise
 
 
 def test_resolve_transport_kind_defaults_to_queue() -> None:
     assert resolve_transport_kind({}) is TransportKind.QUEUE
 
 
-def test_resolve_transport_kind_raises_for_platform_when_extension_missing() -> None:
+def test_resolve_transport_kind_raises_for_platform_when_extension_missing(monkeypatch) -> None:
     # The load-bearing behaviour: requesting `platform` without the native
     # extension must raise, never silently fall back to `queue` -- a silent
     # fallback would report a platform run that never happened.
+    monkeypatch.setattr(selection, "is_platform_extension_available", lambda: False)
     with pytest.raises(RuntimeError, match="PYPTO_SERVING_TRANSPORT=platform"):
         resolve_transport_kind({TRANSPORT_ENV_VAR: "platform"})
 
 
-def test_resolve_transport_kind_does_not_probe_extension_for_queue() -> None:
-    # Must not raise just because the extension happens to be unavailable --
-    # only requesting `platform` triggers the availability check.
+def test_resolve_transport_kind_returns_platform_when_extension_present(monkeypatch) -> None:
+    monkeypatch.setattr(selection, "is_platform_extension_available", lambda: True)
+    assert resolve_transport_kind({TRANSPORT_ENV_VAR: "platform"}) is TransportKind.PLATFORM
+
+
+def test_resolve_transport_kind_does_not_probe_extension_for_queue(monkeypatch) -> None:
+    # Must not raise (or even consult availability) just because the
+    # extension happens to be unavailable -- only requesting `platform`
+    # triggers the availability check.
+    def _boom() -> bool:
+        raise AssertionError("availability must not be probed for the queue transport")
+
+    monkeypatch.setattr(selection, "is_platform_extension_available", _boom)
     assert resolve_transport_kind({TRANSPORT_ENV_VAR: "queue"}) is TransportKind.QUEUE

@@ -15,8 +15,10 @@ unless a caller opts in.
 The native extension (``pypto_serving.platform._native``) is never imported
 at module import time here -- only inside ``is_platform_extension_available``,
 lazily, on demand -- so importing this module never fails on an environment
-that lacks it (no torch, no pypto, no native extension: exactly this
-workstation).
+that lacks it. Whether the extension is actually present is environment- and
+build-dependent (it may be built in one worktree/container and absent in
+another); code that needs a specific answer must call
+``is_platform_extension_available()`` itself rather than assume either way.
 """
 
 from __future__ import annotations

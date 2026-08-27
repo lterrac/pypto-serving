@@ -10,8 +10,9 @@
 
 See ``platform/docs/python-channel-contract.md`` for the full design. This
 package makes a platform ``Output``/``Input`` pair usable wherever
-``multiprocessing.Queue`` is used today (``pypto_serving.serving.engine.async_engine``),
-plus the environment-driven transport selection that picks between them.
+``multiprocessing.Queue`` is used today (``pypto_serving.serving.engine.async_engine``,
+``pypto_serving.serving.server.serving_worker``), plus the environment-driven
+transport selection that picks between them.
 
 Wiring this into ``async_engine.py`` / ``serving_worker.py`` is a separate
 subproblem; this package is self-contained and independently testable.
@@ -21,8 +22,8 @@ from __future__ import annotations
 
 from pypto_serving.serving.transport.channel_queue import (
     DEFAULT_GET_POLL_INTERVAL_SECONDS,
-    DEFAULT_PUT_POLL_INTERVAL_SECONDS,
-    DEFAULT_PUT_TIMEOUT_SECONDS,
+    ChannelNotReadyError,
+    MessageTooLargeError,
     PlatformInputQueue,
     PlatformOutputQueue,
 )
@@ -38,8 +39,8 @@ from pypto_serving.serving.transport.selection import (
 
 __all__ = [
     "DEFAULT_GET_POLL_INTERVAL_SECONDS",
-    "DEFAULT_PUT_POLL_INTERVAL_SECONDS",
-    "DEFAULT_PUT_TIMEOUT_SECONDS",
+    "ChannelNotReadyError",
+    "MessageTooLargeError",
     "PlatformInputQueue",
     "PlatformOutputQueue",
     "ChannelInput",
