@@ -70,6 +70,26 @@ servingBuildDep = declare_dependency(
   dependencies: servingDependencies,
 )
 
+# Helpers shared by the examples and by the Python bindings.
+# TODO: these belong in include/ rather than examples/include/ now that non-example code uses them.
+servingExamplesHelpersDep = declare_dependency(include_directories: include_directories('examples/include'))
+
+####### Python bindings (optional)
+
+if get_option('buildPythonBindings')
+  fs = import('fs')
+  pythonModule = import('python')
+  pythonInstallation = pythonModule.find_installation(get_option('pythonInterpreter'), required: true)
+
+  # pybind11 comes in through TaskR -> TraCR; it is header-only, so no extra build is needed.
+  # Chosen over nanobind purely because it is already vendored in this tree.
+  pybind11Dep = declare_dependency(
+    include_directories: include_directories('extern/TaskR/extern/tracr/extern/pybind11/include'),
+  )
+
+  subdir('python')
+endif
+
 if meson.is_subproject() == false
   if get_option('buildTests')
     subdir('examples')
