@@ -44,7 +44,12 @@ Python side; the C++ they wrap is named in each entry.
         def is_root(self) -> bool: ...
         @property
         def instance_count(self) -> int: ...
-        def finalize(self) -> None: ...          # InstanceManager::finalize
+        def finalize(self) -> None: ...          # InstanceManager::finalize; stops live Platforms first
+        def abort(self, exit_code: int = -1) -> None: ...  # InstanceManager::abort -- does not return
+        @property
+        def is_finalized(self) -> bool: ...
+        def __enter__(self) -> "Runtime": ...
+        def __exit__(self, *exc) -> bool: ...     # finalize
 
     class Deployment:
         @staticmethod
@@ -57,12 +62,20 @@ Python side; the C++ they wrap is named in each entry.
         def has_message(self) -> bool: ...
         def read(self) -> bytes: ...     # getMessage + COPY + popMessage, as one atomic step
         def is_ready(self) -> bool: ...
+        edge_name: str
+        buffer_size: int        # the edge's payload ring, in bytes
+        max_message_size: int   # == buffer_size; the largest payload this edge can carry
+        capacity: int           # the edge's token capacity
 
     class Output:
         def is_full(self, message_size: int) -> bool: ...
         def push(self, payload: bytes, message_type: int = 0,
                  group_id: int = 0, sequence_id: int = 0) -> None: ...   # pushMessageLocking
         def is_ready(self) -> bool: ...
+        edge_name: str
+        buffer_size: int
+        max_message_size: int   # push() raises ValueError above this rather than spinning forever
+        capacity: int
 
     class Platform:
         """Engine + channelController + service, wired as examples/modules/channelController does."""
@@ -71,7 +84,11 @@ Python side; the C++ they wrap is named in each entry.
         def open_input(self, edge_name: str) -> Input: ...
         def start(self) -> None: ...     # addModule, initialize, run  -- channels become ready here
         def wait_until_ready(self, timeout_s: float = 30.0) -> None: ...
-        def stop(self) -> None: ...      # terminate (root only) + await
+        def stop(self) -> None: ...      # terminate (root only) + await; idempotent, also valid before start
+        @property
+        def is_stopped(self) -> bool: ...
+        def __enter__(self) -> "Platform": ...
+        def __exit__(self, *exc) -> bool: ...     # stop
 
 ### Two rules the binding must obey, both load-bearing
 
@@ -164,22 +181,70 @@ meson test -C platform/build --suite examples
 because it is already vendored in this tree, at
 `platform/extern/TaskR/extern/tracr/extern/pybind11`.
 
-The build tree mirrors the package the module must be importable as, so
-`<builddir>/python` is the only thing that needs to be on `PYTHONPATH`:
-
-    <builddir>/python/pypto_serving/platform/_native.<abi>.so
-    <builddir>/python/pypto_serving/platform/__init__.py
-
 `platform/examples/python/roundTrip.py` is the worked example: `mpirun -np 2` over a
 two-partition, two-edge policy, rank 0 = `engine`, rank 1 = `worker`.
+`platform/examples/python/failureModes.py` is the counter-example: it drives every misuse
+below under mpirun and asserts each one fails loudly rather than fatally.
 
-Two things the object model forces, beyond what is written above:
+### Where the `.so` has to live
 
-* **Channels must be opened before `Platform.start()`.** `channelController::reconcile()`
-  only enters `exchangeGlobalMemorySlots`/`fence` when *it* has channels to create, and
-  those are collective over the whole communicator. Opening an edge on one rank after the
-  others have moved on would hang them. `start()` therefore closes the set.
-* **Release every channel before `Runtime.finalize()`.** The channels hold MPI RMA
-  windows; freeing them after `MPI_Finalize` is undefined. `Platform.stop()` drops the
-  desired channels and awaits the engine, which destroys them, and the `Input`/`Output`
-  handles hold their channel weakly so they cannot resurrect one afterwards.
+`ninja` stages the built extension into `pypto_serving/platform/_native.<abi>.so` in the
+source tree (gitignored; declared as setuptools package data). That is not a convenience --
+it is the only layout that works. `pypto_serving` has an `__init__.py`, so it is a *regular*
+package, and a regular package always wins over an implicit namespace portion no matter how
+`sys.path` is ordered. A build-tree mirror at `<builddir>/python/pypto_serving/platform/` is
+therefore unimportable the moment the repository itself is importable -- which is exactly the
+shape the contract mandates, `mpirun ... python -m pypto_serving.cli` from the repository
+root. An editable install resolves to the same directory, so staging *is* the install.
+
+The cost of that layout: importing `pypto_serving.platform` executes
+`pypto_serving/__init__.py`, which pulls in torch and the model loader. Measured on
+hg-atlas-01, `import pypto_serving.platform` takes ~8.5 s, of which the extension itself is
+~6 ms. Inside the real serving process this is free, because torch is imported anyway.
+
+## What the binding enforces, and why it has to
+
+Everything in this section is a rule the object model already had; the binding turns each
+one from a segmentation fault or a silent hang into an exception.
+
+* **Channels are opened before `start()`, and the set is closed there.**
+  `channelController::reconcile()` only enters `exchangeGlobalMemorySlots`/`fence` when *it*
+  has channels to create, and those calls are collective over the whole communicator.
+  Opening an edge on one rank after the others have moved on would hang them.
+
+* **`start()` agrees the channel count across ranks before committing to the collective.**
+  Same asymmetry, reached two other ways: a policy that leaves a partition with no edges, and
+  a `Deployment` that never had `assign_instances()` called on it -- after which every
+  partition keeps coordinator id 0, rank 0 owns every edge and every other rank owns none.
+  `start()` does an allreduce of the local channel count and refuses on *every* rank if any
+  rank has none, and `Platform.__init__` rejects a deployment that has not had both
+  `assign_edge_managers()` and `assign_instances()` called on it.
+
+* **Teardown is ordered, and the binding orders it.** The channels are MPI RMA windows and
+  the channel controller runs on TaskR fibers. Unwinding into `~Engine` while a service
+  worker is still inside `reconcile()` is a segmentation fault, and freeing a channel after
+  `MPI_Finalize` is undefined. So: `Platform.stop()` is idempotent and valid before `start()`
+  (opening a channel already allocated memory slots); `Platform` and `Runtime` are both
+  context managers; both call `stop()`/`finalize()` from their destructors as a last resort;
+  and `Runtime.finalize()` stops any live `Platform` before `MPI_Finalize` rather than
+  assuming the caller did. `Input`/`Output` hold their channel weakly, so a handle that
+  outlives `stop()` raises instead of freeing MPI memory late.
+
+* **A rank that fails alone must abort the job.** Its peers are otherwise blocked in
+  `Engine::await()` waiting for a STOP RPC, or in the collective `MPI_Finalize`.
+  `Runtime.abort(code)` is `InstanceManager::abort`; `roundTrip.py` calls it from its
+  exception handler, and that is the pattern to copy.
+
+* **`push()` rejects a payload that can never fit.** `pushMessageLocking` spins while
+  `isFull` is true, and for `len(payload) > max_message_size` that is true forever -- with the
+  GIL released, so not even SIGINT gets the caller out of it. Above `max_message_size`,
+  `push()` raises `ValueError`.
+
+* **`push()` takes `bytes` only.** `bytearray` and `memoryview` raise `TypeError`. The
+  producer reads the buffer after the GIL is released, so it must not be something the caller
+  can mutate underneath it.
+
+* **One handle per edge per thread.** The channels are SPSC by construction. The binding
+  takes the channel's own mutex around the polled and blocking calls, so a violation degrades
+  to contention rather than corruption -- but two threads sharing one edge is still outside
+  the contract, and nothing detects it.
