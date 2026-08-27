@@ -194,19 +194,21 @@ __INLINE__ void buildLocalChannelsFromDeployment(const serving::configuration::D
   for (const auto &out : localOutputs) outputs.push_back(out.channel);
 }
 
-__INLINE__ void readAndParseConfiguration(char                                   *argv[],
-                                          serving::configuration::Deployment     &deployment,
-                                          std::shared_ptr<HiCR::InstanceManager> &instanceManager,
-                                          const size_t                            replicasPerPartition = 0)
+__INLINE__ void loadDeploymentFromFile(const std::string &servingConfigFilePath, serving::configuration::Deployment &deployment)
 {
-  const std::string servingConfigFilePath = std::string(argv[1]);
-  std::ifstream     servingConfigFs(servingConfigFilePath);
-  auto              servingConfigJs = nlohmann::json::parse(servingConfigFs);
+  std::ifstream servingConfigFs(servingConfigFilePath);
+  if (servingConfigFs.good() == false) HICR_THROW_RUNTIME("Could not open deployment configuration file '%s'.", servingConfigFilePath.c_str());
+  auto servingConfigJs = nlohmann::json::parse(servingConfigFs);
 
   deployment.deserialize(servingConfigJs);
 
   inferEdgeEndpointsFromTasks(deployment);
+}
 
+__INLINE__ void assignInstancesToPartitions(serving::configuration::Deployment     &deployment,
+                                            std::shared_ptr<HiCR::InstanceManager> &instanceManager,
+                                            const size_t                            replicasPerPartition = 0)
+{
   // The coordinator is co-located with the first replica, so each partition needs
   // 1 instance for the coordinator + (replicasPerPartition - 1) extra replica instances.
   const auto extraReplicasPerPartition = replicasPerPartition > 0 ? replicasPerPartition - 1 : 0;
@@ -233,4 +235,13 @@ __INLINE__ void readAndParseConfiguration(char                                  
       partition->addReplica(std::make_shared<serving::configuration::Replica>(replicaInstanceId));
     }
   }
+}
+
+__INLINE__ void readAndParseConfiguration(char                                   *argv[],
+                                          serving::configuration::Deployment     &deployment,
+                                          std::shared_ptr<HiCR::InstanceManager> &instanceManager,
+                                          const size_t                            replicasPerPartition = 0)
+{
+  loadDeploymentFromFile(std::string(argv[1]), deployment);
+  assignInstancesToPartitions(deployment, instanceManager, replicasPerPartition);
 }
