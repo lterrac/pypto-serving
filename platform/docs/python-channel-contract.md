@@ -78,9 +78,31 @@ Python side; the C++ they wrap is named in each entry.
 1. **`Input.read()` copies.** `Message::getData()` returns a pointer *into the consumer ring
    buffer*, valid only until `popMessage()`. Exposing it as a Python buffer would hand out a
    dangling view. `read()` therefore copies into `bytes` and pops, in one call.
-2. **Release the GIL around anything that blocks.** `Output::pushMessageLocking` spins with a
-   1 us sleep until the ring has room, and `reconcile()` runs a collective. Holding the GIL
-   there deadlocks the process against its own asyncio loop.
+2. **Release the GIL around anything that blocks *or that a caller may poll*.**
+   `Output::pushMessageLocking` spins with a 1 us sleep until the ring has room, and
+   `reconcile()` runs a collective. Holding the GIL there deadlocks the process against its
+   own asyncio loop.
+
+   "Blocks" is not the whole rule. `Input::hasMessage()` and `Output::isFull()` each drive two
+   `updateDepth()` calls -- MPI RMA progress, ~4.5 us apiece -- and both are *polled*: the
+   Layer 2 adapter calls `has_message()` ~66 times per 36 ms serving step from an
+   `asyncio.to_thread` worker, and calls `is_full()` on the event-loop thread on every `put`.
+   A native method that never drops the GIL cannot be preempted mid-call, so a poll loop over
+   one pins the interpreter for whole `sys.setswitchinterval` quanta. Measured on hg-atlas-01,
+   a competing thread's 1 ms wakeup lands at p50 **10.0 ms** late when the polled method holds
+   the GIL, against **2.9 ms** when it releases it and **0.06 ms** with no native calls at all.
+   The release pays for itself: it adds under 1 us to a ~5 us call and cuts the competing
+   thread's p50 wakeup latency by ~3.5x.
+
+   So the per-method rule is:
+
+   * release -- `Runtime()`, `Runtime.finalize`, `Platform.start`, `Platform.stop`,
+     `Platform.wait_until_ready`, `Output.push`, `Output.is_full`, `Input.has_message`;
+   * hold -- `Input.read` (it must build the `bytes` object, and the copy needs the GIL) and
+     `is_ready` (a plain atomic load; the release would cost more than the call).
+
+   Never touch the Python C-API -- including refcounts, `py::bytes` construction and raising --
+   inside a released region.
 
 ## Layer 2 — the queue-shaped adapter
 

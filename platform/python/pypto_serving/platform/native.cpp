@@ -229,7 +229,17 @@ class PyOutput final
       _edgeName(std::move(edgeName))
   {}
 
-  [[nodiscard]] __INLINE__ bool isFull(const size_t messageSize) const { return lock()->isFull(messageSize); }
+  /**
+   * Drives two updateDepth() calls, i.e. MPI RMA progress, so the GIL is released for the
+   * same reason Input::hasMessage() releases it: callers poll this for backpressure, and a
+   * poll loop that never drops the GIL starves every other thread in the process.
+   */
+  [[nodiscard]] __INLINE__ bool isFull(const size_t messageSize) const
+  {
+    auto                   channel = lock();
+    py::gil_scoped_release release;
+    return channel->isFull(messageSize);
+  }
 
   /**
    * pushMessageLocking spins with a 1 us sleep until the ring has room, so the GIL is
