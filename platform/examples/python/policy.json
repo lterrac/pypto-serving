@@ -1,0 +1,61 @@
+{
+  "Name": "Python Round Trip",
+  "Settings": {
+    "Heartbeat": {
+      "Enabled": true,
+      "Visible": false,
+      "Interval": 500,
+      "Tolerance": 1000
+    },
+    "Control Buffer": {
+      "Capacity": 32,
+      "Size": 16384
+    }
+  },
+  "Request Manager": {
+    "Input": "",
+    "Output": ""
+  },
+  "Partitions": [
+    {
+      "Name": "engine",
+      "Tasks": [
+        {
+          "Function Name": "engineTask",
+          "Inputs": [
+            "results"
+          ],
+          "Outputs": [
+            "commands"
+          ],
+          "Dependencies": []
+        }
+      ]
+    },
+    {
+      "Name": "worker",
+      "Tasks": [
+        {
+          "Function Name": "workerTask",
+          "Inputs": [
+            "commands"
+          ],
+          "Outputs": [
+            "results"
+          ],
+          "Dependencies": []
+        }
+      ]
+    }
+  ],
+  "Edges": [
+    {
+      "Name": "commands",
+      "Buffer Size": 4096
+    },
+    {
+      "Name": "results",
+      "Buffer Size": 4096
+    }
+  ]
+}

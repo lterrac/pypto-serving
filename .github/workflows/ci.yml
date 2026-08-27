@@ -161,7 +161,7 @@ jobs:
       - name: Check style
         run: |
           python3 platform/extern/HiCR/extern/run-clang-format/run-clang-format.py \
-            --recursive platform/include platform/examples \
+            --recursive platform/include platform/examples platform/python \
             --extensions "hpp,cpp" --exclude "*/build/*"
 
       - name: Configure

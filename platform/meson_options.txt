@@ -16,3 +16,11 @@ option('buildTests', type : 'boolean', value : false,
 option('compileWarningsAsErrors', type : 'boolean', value : false,
        description: 'Indicates whether a compilation warning should result in a fatal error. This is useful for CI testing but may result in inconveniences for normal users, hence it should be false by default'
 )
+
+option('buildPythonBindings', type : 'boolean', value : false,
+       description: 'Indicates whether to build the native Python extension (pypto_serving.platform._native). Requires the Python development headers'
+)
+
+option('pythonInterpreter', type : 'string', value : 'python3',
+       description: 'Python interpreter (name or absolute path) to build the native extension against. Only used when buildPythonBindings is enabled'
+)
