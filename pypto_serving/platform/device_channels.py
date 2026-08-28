@@ -144,6 +144,20 @@ class DeviceChannelSet:
         return self._request
 
     @property
+    def runtime_handle(self) -> Any:
+        """The runtime's own domain handle, for a caller that must manage its lifetime.
+
+        Ordinary callers should not need this: the getters above are the whole surface, and
+        :meth:`release` is the whole teardown. It exists for the one caller that is not a
+        consumer of the window but its *manager* -- ``pypto``'s ``DistributedWorker``, which
+        keys its per-name reuse, its across-dispatch spec check and its release bookkeeping on
+        the identity of the object ``allocate_domain`` returned. Handing that party a wrapper
+        instead of the handle would silently break those checks, so the seam hands back what
+        it was given. See :mod:`pypto_serving.platform.domain_factory`.
+        """
+        return self._handle
+
+    @property
     def name(self) -> str:
         return self._request.name
 
