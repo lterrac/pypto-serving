@@ -27,7 +27,15 @@ def stub_config(monkeypatch):
         cli_main,
         "build_parser",
         lambda: _parser_returning(
-            argparse.Namespace(host="0.0.0.0", port=8000, show_startup_logs=True)
+            argparse.Namespace(
+            host="0.0.0.0",
+            port=8000,
+            show_startup_logs=True,
+            # main() builds a GenerateConfig from this and passes it to run_serve;
+            # prompt selects the one-shot generate path instead of serving.
+            generate_config=None,
+            prompt=None,
+        )
         ),
     )
     return config
@@ -46,7 +54,7 @@ def test_unset_transport_goes_straight_to_run_serve(monkeypatch, stub_config):
     monkeypatch.delenv("PYPTO_SERVING_TRANSPORT", raising=False)
     served: list[tuple] = []
 
-    def _serve(config, **kwargs) -> int:
+    def _serve(config, generate_config=None, **kwargs) -> int:
         served.append((config, kwargs))
         return 0
 
@@ -86,5 +94,5 @@ def test_main_propagates_a_failing_exit_code(monkeypatch, stub_config):
     """A replica whose engine loop died must not exit 0: under systemd or
     Kubernetes a clean exit means no restart, no backoff and no alert."""
     monkeypatch.delenv("PYPTO_SERVING_TRANSPORT", raising=False)
-    monkeypatch.setattr(cli_main, "run_serve", lambda config, **kwargs: 1)
+    monkeypatch.setattr(cli_main, "run_serve", lambda config, generate_config, **kwargs: 1)
     assert cli_main.main([]) == 1
