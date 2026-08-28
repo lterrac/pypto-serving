@@ -14,18 +14,27 @@ package makes a platform ``Output``/``Input`` pair usable wherever
 ``pypto_serving.serving.server.serving_worker``), plus the environment-driven
 transport selection that picks between them.
 
-Wiring this into ``async_engine.py`` / ``serving_worker.py`` is a separate
-subproblem; this package is self-contained and independently testable.
+``platform_launch`` (imported on demand, never at package import time, because
+it pulls in the native extension) is the SPMD bring-up that makes the platform
+create the channels and the serving layer obtain them.
 """
 
 from __future__ import annotations
 
 from pypto_serving.serving.transport.channel_queue import (
     DEFAULT_GET_POLL_INTERVAL_SECONDS,
+    BlockingPlatformOutputQueue,
     ChannelNotReadyError,
     MessageTooLargeError,
     PlatformInputQueue,
     PlatformOutputQueue,
+)
+from pypto_serving.serving.transport.handshake import (
+    HANDSHAKE_PROTOCOL_VERSION,
+    PlatformStartupHandshake,
+    WorkerHandshake,
+    decode_handshake,
+    encode_handshake,
 )
 from pypto_serving.serving.transport.protocols import ChannelInput, ChannelOutput
 from pypto_serving.serving.transport.selection import (
@@ -39,6 +48,12 @@ from pypto_serving.serving.transport.selection import (
 
 __all__ = [
     "DEFAULT_GET_POLL_INTERVAL_SECONDS",
+    "HANDSHAKE_PROTOCOL_VERSION",
+    "BlockingPlatformOutputQueue",
+    "PlatformStartupHandshake",
+    "WorkerHandshake",
+    "decode_handshake",
+    "encode_handshake",
     "ChannelNotReadyError",
     "MessageTooLargeError",
     "PlatformInputQueue",

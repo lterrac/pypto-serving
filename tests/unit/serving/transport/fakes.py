@@ -23,17 +23,38 @@ from collections import deque
 
 
 class FakeChannel:
-    def __init__(self, capacity: int = 8) -> None:
+    """One FIFO exposing both channel ends.
+
+    ``is_full`` models BOTH dimensions of ``Output::isFull``, because the real
+    one is two-dimensional -- it checks the metadata channel's slot count and
+    then the payload ring's free bytes -- and the sizing rule the serving layer
+    depends on (``Buffer Size = capacity x max_message_bytes``, which is what
+    makes ``full_for_worst_case()`` exact) lives entirely in the byte dimension.
+    A slot-count-only double cannot test it.
+
+    ``buffer_size=None`` keeps the byte dimension unbounded, which is the right
+    default for tests that only care about slots.
+    """
+
+    def __init__(self, capacity: int = 8, buffer_size: int | None = None) -> None:
         self._buf: deque[bytes] = deque()
         self._capacity = capacity
+        self._buffer_size = buffer_size
         # Recorded for assertions: every push() call's full argument tuple.
         self.push_calls: list[tuple[bytes, int, int, int]] = []
         self.ready = True
 
     # -- Output surface -----------------------------------------------------
+    def used_bytes(self) -> int:
+        """Bytes currently occupying the payload ring."""
+        return sum(len(payload) for payload in self._buf)
+
     def is_full(self, message_size: int) -> bool:
-        del message_size  # capacity here is message-count based, not byte based
-        return len(self._buf) >= self._capacity
+        if len(self._buf) >= self._capacity:
+            return True
+        if self._buffer_size is None:
+            return False
+        return self.used_bytes() + message_size > self._buffer_size
 
     def push(
         self,
@@ -42,7 +63,7 @@ class FakeChannel:
         group_id: int = 0,
         sequence_id: int = 0,
     ) -> None:
-        if len(self._buf) >= self._capacity:
+        if self.is_full(len(payload)):
             raise AssertionError(
                 "push() called on a full FakeChannel -- the adapter under test "
                 "should have polled is_full() and waited"
