@@ -384,6 +384,48 @@ def _default_worker_main(config: "EngineConfig") -> Callable[[WorkerEndpoints], 
     return worker_main
 
 
+PIDFILE_ENV_VAR = "PYPTO_SERVING_PLATFORM_PIDFILE"
+
+
+@contextlib.contextmanager
+def _engine_pidfile() -> Iterator[None]:
+    """Publish the engine rank's pid, when asked, so a supervisor can signal THIS process.
+
+    Signalling ``mpirun`` does not shut this job down cleanly. mpirun forwards the signal
+    to both ranks and kills them, so the engine never reaches its own shutdown and never
+    sends the worker a ShutdownCommand. Measured on the deployment container (OpenMPI
+    4.1.2):
+
+        SIGTERM to mpirun           -> mpirun exits 1, both ranks left unreaped
+        SIGTERM to the engine rank  -> engine shuts down in band, the worker exits 0 on
+                                       the ShutdownCommand, and mpirun exits 0
+
+    So the pid a supervisor needs is this one, not mpirun's, and there is no way to derive
+    it from outside: mpirun's children are not labelled by rank. The file is written only
+    when the environment names one, and removed on the way out so a stale pid cannot be
+    signalled after the job ends.
+    """
+    path = os.environ.get(PIDFILE_ENV_VAR, "").strip()
+    if not path:
+        yield
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"{os.getpid()}\n")
+    except OSError as error:
+        # Not fatal: a replica that cannot publish its pid still serves. It just cannot
+        # be shut down gracefully, so say so rather than failing silently.
+        logger.warning("could not write %s=%s: %s", PIDFILE_ENV_VAR, path, error)
+        yield
+        return
+    logger.info("engine rank pid %s published to %s", os.getpid(), path)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 def run_platform_replica(
     config: "EngineConfig",
     *,
@@ -498,7 +540,8 @@ def _run_role(
         )
         _ACTIVE_ENGINE_ENDPOINTS = endpoints
         try:
-            exit_code = int(engine_main() or 0)
+            with _engine_pidfile():
+                exit_code = int(engine_main() or 0)
         finally:
             _ACTIVE_ENGINE_ENDPOINTS = None
         if not endpoints.commands.shutdown_sent:

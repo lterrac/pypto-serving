@@ -306,20 +306,46 @@ def process_tree() -> list[dict[str, str]]:
     ]
 
 
-def stop_server(process: subprocess.Popen, timeout: float) -> None:
-    """SIGINT, then escalate.
+def _engine_rank_pid(pidfile: Path | None) -> int | None:
+    """The engine rank's own pid, if it published one."""
+    if pidfile is None:
+        return None
+    try:
+        return int(pidfile.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
 
-    SIGINT is the graceful path on both transports: uvicorn runs its shutdown,
-    ``AsyncLLMEngine.stop()`` sends the worker its ``ShutdownCommand``, and on the
-    platform transport that is also what releases rank 1 from ``get(timeout=None)``.
-    ``mpirun`` forwards the signal to both ranks; rank 1 ignores it deliberately,
-    for exactly this reason.
+
+def stop_server(
+    process: subprocess.Popen, timeout: float, pidfile: Path | None = None
+) -> None:
+    """Signal the ENGINE RANK, not ``mpirun``, then escalate.
+
+    Which process gets the signal decides whether this job exits cleanly. Measured on
+    the deployment container (OpenMPI 4.1.2), with a two-rank job whose ranks both
+    return 0:
+
+        SIGTERM to mpirun           -> mpirun exits 1, and both ranks are left unreaped
+        SIGTERM to the engine rank  -> both ranks exit 0 and mpirun exits 0
+
+    The reason is that mpirun forwards the signal to every rank and kills them, so the
+    engine never runs its own shutdown and never sends the worker a ShutdownCommand.
+    Signalling the engine rank instead lets that chain run: uvicorn's shutdown ->
+    ``AsyncLLMEngine.stop()`` -> ``ShutdownCommand``, which is also what releases rank 1
+    from ``get(timeout=None)``.
+
+    On the queue transport ``process`` IS the server, so there is no pidfile and nothing
+    changes. Falling back to ``process`` when the pid is unavailable keeps the old
+    behaviour rather than leaving the job running.
     """
     if process.poll() is not None:
         return
+    target = _engine_rank_pid(pidfile)
+    if target is None:
+        target = process.pid
     for signal_number, wait in ((signal.SIGINT, timeout), (signal.SIGTERM, 30.0)):
         try:
-            os.kill(process.pid, signal_number)
+            os.kill(target, signal_number)
             process.wait(timeout=wait)
             return
         except (OSError, subprocess.TimeoutExpired):
@@ -353,13 +379,21 @@ def main(args: argparse.Namespace) -> int:
     env["PYTHONPATH"] = os.pathsep.join(
         [str(REPOSITORY_ROOT), env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
+    engine_pidfile: Path | None = None
     if args.transport == "platform":
         env["PYPTO_SERVING_TRANSPORT"] = "platform"
         # mpirun refuses to run as root without this, and the container is root.
         env.setdefault("OMPI_ALLOW_RUN_AS_ROOT", "1")
         env.setdefault("OMPI_ALLOW_RUN_AS_ROOT_CONFIRM", "1")
+        # Ask the engine rank to publish its pid, so shutdown can signal IT rather than
+        # mpirun. mpirun forwards a signal to every rank and kills them, which skips the
+        # engine's own shutdown, exits 1 and leaves the ranks unreaped -- see stop_server.
+        engine_pidfile = artifact_dir / "engine-rank.pid"
+        engine_pidfile.unlink(missing_ok=True)
+        env["PYPTO_SERVING_PLATFORM_PIDFILE"] = str(engine_pidfile)
     else:
         env.pop("PYPTO_SERVING_TRANSPORT", None)
+        env.pop("PYPTO_SERVING_PLATFORM_PIDFILE", None)
 
     port = unused_local_port()
     command = server_command(args, port, devices)
@@ -421,7 +455,7 @@ def main(args: argparse.Namespace) -> int:
                 print(f"Letting the replica settle for {args.settle_seconds:g}s...", flush=True)
                 time.sleep(args.settle_seconds)
             print("Stopping server gracefully...", flush=True)
-            stop_server(process, args.shutdown_timeout)
+            stop_server(process, args.shutdown_timeout, engine_pidfile)
             exit_code = process.returncode if process.returncode is not None else 1
             print(f"Server exit code: {exit_code}", flush=True)
     # Recorded, not used as the verdict -- the completion assertions above are.
