@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import queue
+import signal
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Sequence
@@ -47,6 +49,8 @@ from pypto_serving.serving.server.ipc import (
     encode_command,
 )
 from pypto_serving.serving.server.serving_worker import spawn_worker
+from pypto_serving.serving.transport.channel_queue import MessageTooLargeError
+from pypto_serving.serving.transport.selection import TransportKind, resolve_transport_kind
 from pypto_serving.tools.profile import (
     ProfileConfig,
     create_profile_config,
@@ -55,6 +59,15 @@ from pypto_serving.tools.profile import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ProfilingUnsupportedError(RuntimeError):
+    """Raised when this replica's transport cannot carry profile commands.
+
+    Distinguished from a generic ``RuntimeError`` so the HTTP layer can answer
+    400 (the caller asked for something this deployment does not offer) rather
+    than 500 (the server broke).
+    """
 
 
 @dataclass
@@ -251,6 +264,15 @@ class ReplicaEngineCore:
         # construction rather than re-reading os.environ every pipelined step.
         self._init_timeout = worker_init_timeout_seconds()
         self._step_timeout = worker_step_timeout_seconds()
+        # Which engine<->worker transport this replica uses. Resolved once, here,
+        # so a run that asked for the platform transport without the native
+        # extension fails at construction rather than three seconds into startup.
+        # PYPTO_SERVING_TRANSPORT unset means QUEUE, i.e. today's behaviour.
+        self._transport_kind = resolve_transport_kind()
+        # Set when _engine_loop dies. The loop task used to swallow its own
+        # exception (nothing ever retrieved it) while _running stayed True, so the
+        # replica kept accepting HTTP and served nothing; see _run_engine_loop.
+        self._loop_failure: BaseException | None = None
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
@@ -262,7 +284,7 @@ class ReplicaEngineCore:
                 profile_output_q,
                 ready_event,
                 num_pages_value,
-            ) = spawn_worker(self.config)
+            ) = self._acquire_worker_endpoints()
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -277,7 +299,7 @@ class ReplicaEngineCore:
                         "set PYPTO_WORKER_INIT_TIMEOUT to allow more time for large checkpoints"
                     )
             except BaseException:
-                await asyncio.to_thread(self._shutdown_worker, timeout=5)
+                await self._shutdown_worker_async(timeout=5)
                 raise
             logger.info("Worker ready")
 
@@ -311,17 +333,25 @@ class ReplicaEngineCore:
         freeze_gc_heap()
 
         self._running = True
-        self._loop_task = asyncio.create_task(self._engine_loop())
+        self._loop_task = asyncio.create_task(self._run_engine_loop())
         logger.info("ReplicaEngineCore started")
 
     async def stop(self) -> None:
         """Stop engine loop and worker process."""
         self._running = False
         if self._loop_task is not None:
-            await self._loop_task
+            # _run_engine_loop swallows its own failure, so this normally cannot
+            # raise -- but nothing here may skip the worker shutdown below, which
+            # would leave a worker process (or a whole worker rank) running.
+            try:
+                await self._loop_task
+            except asyncio.CancelledError:
+                logger.info("Engine loop task was cancelled during shutdown")
+            except BaseException:
+                logger.exception("Engine loop task ended with an exception")
             self._loop_task = None
 
-        await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        await self._shutdown_worker_async(timeout=30)
         logger.info("ReplicaEngineCore stopped")
 
     async def start_profile(self) -> None:
@@ -332,9 +362,143 @@ class ReplicaEngineCore:
         """Flush and stop SA profiling in this replica's worker."""
         await self._set_profile_active(False)
 
+    @property
+    def loop_failure(self) -> BaseException | None:
+        """The exception that killed the engine loop, if one did.
+
+        Public because the process exit status depends on it: a replica whose
+        engine loop died must not exit 0, or a supervisor (systemd, Kubernetes)
+        sees a clean shutdown and neither restarts it nor raises an alert.
+        """
+        return getattr(self, "_loop_failure", None)
+
+    @property
+    def _uses_platform_transport(self) -> bool:
+        """Whether this replica's engine<->worker traffic runs on platform channels."""
+        return getattr(self, "_transport_kind", TransportKind.QUEUE) is TransportKind.PLATFORM
+
+    def _acquire_worker_endpoints(self):
+        """Return ``(process, input_q, output_q, profile_q, ready, num_pages)``.
+
+        The one place the two transports diverge at startup. The queue transport
+        *creates* its IPC by spawning a worker process; the platform transport
+        *obtains* channels the launcher already brought up on this MPI rank, with
+        the worker running as rank 1 rather than as a child process.
+        """
+        if self._uses_platform_transport:
+            from pypto_serving.serving.transport.platform_launch import (
+                acquire_engine_worker_endpoints,
+            )
+
+            return acquire_engine_worker_endpoints()
+        return spawn_worker(self.config)
+
+    def _command_channel_full(self) -> bool:
+        """Whether the command channel can accept a step right now.
+
+        Backpressure, not blocking. The platform's ``commands`` edge is a bounded
+        ring, so "full" is a normal steady-state condition rather than a failure,
+        and the answer has to be known BEFORE ``scheduler.schedule()`` runs:
+        ``schedule()`` allocates KV blocks, moves requests between queues and can
+        preempt, none of which can be rolled back if the dispatch is then refused.
+        ``full_for_worst_case()`` is exact for that use (see its docstring), so a
+        step that passes this check is guaranteed to fit.
+
+        The queue transport has no such attribute -- an ``mp.Queue`` is unbounded
+        and never refuses a put -- so this is always False there and the dispatch
+        path behaves exactly as it does today.
+        """
+        check = getattr(self._input_queue, "full_for_worst_case", None)
+        return False if check is None else check()
+
+    async def _shutdown_worker_async(self, *, timeout: float) -> None:
+        """Send the worker its shutdown command and reap it.
+
+        Off-loaded to a thread on the queue transport because ``process.join()``
+        blocks for as long as the worker takes to exit. On the platform transport
+        it runs inline on the event loop instead, because the whole call is then a
+        bounded, non-blocking push and because ``is_full``/``push`` on one edge
+        must stay on one thread (channel contract, "What the binding enforces") --
+        and that thread is the loop thread, which is where every other ``put`` on
+        ``commands`` happens. Safe to run inline: the engine loop has already
+        stopped by the time this is reached, so nothing else is dispatching.
+        """
+        if self._uses_platform_transport:
+            self._shutdown_worker(timeout=timeout)
+            return
+        await asyncio.to_thread(self._shutdown_worker, timeout=timeout)
+
+    async def _run_engine_loop(self) -> None:
+        """Run ``_engine_loop`` so that an escaping exception cannot be silent.
+
+        ``asyncio.create_task(self._engine_loop())`` on its own is a trap that has
+        already been reproduced: the loop body has no ``try/except`` around
+        ``_try_dispatch_step`` and the task had no done-callback, so an exception
+        killed the task, was never retrieved, and left ``_running`` True. The
+        replica went on answering ``/health`` and accepting completions while
+        nothing was scheduling -- every request hanging until its client gave up.
+
+        So: log at CRITICAL, fail every in-flight request instead of leaving it to
+        time out, and take the replica down. Nothing is re-raised, which is what
+        keeps this from becoming another never-retrieved task exception.
+        """
+        try:
+            await self._engine_loop()
+        except asyncio.CancelledError:
+            logger.info("Engine loop cancelled")
+            raise
+        except BaseException as failure:
+            self._loop_failure = failure
+            self._running = False
+            logger.critical(
+                "Engine loop died; this replica can no longer serve. Aborting %d in-flight "
+                "request(s) and shutting down.",
+                len(self._request_contexts),
+                exc_info=True,
+            )
+            # FINISHED_ABORTED, not an invented name: ServingServer._map_finish_reason
+            # and AsyncLLMEngine.normalize_finish_reason both know it and report
+            # "aborted". An unrecognised reason falls through to "stop", which would
+            # tell a client whose request died with the engine that it completed
+            # normally.
+            self._abort_all_requests("FINISHED_ABORTED")
+            self._request_process_shutdown()
+
+    def _abort_all_requests(self, finish_reason: str) -> None:
+        """Complete every live request with ``finish_reason``, non-blockingly."""
+        for request_id, ctx in list(self._request_contexts.items()):
+            self._request_contexts.pop(request_id, None)
+            with contextlib.suppress(Exception):
+                self.scheduler.abort_request(request_id)
+            with contextlib.suppress(Exception):
+                ctx.queue.put_nowait(
+                    TokenOutput(finished=True, finish_reason=finish_reason)
+                )
+
+    def _request_process_shutdown(self) -> None:
+        """Ask this process to shut down, visibly.
+
+        SIGTERM rather than an immediate exit: uvicorn installs a handler for it
+        and runs its normal shutdown, which calls ``AsyncLLMEngine.stop()`` and so
+        still tears the worker (or the worker rank) down in order. A replica that
+        cannot serve must stop being reachable; leaving the HTTP port open on a
+        dead engine is the failure mode this whole method exists to end.
+        """
+        with contextlib.suppress(Exception):
+            os.kill(os.getpid(), signal.SIGTERM)
+
     async def _set_profile_active(self, active: bool) -> None:
         """Send an ordered worker profile command and wait for its acknowledgement."""
         async with self._profile_lock:
+            if self._uses_platform_transport:
+                raise ProfilingUnsupportedError(
+                    "Worker profiling is not available on the platform transport: the "
+                    "profile acknowledgement needs a third worker->engine channel and "
+                    "Layer 3 of the channel contract fixes the replica topology at two "
+                    "edges ('commands', 'results'). Multiplexing acks onto 'results' "
+                    "would break the engine's one-result-per-command invariant. Run with "
+                    "PYPTO_SERVING_TRANSPORT=queue to profile the worker."
+                )
             input_queue = self._input_queue
             output_queue = self._profile_output_queue
             if input_queue is None or output_queue is None:
@@ -517,8 +681,18 @@ class ReplicaEngineCore:
         """Schedule one step and dispatch it to the worker without blocking.
 
         Returns True if a non-empty step was dispatched (and enqueued as
-        in-flight), False if the scheduler produced nothing.
+        in-flight), False if the scheduler produced nothing or the command
+        channel has no room. Returning False for a full channel is the whole
+        backpressure mechanism: ``_engine_loop`` then falls through to
+        ``_await_and_apply_oldest()``, which drains a result and so frees the
+        slot. Nothing sleeps and nothing retries on the event loop.
+
+        The check comes before ``schedule()`` on purpose. ``schedule()`` mutates
+        the scheduler -- it allocates blocks, promotes waiting requests and can
+        preempt -- so a step that is scheduled and then refused cannot be undone.
         """
+        if self._command_channel_full():
+            return False
         with profile_span("scheduler.schedule", cat="scheduler"):
             scheduler_output = self.scheduler.schedule()
         for request_id, reason in scheduler_output.rejected_requests.items():
@@ -546,7 +720,28 @@ class ReplicaEngineCore:
             step_cmd = self._build_step_command(
                 scheduler_output, finished_ids, step_id=self._step_counter
             )
-            self._input_queue.put(encode_command(step_cmd))
+            try:
+                self._input_queue.put(encode_command(step_cmd))
+            except MessageTooLargeError:
+                # This batch can never be dispatched: its block tables and prompt
+                # tokens exceed the edge's per-message limit, and no amount of
+                # draining changes that. Fail the REQUESTS in it, not the replica --
+                # the scheduler state for this step is already committed, and
+                # _handle_step_error is exactly the machinery for "this batch is
+                # gone, and so is anything built on it". result_pending is False:
+                # nothing was dispatched, so no StepResult is in transit for it.
+                logger.error(
+                    "Step %d does not fit the command channel; aborting its %d "
+                    "request(s). Raise %s if this is not a runaway request.",
+                    self._step_counter,
+                    len(scheduler_output.scheduled_requests),
+                    "PYPTO_SERVING_PLATFORM_MAX_MESSAGE_BYTES",
+                    exc_info=True,
+                )
+                self._handle_step_error(
+                    self._step_counter, scheduler_output, result_pending=False
+                )
+                return False
 
         # Advance scheduler state optimistically so the NEXT schedule() (which may
         # run before this step's tokens return) sees consistent counts. No-op in
@@ -728,6 +923,11 @@ class ReplicaEngineCore:
         lock-step with the normal loop.
         """
         if not self._pending_free_ids:
+            return
+        if self._command_channel_full():
+            # Backpressure, same rule as _try_dispatch_step: leave the ids pending
+            # and retry on a later iteration rather than blocking the event loop.
+            # Nothing has been consumed yet, so there is nothing to roll back.
             return
         # Only safe to run its own request/response round-trip when nothing else
         # is in flight; the caller (engine loop) only invokes this with an empty
@@ -922,7 +1122,7 @@ class ReplicaEngineCore:
         if input_q is not None:
             with contextlib.suppress(Exception):
                 # New protocol: send encoded ShutdownCommand bytes.
-                input_q.put(encode_command(ShutdownCommand()))
+                self._put_shutdown_command(input_q, timeout=timeout)
 
         if process is not None:
             with contextlib.suppress(Exception):
@@ -936,6 +1136,50 @@ class ReplicaEngineCore:
         self._input_queue = None
         self._output_queue = None
         self._profile_output_queue = None
+
+    def _put_shutdown_command(self, input_q, *, timeout: float) -> None:
+        """Deliver the ShutdownCommand, retrying while the channel is full.
+
+        An ``mp.Queue`` is unbounded and accepts it immediately. A platform
+        ``commands`` edge is not: it can hold a command the worker has not popped
+        yet, and the existing ``contextlib.suppress(Exception)`` around this call
+        would swallow the resulting ``queue.Full`` and leave the worker rank
+        parked in its busy loop forever -- so this one put is allowed to wait.
+
+        Waiting here is safe where the dispatch path's is not: the engine loop has
+        already stopped, so the loop thread has nothing else to do, and the worker
+        pops commands as fast as it receives them, so the wait is bounded by one
+        step. It is bounded by ``timeout`` regardless, and the raised
+        ``queue.Full`` is suppressed by the caller as any other failure is.
+        """
+        payload = encode_command(ShutdownCommand())
+        try_put = getattr(input_q, "try_put", None)
+        if try_put is None:
+            input_q.put(payload)
+            self._note_shutdown_sent(input_q)
+            return
+        deadline = time.monotonic() + timeout
+        while not try_put(payload):
+            if time.monotonic() >= deadline:
+                raise queue.Full(
+                    f"command channel still full after {timeout:g}s; the worker rank "
+                    "did not consume the pending command and cannot be told to stop"
+                )
+            time.sleep(0.001)
+        self._note_shutdown_sent(input_q)
+
+    @staticmethod
+    def _note_shutdown_sent(input_q) -> None:
+        """Tell the launcher the worker has been told to stop, if it is listening.
+
+        Duck-typed like ``try_put`` so the queue transport is untouched. The
+        platform launcher owns the worker *rank*'s lifetime and cannot otherwise
+        distinguish "idle" from "abandoned"; it refuses to exit normally without
+        this. See ``platform_launch.EngineCommandQueue``.
+        """
+        note = getattr(input_q, "note_shutdown_sent", None)
+        if note is not None:
+            note()
 
 
 class AsyncLLMEngine:
@@ -1008,6 +1252,20 @@ class AsyncLLMEngine:
     async def stop(self) -> None:
         """Stop all DP engine cores."""
         await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
+
+    @property
+    def loop_failure(self) -> BaseException | None:
+        """The first replica engine-loop failure, if any replica's loop died.
+
+        The server reads this after ``uvicorn.run`` returns so the process exit
+        status reflects it. Without that a replica whose engine loop crashed
+        exits 0, and no supervisor restarts it.
+        """
+        for core in self._cores:
+            failure = core.loop_failure
+            if failure is not None:
+                return failure
+        return None
 
     async def start_profile(self) -> None:
         """Start SA profiling in every replica worker."""

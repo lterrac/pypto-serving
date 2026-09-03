@@ -638,7 +638,14 @@ def run_serve(
     *,
     host: str = "0.0.0.0",
     port: int = 8000,
-) -> None:
+) -> int:
+    """Serve until uvicorn stops, and return the process exit code.
+
+    Non-zero when a replica's engine loop died. ``uvicorn.run`` returns normally
+    after the SIGTERM that ``ReplicaEngineCore`` sends itself in that case, so
+    without this check the process would exit 0 and a supervisor would see a
+    clean shutdown: no restart, no crash-loop backoff, no alert.
+    """
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     for _n in ("simpler_setup", "pypto", "simpler"):
@@ -713,6 +720,14 @@ def run_serve(
     print(f"  Endpoints: {endpoints}")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+    failure = async_engine.loop_failure
+    if failure is not None:
+        logging.getLogger(__name__).critical(
+            "Serving exited because a replica engine loop died: %r", failure
+        )
+        return 1
+    return 0
 
 
 def run_generate(
@@ -871,14 +886,37 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.prompt:
         run_generate(config, prompts=args.prompt, generate_config=generate_config)
-    else:
-        run_serve(
+        return 0
+
+    # PYPTO_SERVING_TRANSPORT selects how the engine talks to its worker.
+    # Unset (or "queue") is the default and reaches run_serve directly, exactly as
+    # before: the engine spawns a worker process and creates its own mp.Queues.
+    # "platform" makes the platform own the transport instead -- the same argv runs
+    # on every MPI rank, rank 0 serves the API and rank 1 is the worker -- and
+    # resolve_transport_kind() raises here rather than falling back if the native
+    # extension is missing, because a silent fallback would report a platform run
+    # that never happened.
+    from pypto_serving.serving.transport.selection import TransportKind, resolve_transport_kind
+
+    if resolve_transport_kind() is TransportKind.PLATFORM:
+        from pypto_serving.serving.transport.platform_launch import run_platform_replica
+
+        return run_platform_replica(
             config,
-            generate_config,
-            host=args.host,
-            port=args.port,
+            engine_main=lambda: run_serve(
+                config,
+                generate_config,
+                host=args.host,
+                port=args.port,
+            ),
         )
-    return 0
+
+    return run_serve(
+        config,
+        generate_config,
+        host=args.host,
+        port=args.port,
+    )
 
 
 @contextlib.contextmanager
