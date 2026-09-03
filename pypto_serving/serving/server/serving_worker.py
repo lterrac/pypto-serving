@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import multiprocessing as mp
 import os
@@ -27,6 +28,7 @@ from pypto_serving.config.types import (
     SamplingParams,
 )
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
+from pypto_serving.serving.transport.handshake import WorkerHandshake, encode_handshake
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
@@ -1025,6 +1027,74 @@ def _worker_entry(
             worker.close()
         except Exception:
             logger.exception("Worker process cleanup failed")
+        get_profiler(initially_active=False).stop()
+
+
+def run_worker_over_channels(
+    config: EngineConfig,
+    input_queue,
+    output_queue,
+    *,
+    worker_factory=WorkerProcess,
+) -> None:
+    """Run the worker in *this* process over caller-supplied channel endpoints.
+
+    The platform transport's counterpart to ``_worker_entry``. Same lifecycle --
+    initialise the device and model, publish the startup handshake, run the busy
+    loop, close -- but there is no child process and no shared-memory
+    ``Event``/``Value``: this is MPI rank 1 of the SPMD launch, and the queues
+    are platform channels (see
+    ``pypto_serving.serving.transport.platform_launch``).
+
+    ``ready_event.set()`` and ``num_pages_value.value = n`` become one opaque
+    handshake message on the ``results`` edge, pushed before the busy loop
+    starts and consumed by ``ReplicaEngineCore.start()`` before the engine loop
+    exists (see ``transport/handshake.py`` for why it is not a platform
+    concept). A failed init reports the error in that handshake instead of
+    setting a ready flag and leaving the page count at zero, so the engine rank
+    fails loudly rather than initialising a zero-block KV cache.
+
+    ``worker_factory`` exists so a test can substitute a ``WorkerProcess``
+    subclass whose model execution is stubbed while every other line of this
+    path -- the busy loop, the command codec, the lifecycle bookkeeping -- stays
+    the real one. It is not used by the serving CLI.
+
+    Logging is configured here for the same reason ``_worker_entry`` configures
+    it: this rank never runs ``run_serve``, so nothing else has set up a handler
+    for the per-stage progress logs.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d %(levelname)s | worker-rank | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+        force=True,
+    )
+    for _n in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
+
+    worker = worker_factory(config, input_queue, output_queue, None)
+    try:
+        try:
+            num_pages = worker.init_device_and_model()
+        except Exception as exc:
+            logger.error("Worker rank failed to initialise: %s", exc, exc_info=True)
+            # Best effort: the engine rank is blocked on this handshake, and a
+            # silent exit here would leave it waiting out its whole init timeout.
+            with contextlib.suppress(Exception):
+                output_queue.put(encode_handshake(WorkerHandshake(error=str(exc))))
+            raise
+        # Model weights, compiled kernels and KV-cache objects are now resident;
+        # freeze them so the GC will not rescan them during decode. Per-process,
+        # exactly as in _worker_entry -- this rank has its own heap.
+        freeze_gc_heap()
+        output_queue.put(encode_handshake(WorkerHandshake(num_pages=num_pages)))
+        worker.busy_loop()
+    finally:
+        try:
+            worker.close()
+        except Exception:
+            logger.exception("Worker rank cleanup failed")
         get_profiler(initially_active=False).stop()
 
 

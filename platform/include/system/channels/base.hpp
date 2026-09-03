@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -175,7 +176,9 @@ class Base
   const channelConfig_t _config;
   const slotKeys_t      _slotKeys;
 
-  bool _isReady;
+  // Written by the channel controller's service worker in initialize(), read by whoever is
+  // waiting for the channel to come up -- a different thread, so a plain bool is a data race.
+  std::atomic<bool> _isReady;
 
   // Local coordination buffers
   std::shared_ptr<HiCR::LocalMemorySlot> _dataChannelLocalCoordinationBufferForSizes;
