@@ -1088,6 +1088,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self.cache_metadata = DeepSeekV4CacheMetadataBuilder(layout=compiled.layout)
         self.input_builder: DeepSeekV4InputBuilder | None = None
         self._init_l3_dispatch(stacked=True)
+        # Set when the shared L3 worker is built: the platform factory that created this
+        # program's comm windows, or None when the runtime created them. Kept so a run can
+        # report which party allocated, rather than leaving it to be inferred.
+        self._comm_window_factory: Any | None = None
         self._cache_group_specs: tuple[KVCacheGroupSpec, ...] = ()
         self._cache_group_num_blocks: dict[str, int] = {}
         self._decode_device_cache: DeepSeekV4DeviceCache | None = None
@@ -4330,7 +4334,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 raise RuntimeError("DeepSeekV4 L3 callables are not compiled")
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
+            from pypto_serving.platform.domain_factory import platform_domain_factory  # noqa: PLC0415
+
             compiled = [callable_spec.compiled for callable_spec in compiled_callables]
+            # The MoE dispatch/combine windows are declared by the model and materialised by
+            # the platform: `domain_factory` is the only step of that chain serving supplies.
+            # It is spread rather than passed, because `platform_domain_factory` returns None
+            # against a pypto without the hook, and the runtime then allocates as it always has.
+            domain_factory = platform_domain_factory()
+            factory_kwargs = {} if domain_factory is None else {"domain_factory": domain_factory}
             with profile_span(
                 "DeepSeekV4ModelRunner.create_persistent_l3_worker",
                 cat="executor",
@@ -4345,7 +4357,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 if run_config is not None:
                     # Materialize the full ring arena before KV sizing reads free HBM.
                     worker_kwargs["config"] = run_config
+                # Empty unless the platform supplied a comm-window factory, so a stock
+                # pypto without the domain_factory parameter is unaffected.
+                worker_kwargs.update(factory_kwargs)
                 worker = DistributedWorker(compiled, **worker_kwargs)
+            self._comm_window_factory = domain_factory
+            logger.info(
+                "DeepSeekV4 comm windows are created by %s",
+                "the platform domain factory" if domain_factory is not None else "the pypto runtime",
+            )
             self._l3_worker = worker
         return worker
 

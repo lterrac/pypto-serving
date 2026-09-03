@@ -8,10 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """Python surface of the serving platform.
 
+Two independent layers live here.
+
 **Host-side channels** -- ``Deployment``, ``Input``, ``Output``, ``Platform``, ``Runtime``.
 The Python process is the MPI rank; the platform runs inside it as a library, so these are
 only usable under ``mpirun -np N python -m pypto_serving....``. See
 ``platform/docs/python-channel-contract.md``.
+
+**Device-payload channels** -- :mod:`pypto_serving.platform.device_channels`. Symmetric NPU
+windows that a pypto kernel reads and writes directly, with the host out of the data path.
+Unrelated to the host-side channels above: no MPI, no HiCR, no native extension.
 
 ``_native`` is a compiled extension backing the host-side channels only. It is produced by the
 platform meson project with ``-DbuildPythonBindings=true``, which stages the built ``.so`` into
@@ -25,14 +31,25 @@ the same ``ImportError`` it always did, just at the point of use. That also make
 instead of raising while importing this package on its way to the submodule.
 """
 
+from pypto_serving.platform.device_channels import (
+    DeviceBufferSpec,
+    DeviceChannelRequest,
+    DeviceChannelSet,
+    open_device_channels,
+)
+
 _NATIVE_EXPORTS = ("Deployment", "Input", "Output", "Platform", "Runtime")
 
 __all__ = [
+    "DeviceBufferSpec",
+    "DeviceChannelRequest",
+    "DeviceChannelSet",
     "Deployment",
     "Input",
     "Output",
     "Platform",
     "Runtime",
+    "open_device_channels",
 ]
 
 
