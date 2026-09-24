@@ -301,3 +301,42 @@ TEST(ConfigFileTest, LoadErrorsNameThePath)
     EXPECT_NE(std::string(e.what()).find("not valid JSON"), std::string::npos);
   }
 }
+
+TEST(ConfigFileTest, RulesModeRequiresAnInstancePerReplica)
+{
+  // Left out, instanceId defaults to 0 and a published rule addresses whichever
+  // replica happens to be instance 0 -- a deployment that looks like it works.
+  const std::string msg = errorOf(R"({"routing_mode": "rules", "replicas": [{"name": "a", "host": "h", "port": 1}]})");
+  EXPECT_NE(msg.find("'instance' is required when routing_mode is 'rules'"), std::string::npos) << msg;
+
+  // ingress publishes nothing, so it does not need one.
+  EXPECT_EQ(errorOf(R"({"routing_mode": "ingress", "replicas": [{"name": "a", "host": "h", "port": 1}]})"), "");
+
+  const std::string dup = errorOf(R"({"routing_mode": "rules", "replicas": [
+    {"name": "a", "host": "h", "port": 1, "instance": 7},
+    {"name": "b", "host": "h", "port": 2, "instance": 7}]})");
+  EXPECT_NE(dup.find("duplicate instance 7"), std::string::npos) << dup;
+}
+
+TEST(ConfigFileTest, PartitionsMustFormAChainWithNoGaps)
+{
+  // {0, 2} plans a two-hop path that skips stage 1 -- routing around a
+  // partition rather than through it.
+  const std::string msg = errorOf(R"({"routing_mode": "ingress", "partition": 0, "replicas": [
+    {"name": "a", "host": "h", "port": 1, "partition": 0},
+    {"name": "c", "host": "h", "port": 2, "partition": 2}]})");
+  EXPECT_NE(msg.find("partitions must be 0..1 with no gaps"), std::string::npos) << msg;
+
+  EXPECT_EQ(errorOf(R"({"routing_mode": "ingress", "partition": 0, "replicas": [
+    {"name": "a", "host": "h", "port": 1, "partition": 0},
+    {"name": "b", "host": "h", "port": 2, "partition": 1}]})"),
+            "");
+}
+
+TEST(ConfigFileTest, RejectsTwoReplicasOnTheSameEndpoint)
+{
+  const std::string msg = errorOf(R"({"routing_mode": "ingress", "replicas": [
+    {"name": "a", "host": "h", "port": 1},
+    {"name": "b", "host": "h", "port": 1}]})");
+  EXPECT_NE(msg.find("duplicate endpoint http://h:1"), std::string::npos) << msg;
+}

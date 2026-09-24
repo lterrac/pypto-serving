@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -47,9 +48,11 @@ class ChannelRuleTransport final : public router::RuleTransport
     if (channel == nullptr) { return; }
 
     RulePublish rule;
-    rule.sessionId       = sessionId;
-    rule.nextHopName     = nextHop.name;
-    rule.nextHopInstance = instanceFor(nextHop.name);
+    rule.sessionId             = sessionId;
+    rule.nextHopName           = nextHop.name;
+    const auto nextHopInstance = instanceFor(nextHop.name);
+    if (!nextHopInstance.has_value()) { return; } // unknown hop: publishing would address the wrong replica
+    rule.nextHopInstance = *nextHopInstance;
     rule.generation      = generation;
 
     const auto payload = encodeRulePublish(rule);
@@ -84,10 +87,13 @@ class ChannelRuleTransport final : public router::RuleTransport
     return it == _channels.end() ? nullptr : it->second;
   }
 
-  [[nodiscard]] uint64_t instanceFor(const std::string &replicaName) const
+  /// Nullopt for a name this transport was not given. Returning 0 would be a
+  /// valid-looking instance id pointing at whichever replica is instance 0.
+  [[nodiscard]] std::optional<uint64_t> instanceFor(const std::string &replicaName) const
   {
     const auto it = _instanceByName.find(replicaName);
-    return it == _instanceByName.end() ? 0 : it->second;
+    if (it == _instanceByName.end()) { return std::nullopt; }
+    return it->second;
   }
 
   void send(system::channels::Output &channel, system::channels::Message::messageType_t type, uint64_t generation, const std::vector<uint8_t> &payload)

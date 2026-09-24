@@ -36,6 +36,11 @@ struct RoutingPath
   /// Bumped whenever the path is replanned, so a replica holding an older rule
   /// can tell that it is stale. Failure recovery depends on this: a lost replica
   /// invalidates the paths through it, and in-flight work must not follow them.
+  ///
+  /// The high half is the coordinator's epoch and the low half a counter, so a
+  /// restarted coordinator issues generations above the ones replicas already
+  /// hold. A bare counter would restart at 1 and every new rule would look
+  /// stale to a replica that survived the restart.
   uint64_t generation = 0;
 
   [[nodiscard]] bool empty() const { return hops.empty(); }
@@ -158,7 +163,14 @@ class DistributedRuleStrategy : public RoutingStrategy
 {
   public:
 
-  DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport, size_t maxPaths = DEFAULT_MAX_SESSIONS);
+  /// `epoch` is the high half of every generation this instance issues. It must
+  /// increase across restarts of the same coordinator; the default is the wall
+  /// clock in seconds, which a deployment can override with something it
+  /// persists.
+  DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport, size_t maxPaths = DEFAULT_MAX_SESSIONS, uint64_t epoch = 0);
+
+  /// Generations are (epoch << 32 | counter).
+  [[nodiscard]] static uint64_t makeGeneration(uint64_t epoch, uint32_t counter) { return (epoch << 32) | counter; }
 
   /// The first request for a session plans and publishes; later ones reuse the
   /// standing path without consulting the planner.
@@ -193,7 +205,8 @@ class DistributedRuleStrategy : public RoutingStrategy
   std::map<std::string, Standing> _paths;
   /// Least recently used at the front.
   std::list<std::string> _order;
-  uint64_t               _generation = 0;
+  uint64_t               _epoch;
+  uint32_t               _counter = 0;
   RoutingStats           _stats;
 };
 

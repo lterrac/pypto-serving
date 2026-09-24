@@ -602,3 +602,62 @@ TEST(SchedulerPhaseTest, MixedWorkIsUnrestrictedWithoutTheFlag)
   EXPECT_GT(second.numPrefillTokens, 0);
   EXPECT_GT(second.numDecodeTokens, 0);
 }
+
+TEST(SchedulerPreemptionTest, AReplayStaysInPrefillUntilItOwesOneToken)
+{
+  // A preempted request keeps the tokens it generated but loses its KV, so it
+  // has to recompute prompt + generated. Testing isPrefill against the prompt
+  // boundary let it flip to decode with several tokens still outstanding, and
+  // decode feeds exactly one -- leaving the rows in between unwritten and the
+  // kernel attending stale pages.
+  KvCacheManager manager(64, 1, false);
+  auto           config            = baseConfig();
+  config.maxNumScheduledTokens     = 64;
+  config.longPrefillTokenThreshold = 0;
+  Scheduler scheduler(config, manager);
+
+  auto request = makeRequest("r", {1, 2, 3});
+  scheduler.addRequest(request);
+
+  // Prefill, then three decodes, so it holds three generated tokens.
+  auto out = scheduler.schedule();
+  (void)scheduler.updateFromOutput(out, {{"r", {10}}});
+  for (const int token : {11, 12})
+  {
+    out = scheduler.schedule();
+    (void)scheduler.updateFromOutput(out, {{"r", {token}}});
+  }
+  ASSERT_EQ(request->outputTokenIds.size(), 3u);
+  EXPECT_FALSE(request->isPrefill()) << "steady decode owes exactly one token";
+
+  // Preempt it by hand: the state a real preemption leaves behind.
+  request->numComputedTokens = 0;
+  EXPECT_TRUE(request->isPrefill()) << "it owes prompt + 3 generated";
+
+  // Walk the replay one token at a time and check it never decodes early.
+  const int sampleAt = request->sampleAtLength(); // 3 prompt + 3 generated
+  EXPECT_EQ(sampleAt, 6);
+  for (int computed = 0; computed < sampleAt - 1; ++computed)
+  {
+    request->numComputedTokens = computed;
+    EXPECT_TRUE(request->isPrefill()) << "computed=" << computed << " still owes " << sampleAt - computed;
+  }
+  // Only with one token left does decode become valid: it feeds that token at
+  // the full sequence length, and every row before it is present.
+  request->numComputedTokens = sampleAt - 1;
+  EXPECT_FALSE(request->isPrefill());
+}
+
+TEST(SchedulerPreemptionTest, AReplaySamplesOnceAtTheEndNotAtTheEndOfThePrompt)
+{
+  auto request            = makeRequest("r", {1, 2, 3});
+  request->outputTokenIds = {10, 11};
+
+  // A fresh request samples when a chunk completes its prompt.
+  auto fresh = makeRequest("fresh", {1, 2, 3});
+  EXPECT_EQ(fresh->sampleAtLength(), 3);
+
+  // A replay samples only once it has fed everything it already has, so the
+  // chunk that crosses the prompt does not emit a duplicate token.
+  EXPECT_EQ(request->sampleAtLength(), 5);
+}

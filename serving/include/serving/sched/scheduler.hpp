@@ -104,8 +104,18 @@ struct Request
   /// consistent when the next step is scheduled before the in-flight token lands.
   [[nodiscard]] int numTokens() const { return numPromptTokens() + static_cast<int>(outputTokenIds.size()) + numOutputPlaceholders; }
 
-  [[nodiscard]] int  numNewTokensNeeded() const { return numTokens() - numComputedTokens; }
-  [[nodiscard]] bool isPrefill() const { return numComputedTokens < numPromptTokens(); }
+  [[nodiscard]] int numNewTokensNeeded() const { return numTokens() - numComputedTokens; }
+  /// Tokens that still have to be fed: the prompt plus everything generated,
+  /// less what is already in the KV cache. A step feeding the last of them
+  /// samples the next token.
+  [[nodiscard]] int sampleAtLength() const { return numPromptTokens() + static_cast<int>(outputTokenIds.size()); }
+
+  /// Decode feeds exactly one token, so it is only valid when everything before
+  /// that token is already computed. A preempted request keeps the tokens it
+  /// generated but loses its KV, so on replay it owes more than one and stays
+  /// in prefill past the end of its prompt -- which is what stops the decode
+  /// path from skipping the rows in between.
+  [[nodiscard]] bool isPrefill() const { return outputTokenIds.empty() || sampleAtLength() - numComputedTokens > 1; }
   /// Tokens [begin, end) of prompt-then-generated. Building the whole sequence
   /// to take a chunk out of it is O(context) per chunk.
   [[nodiscard]] std::vector<int> tokenRange(int begin, int end) const;

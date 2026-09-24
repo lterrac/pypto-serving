@@ -384,3 +384,26 @@ TEST(DistributedRulesTest, TellsTheTransportAReplicaIsUnreachable)
   ASSERT_EQ(transport.unreachable.size(), 1u);
   EXPECT_EQ(transport.unreachable.front(), path.hops[1].name);
 }
+
+TEST(DistributedRulesTest, ARestartIssuesGenerationsAboveTheOnesReplicasHold)
+{
+  SessionDirectory sessions(600.0);
+  RoutingPlanner   planner(RoutingConfig{}, sessions, pipeline());
+  FakeTransport    transport;
+
+  // A coordinator runs, publishes, and dies.
+  uint64_t lastBeforeRestart = 0;
+  {
+    DistributedRuleStrategy before(planner, transport, 16, /*epoch=*/100);
+    for (int i = 0; i < 5; ++i) { lastBeforeRestart = before.onRequest("s" + std::to_string(i)).generation; }
+  }
+
+  // It comes back. A bare counter would restart at 1, and every new rule would
+  // look stale to a replica still holding one from before.
+  DistributedRuleStrategy after(planner, transport, 16, /*epoch=*/101);
+  const uint64_t          first = after.onRequest("fresh").generation;
+  EXPECT_GT(first, lastBeforeRestart);
+
+  // Within one epoch they still increase.
+  EXPECT_GT(after.onRequest("fresh2").generation, first);
+}
