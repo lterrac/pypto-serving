@@ -13,6 +13,7 @@ servingTestSources = files(
   'router/test_strategy.cpp',
   'coordinator/test_coordinator.cpp',
   'coordinator/test_rule_message.cpp',
+  'coordinator/test_config_file.cpp',
   'router/test_router_server.cpp',
   'model/test_chat_template.cpp',
 )

@@ -1,8 +1,8 @@
 /**
- * Drives the two routing strategies, printing the path per turn and what
- * `rules` would publish.
+ * Drives the two routing strategies from a configuration file, printing the
+ * path per turn and what `rules` would publish.
  *
- *   routing-modes [--routing-mode ingress|rules]
+ *   routing-modes --config FILE
  */
 
 #include <cstdio>
@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include <serving/coordinator/config_file.hpp>
 #include <serving/router/strategy.hpp>
 
 namespace
@@ -34,16 +35,6 @@ class PrintingTransport : public RuleTransport
   }
 };
 
-ReplicaSpec replica(const std::string &name, int partition, int port)
-{
-  ReplicaSpec s;
-  s.name      = name;
-  s.partition = partition;
-  s.host      = "127.0.0.1";
-  s.port      = port;
-  return s;
-}
-
 void printPath(const char *label, const RoutingPath &path)
 {
   std::printf("      %s: ", label);
@@ -55,31 +46,39 @@ void printPath(const char *label, const RoutingPath &path)
 
 int main(int argc, char **argv)
 {
-  std::string modeText = "ingress";
+  std::string configPath;
   for (int i = 1; i < argc; ++i)
   {
     const std::string arg = argv[i];
-    if (arg == "--routing-mode" && i + 1 < argc) { modeText = argv[++i]; }
+    if (arg == "--config" && i + 1 < argc) { configPath = argv[++i]; }
     else if (arg == "--help" || arg == "-h")
     {
-      std::printf("usage: %s [--routing-mode ingress|rules]\n", argv[0]);
+      std::printf("usage: %s --config FILE\n", argv[0]);
       return 0;
     }
+  }
+  if (configPath.empty())
+  {
+    std::fprintf(stderr, "usage: %s --config FILE\n", argv[0]);
+    return 2;
   }
 
   try
   {
-    const RoutingMode mode = parseRoutingMode(modeText);
-    std::printf("routing mode: %s (%s)\n\n",
+    const serving::coordinator::CoordinatorConfig config = serving::coordinator::loadCoordinatorConfig(configPath);
+    const RoutingMode                             mode   = config.mode;
+    std::printf("routing mode: %s (%s), from %s\n\n",
                 routingModeName(mode),
-                mode == RoutingMode::CoordinatorIngress ? "Option A -- coordinator is the ingress point" : "Option B -- coordinator publishes routing rules");
+                mode == RoutingMode::CoordinatorIngress ? "Option A -- coordinator is the ingress point" : "Option B -- coordinator publishes routing rules",
+                configPath.c_str());
 
-    // Three partitions of two replicas: a split model, each stage replicated.
-    const std::vector<ReplicaSpec> replicas{
-      replica("p0a", 0, 8000), replica("p0b", 0, 8001), replica("p1a", 1, 8002), replica("p1b", 1, 8003), replica("p2a", 2, 8004), replica("p2b", 2, 8005)};
+    // The file lists every replica in the pipeline; the strategy layer wants
+    // only their routing identity.
+    std::vector<ReplicaSpec> replicas;
+    for (const auto &binding : config.replicas) { replicas.push_back(binding.spec); }
 
-    SessionDirectory  sessions(600.0);
-    RoutingPlanner    planner(RoutingConfig{}, sessions, replicas);
+    SessionDirectory  sessions(config.routing.sessionTtlSeconds);
+    RoutingPlanner    planner(config.routing, sessions, replicas);
     PrintingTransport transport;
     auto              strategy = makeRoutingStrategy(mode, planner, &transport);
 
