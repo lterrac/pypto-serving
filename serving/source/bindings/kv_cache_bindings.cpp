@@ -43,7 +43,11 @@ void bindKvCache(py::module_ &m)
          })
     .def("release_cached_blocks", &KvCacheManager::releaseCachedBlocks, py::arg("blocks"))
     .def("compute_block_hashes", &KvCacheManager::computeBlockHashes, py::arg("token_ids"))
-    .def("get_computed_blocks", &KvCacheManager::getComputedBlocks, py::arg("token_ids"), py::arg("max_cache_hit_tokens") = py::none(), py::return_value_policy::reference_internal)
+    .def("get_computed_blocks",
+         static_cast<std::vector<KVCacheBlock *> (KvCacheManager::*)(const std::vector<int> &, std::optional<int>)>(&KvCacheManager::getComputedBlocks),
+         py::arg("token_ids"),
+         py::arg("max_cache_hit_tokens") = py::none(),
+         py::return_value_policy::reference_internal)
     .def("cache_block_ids", &KvCacheManager::cacheBlockIds, py::arg("block_ids"), py::arg("block_hashes"), py::arg("start"), py::arg("end"))
     .def("has_groups", &KvCacheManager::hasGroups)
     .def("has_eagle_groups", &KvCacheManager::hasEagleGroups)

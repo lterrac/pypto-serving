@@ -34,11 +34,17 @@ const char *statusName(RequestStatus status)
   return "UNKNOWN";
 }
 
-std::vector<int> Request::allTokenIds() const
+std::vector<int> Request::tokenRange(int begin, int end) const
 {
-  std::vector<int> all = promptTokenIds;
-  all.insert(all.end(), outputTokenIds.begin(), outputTokenIds.end());
-  return all;
+  const int promptLen = static_cast<int>(promptTokenIds.size());
+  const int total     = promptLen + static_cast<int>(outputTokenIds.size());
+  begin               = std::clamp(begin, 0, total);
+  end                 = std::clamp(end, begin, total);
+
+  std::vector<int> out;
+  out.reserve(static_cast<size_t>(end - begin));
+  for (int i = begin; i < end; ++i) { out.push_back(i < promptLen ? promptTokenIds[static_cast<size_t>(i)] : outputTokenIds[static_cast<size_t>(i - promptLen)]); }
+  return out;
 }
 
 void SchedulerConfig::validate() const
@@ -340,7 +346,9 @@ SchedulerOutput Scheduler::schedule()
 
     if (_config.enablePrefixCache)
     {
-      auto cachedBlocks = _kvCacheManager.getComputedBlocks(request->promptTokenIds);
+      // request->blockHashes was computed over this same prompt at admission;
+      // re-deriving it here costs O(prompt) on every step the request waits.
+      auto cachedBlocks = _kvCacheManager.getComputedBlocks(request->blockHashes, static_cast<int>(request->promptTokenIds.size()));
       if (!cachedBlocks.empty())
       {
         request->cachedBlockIds.clear();

@@ -243,10 +243,7 @@ StepCommand Engine::buildStepCommand(const sched::SchedulerOutput &output) const
       item.numComputedTokens = scheduled.numComputedTokens;
       item.promptLen         = request.numPromptTokens();
 
-      const auto all   = request.allTokenIds();
-      const int  begin = std::min(scheduled.numComputedTokens, static_cast<int>(all.size()));
-      const int  end   = std::min(begin + scheduled.numNewTokens, static_cast<int>(all.size()));
-      item.chunkTokens.assign(all.begin() + begin, all.begin() + end);
+      item.chunkTokens = request.tokenRange(scheduled.numComputedTokens, scheduled.numComputedTokens + scheduled.numNewTokens);
       command.prefill.push_back(std::move(item));
     }
     else
