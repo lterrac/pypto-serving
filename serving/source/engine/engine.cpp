@@ -65,9 +65,19 @@ void Engine::start()
   // Model first, thread second. Once the executor is the Python bridge this is
   // the call that forks simpler's per-chip children, and that must happen while
   // the process is still single-threaded.
-  const int numPages = _executor.registerModel();
-  _kvCacheManager.initialize(_config.runtime, numPages);
-  _scheduler = std::make_unique<sched::Scheduler>(_config.scheduler, _kvCacheManager);
+  try
+  {
+    const int numPages = _executor.registerModel();
+    _kvCacheManager.initialize(_config.runtime, numPages);
+    _scheduler = std::make_unique<sched::Scheduler>(_config.scheduler, _kvCacheManager);
+  }
+  catch (...)
+  {
+    // Loading the model is the common failure. Leaving _started set would make
+    // addRequest admit into a null scheduler.
+    _started = false;
+    throw;
+  }
 
   _running = true;
   _thread  = std::thread([this] { loop(); });
@@ -108,7 +118,7 @@ int Engine::pendingTokenLoad() const
 
 std::shared_ptr<RequestStream> Engine::addRequest(const std::string &requestId, const std::vector<int> &promptTokenIds, const config::GenerateConfig &generateConfig)
 {
-  if (!_started.load()) { throw std::runtime_error("engine is not started"); }
+  if (!isReady()) { throw std::runtime_error("engine is not ready"); }
 
   auto request            = std::make_shared<sched::Request>();
   request->requestId      = requestId;
@@ -127,7 +137,7 @@ std::shared_ptr<RequestStream> Engine::addRequest(const std::string &requestId, 
   RequestContext ctx;
   ctx.request        = request;
   ctx.stream         = stream;
-  ctx.detokenizer    = std::make_unique<IncrementalDetokenizer>(_tokenizer);
+  ctx.detokenizer    = std::make_shared<IncrementalDetokenizer>(_tokenizer);
   ctx.generateConfig = generateConfig;
 
   {
@@ -252,33 +262,93 @@ StepCommand Engine::buildStepCommand(const sched::SchedulerOutput &output) const
   return command;
 }
 
+namespace
+{
+
+/// Offset of the earliest stop string in `text`, or npos. The stop text itself
+/// is not part of the answer, so the caller truncates there.
+size_t firstStopOffset(const std::string &text, const std::vector<std::string> &stopStrings)
+{
+  size_t earliest = std::string::npos;
+  for (const std::string &stop : stopStrings)
+  {
+    if (stop.empty()) { continue; }
+    const size_t at = text.find(stop);
+    if (at != std::string::npos && at < earliest) { earliest = at; }
+  }
+  return earliest;
+}
+
+} // namespace
+
 void Engine::deliver(const std::vector<sched::RequestOutput> &outputs)
 {
   for (const sched::RequestOutput &out : outputs)
   {
-    std::shared_ptr<RequestStream> stream;
-    TokenOutput                    update;
-    bool                           finished = false;
+    std::shared_ptr<RequestStream>          stream;
+    std::shared_ptr<IncrementalDetokenizer> detokenizer;
+    sched::RequestPtr                       request;
+    std::string                             lastText;
 
     {
       const std::lock_guard<std::mutex> lock(_mutex);
       const auto                        it = _contexts.find(out.requestId);
       if (it == _contexts.end()) { continue; }
-      RequestContext &ctx = it->second;
+      stream      = it->second.stream;
+      detokenizer = it->second.detokenizer;
+      request     = it->second.request;
+      lastText    = it->second.lastText;
+    }
 
-      const std::string text = out.finished ? ctx.detokenizer->finalize(ctx.request->outputTokenIds) : ctx.detokenizer->append(ctx.request->outputTokenIds);
+    // Unlocked: with a Python tokenizer this takes the GIL, and holding _mutex
+    // across that inverts the lock order against any Python thread calling in.
+    // Only this thread touches the detokenizer or the request, and the shared
+    // pointers keep both alive if the context is erased meanwhile.
+    std::string text;
+    try
+    {
+      text = out.finished ? detokenizer->finalize(request->outputTokenIds) : detokenizer->append(request->outputTokenIds);
+    }
+    catch (const std::exception &e)
+    {
+      failRequest(out.requestId, std::string("detokenization failed: ") + e.what());
+      continue;
+    }
 
-      update.requestId    = out.requestId;
-      update.text         = text;
-      update.delta        = text.size() >= ctx.lastText.size() ? text.substr(ctx.lastText.size()) : std::string{};
-      update.tokenId      = out.newTokenId;
-      update.finished     = out.finished;
-      update.finishReason = out.finishReason;
-      ctx.lastText        = text;
+    bool        finished     = out.finished;
+    std::string finishReason = out.finishReason;
+    if (!finished)
+    {
+      // Stop strings match the decoded text, so the scheduler cannot check them.
+      const size_t cut = firstStopOffset(text, request->stopStrings);
+      if (cut != std::string::npos)
+      {
+        text.resize(cut);
+        finished     = true;
+        finishReason = "FINISHED_STOP";
+      }
+    }
 
-      stream   = ctx.stream;
-      finished = out.finished;
-      if (finished) { _contexts.erase(it); }
+    TokenOutput update;
+    update.requestId    = out.requestId;
+    update.delta        = text.size() >= lastText.size() ? text.substr(lastText.size()) : std::string{};
+    update.tokenId      = out.newTokenId;
+    update.finished     = finished;
+    update.finishReason = finishReason;
+    if (finished) { update.text = text; }
+
+    {
+      const std::lock_guard<std::mutex> lock(_mutex);
+      const auto                        it = _contexts.find(out.requestId);
+      if (it == _contexts.end()) { continue; }
+      if (!finished) { it->second.lastText = std::move(text); }
+      else
+      {
+        // A stop string ends the request here rather than in the scheduler, so
+        // its blocks and its slot have to be released explicitly.
+        if (!out.finished && _scheduler != nullptr) { _scheduler->finishRequest(out.requestId, sched::RequestStatus::FinishedStop); }
+        _contexts.erase(it);
+      }
     }
 
     stream->push(std::move(update));

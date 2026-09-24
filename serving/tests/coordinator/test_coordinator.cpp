@@ -1,4 +1,6 @@
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -189,4 +191,47 @@ TEST(CoordinatorTest, FinalizeReleasesAndIsIdempotent)
   EXPECT_NO_THROW(coordinator.finalize());
   // After finalize the engine may still tick once before dropping the module.
   EXPECT_NO_THROW(coordinator.service());
+}
+
+TEST(CoordinatorTest, RoutesWhileTheServiceTickApplies)
+{
+  // routeFor runs on request threads and service() on the platform's timer;
+  // both reach the same strategy, planner and session directory. Without a lock
+  // this is concurrent mutation of std::map/std::list, so it corrupts rather
+  // than merely returning something stale. Run under ThreadSanitizer.
+  RecordingTransport transport;
+  Coordinator        coordinator(config(RoutingMode::DistributedRules), &transport);
+  coordinator.initialize();
+
+  std::atomic<bool>        stop{false};
+  std::atomic<int>         routed{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 4; ++t)
+  {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < 200 && !stop.load(); ++i)
+      {
+        try
+        {
+          (void)coordinator.routeFor("chat-" + std::to_string(t) + "-" + std::to_string(i % 8));
+          routed.fetch_add(1);
+        }
+        catch (const serving::router::NoReplicaAvailable &)
+        {} // every replica in a partition may be gone by now
+      }
+    });
+  }
+  threads.emplace_back([&] {
+    for (int i = 0; i < 50; ++i)
+    {
+      coordinator.reportReplicaLost(i % 2 == 0 ? "p1a" : "p2b");
+      coordinator.service();
+      (void)coordinator.stats();
+      (void)coordinator.instanceFor("p1a");
+    }
+  });
+  for (std::thread &thread : threads) { thread.join(); }
+
+  EXPECT_GT(routed.load(), 0);
+  EXPECT_GT(coordinator.lossesApplied(), 0);
 }
