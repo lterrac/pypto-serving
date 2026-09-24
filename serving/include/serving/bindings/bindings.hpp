@@ -14,6 +14,19 @@
 namespace serving::bindings
 {
 
+/// Deleter for bound types whose destructor joins a thread that may be waiting
+/// for the GIL. pybind11 runs dealloc with the GIL held, so joining under it
+/// deadlocks against the engine thread inside a Python executor.
+struct GilReleasingDelete
+{
+  template <typename T>
+  void operator()(T *object) const
+  {
+    pybind11::gil_scoped_release release;
+    delete object;
+  }
+};
+
 /// Everything below, in dependency order. Both module faces call this.
 void bindServing(pybind11::module_ &m);
 

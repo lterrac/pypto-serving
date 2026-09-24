@@ -51,7 +51,12 @@ void RouterServer::start()
 
 void RouterServer::stop()
 {
-  if (!_running.exchange(false)) { return; }
+  {
+    // Under the mutex: the health thread can otherwise evaluate the predicate,
+    // block, and miss the notify, then sleep out the whole health interval.
+    const std::lock_guard<std::mutex> lock(_wakeMutex);
+    if (!_running.exchange(false)) { return; }
+  }
   _wakeCv.notify_all();
   if (_healthThread.joinable()) { _healthThread.join(); }
   if (_server) { _server->stop(); }

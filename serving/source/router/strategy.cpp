@@ -1,6 +1,7 @@
 #include <serving/router/strategy.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 
 namespace serving::router
@@ -116,10 +117,11 @@ void CoordinatorIngressStrategy::onReplicaLost(const std::string &replicaName)
 // Option B
 // ---------------------------------------------------------------------------
 
-DistributedRuleStrategy::DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport, size_t maxPaths)
+DistributedRuleStrategy::DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport, size_t maxPaths, uint64_t epoch)
   : _planner(planner),
     _transport(transport),
-    _maxPaths(maxPaths == 0 ? 1 : maxPaths)
+    _maxPaths(maxPaths == 0 ? 1 : maxPaths),
+    _epoch(epoch != 0 ? epoch : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()) & 0xFFFFFFFFULL)
 {}
 
 RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
@@ -136,7 +138,7 @@ RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
 
   _stats.plansComputed += 1;
   RoutingPath path = _planner.plan(sessionId);
-  path.generation  = ++_generation;
+  path.generation  = makeGeneration(_epoch, ++_counter);
   publish(path);
 
   while (_paths.size() >= _maxPaths && !_order.empty())

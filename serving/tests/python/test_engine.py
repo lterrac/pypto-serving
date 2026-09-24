@@ -63,3 +63,21 @@ def test_step_types_read_like_the_python_dicts():
     r = s.StepResult(new_tokens={"a": [1, 2]}, error="")
     assert r.new_tokens == {"a": [1, 2]}
     assert s.StepResult().error == ""
+
+
+def test_dropping_the_engine_without_stopping_it_does_not_hang():
+    # pybind11 runs dealloc with the GIL held, so a destructor that joins the
+    # engine thread deadlocks against a Python executor waiting for the GIL.
+    engine = s.Engine(config(), WordTokenizer(), CountingExecutor())
+    engine.start()
+    drain(engine.add_request("r", [1, 2, 3], s.GenerateConfig(max_new_tokens=2)))
+    del engine  # no explicit stop()
+
+
+def test_dropping_the_server_without_stopping_it_does_not_hang():
+    tok, ex = WordTokenizer(), CountingExecutor()
+    engine = s.Engine(config(), tok, ex)
+    with running(engine):
+        server = s.HttpServer(s.ServerConfig(host="127.0.0.1", port=0), engine, tok)
+        server.start()
+        del server

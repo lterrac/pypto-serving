@@ -112,8 +112,11 @@ StepResult BridgeExecutor::executeStep(const StepCommand &command)
   payload["decode"]  = Json::array();
   for (const PrefillItem &item : command.prefill)
   {
-    payload["prefill"].push_back(
-      Json{{"request_id", item.requestId}, {"tokens", item.chunkTokens}, {"num_computed", item.numComputedTokens}, {"prompt_len", item.promptLen}, {"block_ids", item.blockIds}});
+    payload["prefill"].push_back(Json{{"request_id", item.requestId},
+                                      {"tokens", item.chunkTokens},
+                                      {"num_computed", item.numComputedTokens},
+                                      {"sample_at_length", item.sampleAtLength},
+                                      {"block_ids", item.blockIds}});
   }
   for (const DecodeItem &item : command.decode)
   {
