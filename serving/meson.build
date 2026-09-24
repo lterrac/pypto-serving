@@ -45,6 +45,7 @@ servingSources = files(
   'source/server/http_server.cpp',
   'source/router/routing.cpp',
   'source/router/strategy.cpp',
+  'source/coordinator/module.cpp',
   'source/router/proxy.cpp',
   'source/router/router_server.cpp',
 )
