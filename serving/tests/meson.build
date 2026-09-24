@@ -9,6 +9,7 @@ servingTestSources = files(
   'engine/test_detokenizer.cpp',
   'engine/test_engine.cpp',
   'server/test_http_server.cpp',
+  'router/test_routing.cpp',
   'model/test_chat_template.cpp',
 )
 

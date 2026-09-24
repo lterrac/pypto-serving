@@ -43,6 +43,7 @@ servingSources = files(
   'source/engine/engine.cpp',
   'source/model/chat_template.cpp',
   'source/server/http_server.cpp',
+  'source/router/routing.cpp',
 )
 
 ####### Optional: Python -- the bridge (embedded) and the bindings (extension)
