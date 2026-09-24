@@ -137,6 +137,7 @@ if haveTokenizers
 endif
 
 if havePythonBridge
+  servingSources += files('source/engine/bridge_executor.cpp')
   servingDependencies += pythonEmbedDep
 endif
 
@@ -164,6 +165,7 @@ servingBuildDep = declare_dependency(
 if havePythonBindings
   pybind11Includes       = include_directories('extern/pybind11/include')
   bindingsCppArgs        = ['-fexceptions']
+  bindingsEmbeddedSource = files('source/bindings/embedded.cpp')
 
   # HfTokenizer is bound only where tokenizers-cpp is configured.
   bindingsCppArgs += ['-DSERVING_HAVE_TOKENIZERS=' + (haveTokenizers ? '1' : '0')]
@@ -201,6 +203,29 @@ if havePythonBindings
     gnu_symbol_visibility: 'hidden',
     install: true,
   )
+endif
+
+####### The serving binary
+#
+# Needs the Python bridge and tokenizers-cpp.
+
+if havePythonBridge and haveTokenizers
+  servingBinarySources      = ['source/main.cpp']
+  servingBinaryDependencies = [servingBuildDep]
+  # The embedded interpreter can import _pypto_serving.
+  if havePythonBindings
+    servingBinarySources      += bindingsEmbeddedSource
+    servingBinaryDependencies += bindingsDep
+  endif
+  servingBinary = executable(
+    'pypto-serving-cpp',
+    servingBinarySources,
+    dependencies: servingBinaryDependencies,
+    gnu_symbol_visibility: havePythonBindings ? 'hidden' : 'default',
+    install: true,
+  )
+else
+  message('pypto-serving-cpp skipped: it needs both the pythonBridge and tokenizers features')
 endif
 
 ####### The router binary
