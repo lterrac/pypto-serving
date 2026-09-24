@@ -39,6 +39,7 @@ servingDependencies = [dependency('threads')]
 servingSources = files(
   'source/memory/kv_cache.cpp',
   'source/sched/scheduler.cpp',
+  'source/engine/detokenizer.cpp',
   'source/model/chat_template.cpp',
 )
 
@@ -122,6 +123,7 @@ haveTokenizers = tokenizersDep.found()
 ####### Creating the serving dependency
 
 if haveTokenizers
+  servingSources += files('source/model/hf_tokenizer.cpp')
   servingDependencies += tokenizersDep
 endif
 
@@ -165,6 +167,7 @@ if havePythonBindings
       'source/bindings/template_bindings.cpp',
       'source/bindings/kv_cache_bindings.cpp',
       'source/bindings/scheduler_bindings.cpp',
+      'source/bindings/tokenizer_bindings.cpp',
     ),
     cpp_args: bindingsCppArgs,
     include_directories: pybind11Includes,

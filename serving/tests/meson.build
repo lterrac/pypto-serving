@@ -6,9 +6,13 @@ servingTestSources = files(
   'config/test_types.cpp',
   'memory/test_kv_cache.cpp',
   'sched/test_scheduler.cpp',
+  'engine/test_detokenizer.cpp',
   'model/test_chat_template.cpp',
 )
 
+if haveTokenizers
+  servingTestSources += files('model/test_hf_tokenizer.cpp')
+endif
 
 servingTests = executable(
   'serving-tests',
