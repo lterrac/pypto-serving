@@ -8,6 +8,7 @@ servingTestSources = files(
   'sched/test_scheduler.cpp',
   'engine/test_detokenizer.cpp',
   'engine/test_engine.cpp',
+  'server/test_http_server.cpp',
   'model/test_chat_template.cpp',
 )
 
