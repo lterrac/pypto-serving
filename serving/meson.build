@@ -44,6 +44,7 @@ servingSources = files(
   'source/model/chat_template.cpp',
   'source/server/http_server.cpp',
   'source/router/routing.cpp',
+  'source/router/strategy.cpp',
   'source/router/proxy.cpp',
   'source/router/router_server.cpp',
 )
