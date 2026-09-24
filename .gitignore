@@ -41,3 +41,7 @@ Thumbs.db
 
 # Platform build dir
 platform/build
+
+# C++ serving: build directories, and the platform subproject symlink made locally
+serving/build*/
+serving/subprojects/
