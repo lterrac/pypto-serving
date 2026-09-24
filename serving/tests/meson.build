@@ -7,6 +7,7 @@ servingTestSources = files(
   'memory/test_kv_cache.cpp',
   'sched/test_scheduler.cpp',
   'engine/test_detokenizer.cpp',
+  'engine/test_engine.cpp',
   'model/test_chat_template.cpp',
 )
 
