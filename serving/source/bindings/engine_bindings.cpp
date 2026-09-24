@@ -119,7 +119,8 @@ void bindEngine(py::module_ &m)
     .def_readonly("text", &engine::TokenOutput::text)
     .def_readonly("token_id", &engine::TokenOutput::tokenId)
     .def_readonly("finished", &engine::TokenOutput::finished)
-    .def_readonly("finish_reason", &engine::TokenOutput::finishReason);
+    .def_readonly("finish_reason", &engine::TokenOutput::finishReason)
+    .def_readonly("error", &engine::TokenOutput::error);
 
   // pop() blocks on the engine thread, which may need the GIL: release it.
   py::class_<engine::RequestStream, std::shared_ptr<engine::RequestStream>>(m, "RequestStream", "A request's updates in order; pop() returns None once finished and drained.")

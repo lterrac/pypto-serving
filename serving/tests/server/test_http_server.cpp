@@ -60,6 +60,11 @@ class ScriptedExecutor : public ModelExecutor
   StepResult executeStep(const StepCommand &command) override
   {
     StepResult result;
+    if (!failWith.empty())
+    {
+      result.error = failWith;
+      return result;
+    }
     for (const auto &item : command.prefill)
     {
       const int covered = item.numComputedTokens + static_cast<int>(item.chunkTokens.size());
@@ -69,7 +74,8 @@ class ScriptedExecutor : public ModelExecutor
     return result;
   }
 
-  int promptLength = 0;
+  int         promptLength = 0;
+  std::string failWith;
 
   private:
 
@@ -255,6 +261,20 @@ TEST(HttpServerTest, RejectsAMissingPrompt)
   const auto response = client.Post("/v1/completions", json{{"max_tokens", 2}}.dump(), "application/json");
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, 400);
+}
+
+TEST(HttpServerTest, AFailedStepIsAnErrorNotACompletion)
+{
+  Fixture fixture;
+  fixture.executor.failWith = "device exploded";
+  auto client               = fixture.client();
+
+  const auto response = client.Post("/v1/completions", json{{"prompt", "hi"}, {"max_tokens", 4}}.dump(), "application/json");
+  ASSERT_NE(response, nullptr);
+  // Previously 200 with finish_reason "stop": a crashed step was indistinguishable
+  // from a short but successful answer.
+  EXPECT_EQ(response->status, 500);
+  EXPECT_NE(response->body.find("device exploded"), std::string::npos) << response->body;
 }
 
 TEST(HttpServerTest, RejectsAPromptTheSchedulerCannotAdmit)

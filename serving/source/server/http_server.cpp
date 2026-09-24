@@ -58,8 +58,9 @@ void sendError(httplib::Response &response, const std::string &message, int stat
 
 std::string mapFinishReason(const std::string &reason)
 {
-  static const std::map<std::string, std::string> mapping{{"FINISHED_EOS", "eos"}, {"FINISHED_LENGTH", "length"}, {"FINISHED_STOP", "stop"}, {"FINISHED_ABORTED", "aborted"}};
-  const auto                                      it = mapping.find(reason);
+  static const std::map<std::string, std::string> mapping{
+    {"FINISHED_EOS", "eos"}, {"FINISHED_LENGTH", "length"}, {"FINISHED_STOP", "stop"}, {"FINISHED_ABORTED", "aborted"}, {"FINISHED_ERROR", "error"}};
+  const auto it = mapping.find(reason);
   return it == mapping.end() ? "stop" : it->second;
 }
 
@@ -190,16 +191,32 @@ void HttpServer::registerRoutes()
     if (!generate.stream)
     {
       std::string text;
-      std::string finishReason     = "stop";
+      std::string finishReason = "stop";
+      std::string error;
+      bool        finishedCleanly  = false;
       int         completionTokens = 0;
       while (auto update = stream->pop())
       {
         if (update->tokenId.has_value()) { completionTokens += 1; }
         if (update->finished)
         {
-          text         = update->text;
-          finishReason = mapFinishReason(update->finishReason);
+          text            = update->text;
+          finishReason    = mapFinishReason(update->finishReason);
+          error           = update->error;
+          finishedCleanly = update->error.empty();
         }
+      }
+      // A step that failed, or a stream closed without finishing, is not a
+      // successful completion: reporting it as one hides the failure entirely.
+      if (!error.empty())
+      {
+        sendError(response, error, 500);
+        return;
+      }
+      if (!finishedCleanly)
+      {
+        sendError(response, "request did not complete", 500);
+        return;
       }
 
       json choice;
@@ -222,8 +239,17 @@ void HttpServer::registerRoutes()
     auto              completionTokens = std::make_shared<int>(0);
     auto              done             = std::make_shared<bool>(false);
 
+    // httplib stops calling the provider once the peer is gone, so the only
+    // reliable hook is the destruction of this closure: without it a client
+    // that hangs up leaves the request decoding to max_tokens, holding a decode
+    // slot and its KV blocks.
+    engine::Engine       *engine = &_engine;
+    std::shared_ptr<void> abortIfUnfinished(nullptr, [engine, requestId, done](void *) {
+      if (!*done) { engine->abortRequest(requestId); }
+    });
+
     response.set_chunked_content_provider(
-      "text/event-stream", [stream, requestId, model, objectNameStr, chat, promptTokens, completionTokens, done](size_t, httplib::DataSink &sink) {
+      "text/event-stream", [stream, requestId, model, objectNameStr, chat, promptTokens, completionTokens, done, engine, abortIfUnfinished](size_t, httplib::DataSink &sink) {
         if (*done)
         {
           sink.done();
@@ -242,6 +268,17 @@ void HttpServer::registerRoutes()
 
         if (update->tokenId.has_value()) { *completionTokens += 1; }
 
+        if (!update->error.empty())
+        {
+          const std::string payload = "data: " + json{{"error", {{"message", update->error}, {"type", "server_error"}}}}.dump() + "\n\n";
+          sink.write(payload.data(), payload.size());
+          const std::string tail = "data: [DONE]\n\n";
+          sink.write(tail.data(), tail.size());
+          *done = true;
+          sink.done();
+          return true;
+        }
+
         json       choice;
         const json finishReason = update->finished ? json(mapFinishReason(update->finishReason)) : json(nullptr);
         if (chat) { choice = json{{"index", 0}, {"delta", {{"content", update->delta}}}, {"finish_reason", finishReason}}; }
@@ -249,7 +286,13 @@ void HttpServer::registerRoutes()
 
         const json        chunk{{"id", requestId}, {"object", objectNameStr}, {"created", nowSeconds()}, {"model", model}, {"choices", json::array({choice})}};
         const std::string payload = "data: " + chunk.dump() + "\n\n";
-        sink.write(payload.data(), payload.size());
+        if (!sink.write(payload.data(), payload.size()))
+        {
+          // The client is gone; stop generating for it.
+          engine->abortRequest(requestId);
+          *done = true;
+          return false;
+        }
 
         if (update->finished)
         {
