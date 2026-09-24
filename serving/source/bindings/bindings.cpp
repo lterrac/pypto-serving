@@ -11,6 +11,7 @@ void bindServing(pybind11::module_ &m)
   bindKvCache(m);
   bindScheduler(m);
   bindTokenizer(m);
+  bindEngine(m);
 }
 
 } // namespace serving::bindings

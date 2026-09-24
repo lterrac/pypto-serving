@@ -40,6 +40,7 @@ servingSources = files(
   'source/memory/kv_cache.cpp',
   'source/sched/scheduler.cpp',
   'source/engine/detokenizer.cpp',
+  'source/engine/engine.cpp',
   'source/model/chat_template.cpp',
 )
 
@@ -168,6 +169,7 @@ if havePythonBindings
       'source/bindings/kv_cache_bindings.cpp',
       'source/bindings/scheduler_bindings.cpp',
       'source/bindings/tokenizer_bindings.cpp',
+      'source/bindings/engine_bindings.cpp',
     ),
     cpp_args: bindingsCppArgs,
     include_directories: pybind11Includes,
