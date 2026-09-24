@@ -8,6 +8,8 @@
 
 #include <serving/engine/engine.hpp>
 
+#include "support/stubs.hpp"
+
 using serving::config::GenerateConfig;
 using serving::config::RuntimeConfig;
 using serving::engine::Engine;
@@ -21,113 +23,16 @@ using serving::model::TokenizerAdapter;
 namespace
 {
 
+using serving::testing::CharTokenizer;
+using serving::testing::drain;
+using serving::testing::ScriptedExecutor;
+
 /// One character per token id, so generated text is readable in assertions.
-class CharTokenizer : public TokenizerAdapter
-{
-  public:
-
-  [[nodiscard]] std::vector<int> encode(const std::string &text) const override
-  {
-    std::vector<int> ids;
-    for (const char c : text) { ids.push_back(static_cast<int>(c)); }
-    return ids;
-  }
-
-  [[nodiscard]] std::string decode(const std::vector<int> &ids, bool = true) const override
-  {
-    std::string out;
-    for (const int id : ids) { out += static_cast<char>(id); }
-    return out;
-  }
-
-  [[nodiscard]] std::optional<int> eosTokenId() const override { return 0; }
-};
 
 /**
  * An executor that returns a scripted token per request and can be told to
  * fail; counts registrations, steps and closes.
  */
-class ScriptedExecutor : public ModelExecutor
-{
-  public:
-
-  explicit ScriptedExecutor(std::vector<int> script, int numPages = 64)
-    : _script(std::move(script)),
-      _numPages(numPages)
-  {}
-
-  int registerModel() override
-  {
-    registered += 1;
-    return _numPages;
-  }
-
-  StepResult executeStep(const StepCommand &command) override
-  {
-    steps += 1;
-    lastPrefillChunks = 0;
-    for (const auto &item : command.prefill) { lastPrefillChunks += static_cast<int>(item.chunkTokens.size()); }
-
-    StepResult result;
-    if (!failWith.empty())
-    {
-      result.error = failWith;
-      return result;
-    }
-
-    // A prefill chunk only samples when it completes its prompt; the engine
-    // knows the prompt length, so mirror the worker: emit for every prefill item
-    // whose chunk reaches the end, and for every decode slot.
-    for (const auto &item : command.prefill)
-    {
-      const int covered = item.numComputedTokens + static_cast<int>(item.chunkTokens.size());
-      if (covered >= promptLengths[item.requestId]) { result.newTokens[item.requestId] = {next(item.requestId)}; }
-    }
-    for (const auto &item : command.decode) { result.newTokens[item.requestId] = {next(item.requestId)}; }
-    {
-      const std::lock_guard<std::mutex> lock(_decodedMutex);
-      for (const auto &item : command.decode) { _decodedIds.push_back(item.requestId); }
-    }
-    return result;
-  }
-
-  void close() override { closed += 1; }
-
-  std::map<std::string, int> promptLengths;
-  std::string                failWith;
-  std::atomic<int>           steps{0};
-  std::atomic<int>           registered{0};
-  std::atomic<int>           closed{0};
-  std::atomic<int>           lastPrefillChunks{0};
-
-  /// Every decode slot the engine has asked for, in order. Written on the
-  /// engine thread, read by the test, hence the lock.
-  std::vector<std::string> decodedIds()
-  {
-    const std::lock_guard<std::mutex> lock(_decodedMutex);
-    return _decodedIds;
-  }
-  void clearDecodedIds()
-  {
-    const std::lock_guard<std::mutex> lock(_decodedMutex);
-    _decodedIds.clear();
-  }
-
-  private:
-
-  std::mutex               _decodedMutex;
-  std::vector<std::string> _decodedIds;
-
-  int next(const std::string &requestId)
-  {
-    const size_t index = _emitted[requestId]++;
-    return _script[index % _script.size()];
-  }
-
-  std::vector<int>              _script;
-  int                           _numPages;
-  std::map<std::string, size_t> _emitted;
-};
 
 EngineConfig makeConfig()
 {
@@ -140,12 +45,6 @@ EngineConfig makeConfig()
 }
 
 /// Drain a stream to completion, returning every update.
-std::vector<TokenOutput> drain(const std::shared_ptr<serving::engine::RequestStream> &stream)
-{
-  std::vector<TokenOutput> updates;
-  while (auto update = stream->pop()) { updates.push_back(*update); }
-  return updates;
-}
 
 } // namespace
 
