@@ -1,0 +1,14 @@
+# ThreadSanitizer suppressions for the serving tests.
+#
+#   TSAN_OPTIONS=suppressions=serving/tests/tsan.supp \
+#     setarch $(uname -m) -R ./build-tsan/tests/serving-tests
+#
+# ASLR must be off: tsan cannot map its shadow otherwise on this kernel.
+
+# libstdc++ initialises std::ctype<char>'s narrow-cache table lazily and without
+# synchronisation; cpp-httplib reaches it by constructing a std::regex per
+# response line. Two threads parsing responses race on that global. Third-party
+# (every frame is libstdc++ or httplib); the write is an idempotent
+# initialisation.
+race:std::ctype<char>::narrow
+race:httplib::ClientImpl::read_response_line
