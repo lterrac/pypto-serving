@@ -18,5 +18,6 @@ namespace serving::bindings
 void bindServing(pybind11::module_ &m);
 
 void bindConfigTypes(pybind11::module_ &m);  // config/types.hpp
+void bindChatTemplate(pybind11::module_ &m); // model/chat_template.hpp
 
 } // namespace serving::bindings

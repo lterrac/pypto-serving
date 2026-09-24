@@ -7,6 +7,7 @@ void bindServing(pybind11::module_ &m)
 {
   m.doc() = "pypto-serving: the C++ serving engine.";
   bindConfigTypes(m);
+  bindChatTemplate(m);
 }
 
 } // namespace serving::bindings
