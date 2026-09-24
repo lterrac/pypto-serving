@@ -45,6 +45,11 @@ class CountingExecutor(s.ModelExecutor):
         self.registered = 0
         self.steps = 0
         self.closed = False
+        #: Decodes asked for at a position with unwritten rows before it.
+        self.kv_gaps: list = []
+        self._written: dict = {}
+        #: Fail the step rather than let a livelocking schedule hang the suite.
+        self.max_steps = 100_000
 
     def register_model(self):
         self.registered += 1
@@ -52,13 +57,29 @@ class CountingExecutor(s.ModelExecutor):
 
     def execute_step(self, command):
         self.steps += 1
+        if self.steps > self.max_steps:
+            raise RuntimeError(f"executor gave up after {self.max_steps} steps: the schedule is not making progress")
         new = {}
         for item in command.prefill:
+            # A prefill writes the KV rows for the positions it feeds.
+            self._written.setdefault(item.request_id, set()).update(
+                range(item.num_computed_tokens, item.num_computed_tokens + len(item.chunk_tokens))
+            )
             if item.num_computed_tokens + len(item.chunk_tokens) >= item.sample_at_length:
                 new[item.request_id] = [item.chunk_tokens[-1] + 1]
         for item in command.decode:
             if item.last_token == self.fail_on_token:
                 raise RuntimeError("the model fell over")
+            # A decode feeds one token at seq_len - 1 and attends everything
+            # before it, so every earlier row must already be written. A gap is
+            # the kernel reading stale pages, which no token comparison against
+            # a stub would reveal.
+            written = self._written.setdefault(item.request_id, set())
+            position = item.seq_len - 1
+            missing = set(range(position)) - written
+            if missing:
+                self.kv_gaps.append((item.request_id, position, sorted(missing)))
+            written.add(position)
             new[item.request_id] = [item.last_token + 1]
         return s.StepResult(new_tokens=new)
 

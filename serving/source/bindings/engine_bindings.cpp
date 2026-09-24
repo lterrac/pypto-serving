@@ -153,6 +153,7 @@ void bindEngine(py::module_ &m)
     .def_property_readonly("is_ready", &engine::Engine::isReady)
     .def("add_request", &engine::Engine::addRequest, py::arg("request_id"), py::arg("prompt_token_ids"), py::arg("generate_config"), py::call_guard<py::gil_scoped_release>())
     .def("generate_request_id", &engine::Engine::generateRequestId)
+    .def_property_readonly("preemptions", &engine::Engine::preemptions)
     .def_property_readonly("pending_token_load",
                            [](engine::Engine &e) {
                              py::gil_scoped_release release;
