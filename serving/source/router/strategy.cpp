@@ -1,5 +1,6 @@
 #include <serving/router/strategy.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace serving::router
@@ -77,6 +78,7 @@ const char *routingModeName(RoutingMode mode)
   switch (mode)
   {
   case RoutingMode::CoordinatorIngress: return "ingress";
+  case RoutingMode::DistributedRules: return "rules";
   }
   return "unknown";
 }
@@ -84,7 +86,8 @@ const char *routingModeName(RoutingMode mode)
 RoutingMode parseRoutingMode(const std::string &text)
 {
   if (text == "ingress") { return RoutingMode::CoordinatorIngress; }
-  throw std::invalid_argument("unknown routing mode '" + text + "' (expected 'ingress')");
+  if (text == "rules") { return RoutingMode::DistributedRules; }
+  throw std::invalid_argument("unknown routing mode '" + text + "' (expected 'ingress' or 'rules')");
 }
 
 // ---------------------------------------------------------------------------
@@ -110,14 +113,73 @@ void CoordinatorIngressStrategy::onReplicaLost(const std::string &replicaName)
 }
 
 // ---------------------------------------------------------------------------
+// Option B
+// ---------------------------------------------------------------------------
 
-std::unique_ptr<RoutingStrategy> makeRoutingStrategy(RoutingMode mode, RoutingPlanner &planner)
+DistributedRuleStrategy::DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport)
+  : _planner(planner),
+    _transport(transport)
+{}
+
+RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
 {
-  switch (mode)
+  const auto existing = _paths.find(sessionId);
+  if (existing != _paths.end())
   {
-  case RoutingMode::CoordinatorIngress: return std::make_unique<CoordinatorIngressStrategy>(planner);
+    // The standing path is reused without consulting the planner. Routing
+    // happens once per session -- that is what keeps the decision off the
+    // critical path.
+    return existing->second;
   }
-  throw std::invalid_argument("unknown routing mode");
+
+  _stats.plansComputed += 1;
+  RoutingPath path = _planner.plan(sessionId);
+  path.generation  = ++_generation;
+  publish(path);
+  _paths.emplace(sessionId, path);
+  return path;
+}
+
+void DistributedRuleStrategy::publish(const RoutingPath &path)
+{
+  // Each hop is told where to forward next; the last hop has nowhere to go.
+  for (size_t i = 0; i + 1 < path.hops.size(); ++i)
+  {
+    _transport.publish(path.hops[i], path.sessionId, path.hops[i + 1], path.generation);
+    _stats.rulesPublished += 1;
+  }
+}
+
+void DistributedRuleStrategy::onReplicaLost(const std::string &replicaName)
+{
+  _planner.setReady(replicaName, false);
+
+  // Every standing path through the lost replica is now wrong. Revoke it rather
+  // than leaving replicas forwarding into a dead node, and let the next request
+  // replan -- the generation on the new rule is what lets a replica holding the
+  // old one recognise it as stale.
+  std::vector<std::string> affected;
+  for (const auto &[sessionId, path] : _paths)
+  {
+    const bool touches = std::any_of(path.hops.begin(), path.hops.end(), [&](const ReplicaSpec &hop) { return hop.name == replicaName; });
+    if (touches) { affected.push_back(sessionId); }
+  }
+
+  for (const std::string &sessionId : affected)
+  {
+    _transport.revoke(sessionId, _paths.at(sessionId).generation);
+    _paths.erase(sessionId);
+    _stats.pathsInvalidated += 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+std::unique_ptr<RoutingStrategy> makeRoutingStrategy(RoutingMode mode, RoutingPlanner &planner, RuleTransport *transport)
+{
+  if (mode == RoutingMode::CoordinatorIngress) { return std::make_unique<CoordinatorIngressStrategy>(planner); }
+  if (transport == nullptr) { throw std::invalid_argument("the 'rules' routing mode needs a RuleTransport to publish through"); }
+  return std::make_unique<DistributedRuleStrategy>(planner, *transport);
 }
 
 } // namespace serving::router
