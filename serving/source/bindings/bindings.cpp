@@ -10,6 +10,7 @@ void bindServing(pybind11::module_ &m)
   bindChatTemplate(m);
   bindKvCache(m);
   bindScheduler(m);
+  bindTokenizer(m);
 }
 
 } // namespace serving::bindings
