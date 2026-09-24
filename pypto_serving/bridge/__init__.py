@@ -19,7 +19,7 @@ other thread exists.
 Items::
 
     prefill: {"request_id": str, "tokens": [int], "num_computed": int,
-              "prompt_len": int, "block_ids": [int]}
+              "sample_at_length": int, "block_ids": [int]}
     decode:  {"request_id": str, "last_token": int, "seq_len": int,
               "block_ids": [int]}
 
@@ -178,14 +178,15 @@ def _run_prefill(state: _BridgeState, items: list[dict[str, Any]]) -> dict[str, 
     )
     result = state.executor.run_prefill(state.record.runtime_model, batch)
 
-    # Only a chunk that completes its prompt sampled anything -- the same test
-    # the worker applies against its request cache.
+    # Only a chunk that fed the last outstanding token sampled anything. For a
+    # fresh request that is the end of the prompt; for one replaying after
+    # preemption it is past it, so the replay does not emit a duplicate token.
     sampled: dict[str, list[int]] = {}
     completed_ids: list[str] = []
     completed_tokens: list[int] = []
     for index, item in enumerate(items):
         covered = chunk_starts[index] + len(token_chunks[index])
-        if covered < int(item["prompt_len"]):
+        if covered < int(item["sample_at_length"]):
             continue
         token_id = _sampled_id(result, index, "prefill")
         sampled[item["request_id"]] = [token_id]

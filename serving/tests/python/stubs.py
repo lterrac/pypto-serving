@@ -54,7 +54,7 @@ class CountingExecutor(s.ModelExecutor):
         self.steps += 1
         new = {}
         for item in command.prefill:
-            if item.num_computed_tokens + len(item.chunk_tokens) >= item.prompt_len:
+            if item.num_computed_tokens + len(item.chunk_tokens) >= item.sample_at_length:
                 new[item.request_id] = [item.chunk_tokens[-1] + 1]
         for item in command.decode:
             if item.last_token == self.fail_on_token:

@@ -241,7 +241,7 @@ StepCommand Engine::buildStepCommand(const sched::SchedulerOutput &output) const
       item.requestId         = request.requestId;
       item.blockIds          = scheduled.blockIds;
       item.numComputedTokens = scheduled.numComputedTokens;
-      item.promptLen         = request.numPromptTokens();
+      item.sampleAtLength    = request.sampleAtLength();
 
       item.chunkTokens = request.tokenRange(scheduled.numComputedTokens, scheduled.numComputedTokens + scheduled.numNewTokens);
       command.prefill.push_back(std::move(item));

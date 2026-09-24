@@ -432,13 +432,13 @@ void Scheduler::advanceAfterSchedule(SchedulerOutput &output)
   if (!_config.asyncScheduling) { return; }
   for (ScheduledRequest &scheduled : output.scheduledRequests)
   {
-    Request   &request         = *scheduled.request;
-    const bool completesPrompt = request.numComputedTokens + scheduled.numNewTokens >= request.numPromptTokens();
+    Request   &request = *scheduled.request;
+    const bool samples = request.numComputedTokens + scheduled.numNewTokens >= request.sampleAtLength();
     request.numComputedTokens += scheduled.numNewTokens;
 
     // Prefix-cache blocks are not published here: this runs at schedule time,
     // before the tokens exist.
-    if (!scheduled.isPrefill || completesPrompt)
+    if (!scheduled.isPrefill || samples)
     {
       // Reserve the MAXIMUM this step can emit. Speculative/MTP decode returns
       // 1..1+num_speculative_tokens, known only once the worker replies, so
@@ -448,7 +448,7 @@ void Scheduler::advanceAfterSchedule(SchedulerOutput &output)
       request.numOutputPlaceholders += reserved;
       request.numComputedTokens += reserved - 1;
     }
-    if (scheduled.isPrefill && completesPrompt && _config.numSpeculativeTokens > 0) { request.terminalPrefillInFlight = true; }
+    if (scheduled.isPrefill && samples && _config.numSpeculativeTokens > 0) { request.terminalPrefillInFlight = true; }
   }
 }
 
@@ -474,7 +474,7 @@ std::vector<RequestOutput> Scheduler::updateFromOutput(const SchedulerOutput &ou
     // applying tokens would corrupt the bookkeeping.
     if (isFinished(request->status) || request->status == RequestStatus::Preempted) { continue; }
 
-    if (scheduled.isPrefill && scheduled.numComputedTokens + scheduled.numNewTokens >= request->numPromptTokens()) { request->terminalPrefillInFlight = false; }
+    if (scheduled.isPrefill && scheduled.numComputedTokens + scheduled.numNewTokens >= request->sampleAtLength()) { request->terminalPrefillInFlight = false; }
 
     std::vector<int> tokenIds;
     const auto       it = newTokenIds.find(request->requestId);
@@ -490,7 +490,8 @@ std::vector<RequestOutput> Scheduler::updateFromOutput(const SchedulerOutput &ou
     {
       request->numComputedTokens += scheduled.numNewTokens;
       cacheCompletedBlocks(*request);
-      if (request->numComputedTokens < request->numPromptTokens()) { continue; }
+      // Only a chunk that fed the last outstanding token sampled anything.
+      if (request->numComputedTokens < request->sampleAtLength()) { continue; }
       for (const int tokenId : tokenIds)
       {
         request->outputTokenIds.push_back(tokenId);
@@ -555,7 +556,7 @@ void Scheduler::reconcileAsyncOutput(const RequestPtr &requestPtr, const Schedul
   // This step reserved placeholders iff it sampled: a decode step, or a prefill
   // chunk that completed the prompt. numComputedTokens was already advanced, so
   // "completed the prompt" means numComputed >= prompt.
-  const bool sampledThisStep = !scheduled.isPrefill || request.numComputedTokens >= request.numPromptTokens();
+  const bool sampledThisStep = !scheduled.isPrefill || request.numComputedTokens >= request.sampleAtLength();
   const int  reserved        = sampledThisStep ? 1 + speculativeTokensFor(request, scheduled) : 0;
 
   // Publish through the token count this step actually confirmed. A newer

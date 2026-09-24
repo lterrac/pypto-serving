@@ -170,14 +170,43 @@ CoordinatorConfig parseCoordinatorConfig(const std::string &text, const std::str
   if (!replicas.is_array()) { throw ctx.error("'replicas' must be a list"); }
   if (replicas.empty()) { throw ctx.error("'replicas' must list at least one replica"); }
 
-  std::set<std::string> names;
-  bool                  ownsSomething = false;
+  std::set<std::string>         names;
+  std::set<std::string>         endpoints;
+  std::set<uint64_t>            instances;
+  std::set<router::PartitionId> partitions;
+  bool                          ownsSomething = false;
   for (size_t i = 0; i < replicas.size(); ++i)
   {
-    ReplicaBinding binding = parseReplica(replicas[i], i, ctx);
-    if (!names.insert(binding.spec.name).second) { throw ctx.error("replica " + std::to_string(i) + ": duplicate name '" + binding.spec.name + "'"); }
+    const std::string where   = "replica " + std::to_string(i);
+    ReplicaBinding    binding = parseReplica(replicas[i], i, ctx);
+    if (!names.insert(binding.spec.name).second) { throw ctx.error(where + ": duplicate name '" + binding.spec.name + "'"); }
+    if (!endpoints.insert(binding.spec.baseUrl()).second) { throw ctx.error(where + ": duplicate endpoint " + binding.spec.baseUrl()); }
+
+    // In rules mode the instance is what a published rule names. Left out it
+    // would default to 0 and address whichever replica happens to be instance
+    // 0, which looks like a working deployment.
+    if (config.mode == router::RoutingMode::DistributedRules)
+    {
+      if (!replicas[i].contains("instance")) { throw ctx.error(where + ": 'instance' is required when routing_mode is 'rules'"); }
+      if (!instances.insert(binding.instanceId).second) { throw ctx.error(where + ": duplicate instance " + std::to_string(binding.instanceId)); }
+    }
+
+    partitions.insert(binding.spec.partition);
     ownsSomething = ownsSomething || binding.spec.partition == config.partition;
     config.replicas.push_back(std::move(binding));
+  }
+
+  // A pipeline is a chain: a gap means plan() produces a path that skips a
+  // stage, which routes around a partition rather than through it.
+  router::PartitionId expected = 0;
+  for (const router::PartitionId partition : partitions)
+  {
+    if (partition != expected)
+    {
+      throw ctx.error("partitions must be 0.." + std::to_string(partitions.size() - 1) + " with no gaps; found " + std::to_string(partition) + " where " +
+                      std::to_string(expected) + " was expected");
+    }
+    expected += 1;
   }
 
   // A partition no replica serves is a misconfiguration.

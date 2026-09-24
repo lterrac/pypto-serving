@@ -257,7 +257,16 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
   // session id on a streaming response without rewriting SSE.
   response.set_header(SESSION_HEADER, sessionId);
 
-  response.set_chunked_content_provider(contentType, [queue, releaseOnce](size_t, httplib::DataSink &sink) {
+  // httplib stops invoking the provider once the peer is gone, so a disconnect
+  // between chunks would otherwise never reach the two lines below: the upstream
+  // thread would block on a full queue for ever and the replica would keep its
+  // slot in `outstanding`. Destroying the closure releases either way.
+  std::shared_ptr<void> closeOnDestroy(nullptr, [queue, releaseOnce](void *) {
+    queue->close();
+    releaseOnce();
+  });
+
+  response.set_chunked_content_provider(contentType, [queue, releaseOnce, closeOnDestroy](size_t, httplib::DataSink &sink) {
     auto chunk = queue->pop();
     if (!chunk.has_value())
     {

@@ -20,9 +20,11 @@ struct PrefillItem
   std::vector<int> chunkTokens;
   /// Tokens already computed before this chunk (a prefix-cache hit, or earlier chunks).
   int numComputedTokens = 0;
-  /// Full prompt length. A chunk samples a token only when it reaches the end of
-  /// the prompt; the executor needs this to know which chunks did.
-  int              promptLen = 0;
+  /// The chunk that reaches this length samples the next token. For a fresh
+  /// request it is the prompt length; for one replaying after preemption it is
+  /// the prompt plus what it had already generated, so the replay recomputes
+  /// those rows without emitting a duplicate token.
+  int              sampleAtLength = 0;
   std::vector<int> blockIds;
 };
 

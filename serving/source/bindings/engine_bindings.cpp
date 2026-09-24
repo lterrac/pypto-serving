@@ -66,7 +66,7 @@ void bindExecutorTypes(py::module_ &m)
     .def_readonly("request_id", &engine::PrefillItem::requestId)
     .def_readonly("chunk_tokens", &engine::PrefillItem::chunkTokens)
     .def_readonly("num_computed_tokens", &engine::PrefillItem::numComputedTokens)
-    .def_readonly("prompt_len", &engine::PrefillItem::promptLen)
+    .def_readonly("sample_at_length", &engine::PrefillItem::sampleAtLength)
     .def_readonly("block_ids", &engine::PrefillItem::blockIds);
 
   py::class_<engine::DecodeItem>(m, "DecodeItem", "One request's decode slot in a step.")
@@ -140,7 +140,7 @@ void bindEngine(py::module_ &m)
 
   // keep_alive ties the tokenizer and executor to the engine. Calls that can
   // wait on the engine thread release the GIL.
-  py::class_<engine::Engine>(m, "Engine", "The serving engine: scheduler, KV cache and the step loop, on its own thread.")
+  py::class_<engine::Engine, std::unique_ptr<engine::Engine, GilReleasingDelete>>(m, "Engine", "The serving engine: scheduler, KV cache and the step loop, on its own thread.")
     .def(py::init<engine::EngineConfig, const model::TokenizerAdapter &, engine::ModelExecutor &>(),
          py::arg("config"),
          py::arg("tokenizer"),

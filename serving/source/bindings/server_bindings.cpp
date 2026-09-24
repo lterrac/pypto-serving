@@ -1,5 +1,6 @@
 #include <serving/bindings/bindings.hpp>
 
+#include <memory>
 #include <string>
 
 #include <pybind11/stl.h>
@@ -31,7 +32,7 @@ void bindServer(py::module_ &m)
     .def_readwrite("port", &server::ServerConfig::port)
     .def_readwrite("model_id", &server::ServerConfig::modelId);
 
-  py::class_<server::HttpServer>(m, "HttpServer", "OpenAI-compatible HTTP front end over an Engine, on its own threads.")
+  py::class_<server::HttpServer, std::unique_ptr<server::HttpServer, GilReleasingDelete>>(m, "HttpServer", "OpenAI-compatible HTTP front end over an Engine, on its own threads.")
     .def(py::init<server::ServerConfig, engine::Engine &, const model::TokenizerAdapter &, const model::ChatTemplate *>(),
          py::arg("config"),
          py::arg("engine"),

@@ -62,7 +62,7 @@ class PyptoModelExecutor(cpp.ModelExecutor):
                     "request_id": item.request_id,
                     "tokens": list(item.chunk_tokens),
                     "num_computed": item.num_computed_tokens,
-                    "prompt_len": item.prompt_len,
+                    "sample_at_length": item.sample_at_length,
                     "block_ids": list(item.block_ids),
                 }
                 for item in command.prefill
