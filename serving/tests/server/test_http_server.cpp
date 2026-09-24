@@ -9,6 +9,8 @@
 
 #include <serving/server/http_server.hpp>
 
+#include "support/stubs.hpp"
+
 using Json = nlohmann::json;
 using serving::config::GenerateConfig;
 using serving::engine::Engine;
@@ -24,70 +26,13 @@ using serving::server::ServerConfig;
 namespace
 {
 
+using serving::testing::CharTokenizer;
+using serving::testing::drain;
+using serving::testing::ScriptedExecutor;
+
 /// One character per token, so a prompt's text is its token ids.
-class CharTokenizer : public TokenizerAdapter
-{
-  public:
-
-  [[nodiscard]] std::vector<int> encode(const std::string &text) const override
-  {
-    std::vector<int> ids;
-    for (const char c : text) { ids.push_back(static_cast<int>(c)); }
-    return ids;
-  }
-
-  [[nodiscard]] std::string decode(const std::vector<int> &ids, bool = true) const override
-  {
-    std::string out;
-    for (const int id : ids) { out += static_cast<char>(id); }
-    return out;
-  }
-
-  [[nodiscard]] std::optional<int> eosTokenId() const override { return 0; }
-};
 
 /// Emits a fixed script, one token per step per request.
-class ScriptedExecutor : public ModelExecutor
-{
-  public:
-
-  explicit ScriptedExecutor(std::string script)
-    : _script(std::move(script))
-  {}
-
-  int registerModel() override { return 64; }
-
-  StepResult executeStep(const StepCommand &command) override
-  {
-    StepResult result;
-    if (!failWith.empty())
-    {
-      result.error = failWith;
-      return result;
-    }
-    for (const auto &item : command.prefill)
-    {
-      const int covered = item.numComputedTokens + static_cast<int>(item.chunkTokens.size());
-      if (covered >= promptLength) { result.newTokens[item.requestId] = {next(item.requestId)}; }
-    }
-    for (const auto &item : command.decode) { result.newTokens[item.requestId] = {next(item.requestId)}; }
-    return result;
-  }
-
-  int         promptLength = 0;
-  std::string failWith;
-
-  private:
-
-  int next(const std::string &requestId)
-  {
-    const size_t index = _emitted[requestId]++;
-    return static_cast<int>(_script[index % _script.size()]);
-  }
-
-  std::string                   _script;
-  std::map<std::string, size_t> _emitted;
-};
 
 /// Engine + server on an ephemeral port, torn down in the right order.
 struct Fixture
@@ -98,7 +43,7 @@ struct Fixture
   std::unique_ptr<HttpServer> server;
 
   explicit Fixture(std::string script = "hi!", int promptLength = 4)
-    : executor(std::move(script))
+    : executor(ScriptedExecutor::fromText(script))
   {
     executor.promptLength = promptLength;
 
