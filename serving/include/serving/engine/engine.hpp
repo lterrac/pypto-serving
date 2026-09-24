@@ -41,6 +41,9 @@ struct TokenOutput
   std::optional<int> tokenId;
   bool               finished = false;
   std::string        finishReason;
+  /// Set when the request failed. The answer is incomplete and the caller must
+  /// report it as an error rather than a normal finish.
+  std::string error;
 };
 
 /**

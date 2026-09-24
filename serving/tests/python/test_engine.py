@@ -43,7 +43,8 @@ def test_an_executor_exception_fails_the_request_not_the_engine():
         # 10 -> prefill emits 11 -> the next decode step raises.
         _, failed = drain(engine.add_request("bad", [10], s.GenerateConfig(max_new_tokens=5)))
         assert failed.finished
-        assert "the model fell over" in failed.finish_reason
+        assert "the model fell over" in failed.error
+        assert failed.finish_reason == "FINISHED_ERROR"
 
         # The engine thread is alive, and the failed request is gone from the
         # scheduler: were it still there, the executor would raise on it again
