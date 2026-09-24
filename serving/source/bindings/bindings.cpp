@@ -9,6 +9,7 @@ void bindServing(pybind11::module_ &m)
   bindConfigTypes(m);
   bindChatTemplate(m);
   bindKvCache(m);
+  bindScheduler(m);
 }
 
 } // namespace serving::bindings

@@ -20,5 +20,6 @@ void bindServing(pybind11::module_ &m);
 void bindConfigTypes(pybind11::module_ &m);  // config/types.hpp
 void bindChatTemplate(pybind11::module_ &m); // model/chat_template.hpp
 void bindKvCache(pybind11::module_ &m);      // memory/kv_cache.hpp
+void bindScheduler(pybind11::module_ &m);    // sched/scheduler.hpp (SchedulerConfig)
 
 } // namespace serving::bindings

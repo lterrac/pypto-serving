@@ -5,6 +5,7 @@ servingTestArgs = ['-DSERVING_TEST_FIXTURE_DIR="' + meson.current_source_dir() /
 servingTestSources = files(
   'config/test_types.cpp',
   'memory/test_kv_cache.cpp',
+  'sched/test_scheduler.cpp',
   'model/test_chat_template.cpp',
 )
 
