@@ -17,6 +17,7 @@
  */
 
 #include <cstdint>
+#include <list>
 #include <map>
 #include <memory>
 #include <string>
@@ -100,6 +101,10 @@ class RuleTransport
 
   /// Withdraw every rule for a session, because its path is being replanned.
   virtual void revoke(const std::string &sessionId, uint64_t generation) = 0;
+
+  /// A replica is gone. A transport that holds a per-replica channel stops
+  /// writing to it: a dead consumer never drains, so pushing to it blocks.
+  virtual void onReplicaUnreachable(const std::string & /*replicaName*/) {}
 };
 
 /// What a strategy did, so a caller (and a test) can tell the options apart.
@@ -153,7 +158,7 @@ class DistributedRuleStrategy : public RoutingStrategy
 {
   public:
 
-  DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport);
+  DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport, size_t maxPaths = DEFAULT_MAX_SESSIONS);
 
   /// The first request for a session plans and publishes; later ones reuse the
   /// standing path without consulting the planner.
@@ -170,12 +175,26 @@ class DistributedRuleStrategy : public RoutingStrategy
   private:
 
   void publish(const RoutingPath &path);
+  void forget(const std::string &sessionId);
 
-  RoutingPlanner                    &_planner;
-  RuleTransport                     &_transport;
-  std::map<std::string, RoutingPath> _paths;
-  uint64_t                           _generation = 0;
-  RoutingStats                       _stats;
+  struct Standing
+  {
+    RoutingPath                      path;
+    std::list<std::string>::iterator position;
+  };
+
+  RoutingPlanner &_planner;
+  RuleTransport  &_transport;
+
+  /// A standing path is keyed by a client-supplied session id and reused for as
+  /// long as it exists, so without a bound the map grows with the number of
+  /// distinct ids a caller sends. Mirrors SessionDirectory's cap.
+  size_t                          _maxPaths;
+  std::map<std::string, Standing> _paths;
+  /// Least recently used at the front.
+  std::list<std::string> _order;
+  uint64_t               _generation = 0;
+  RoutingStats           _stats;
 };
 
 /// Build the strategy a deployment was launched with. `transport` may be null

@@ -61,6 +61,10 @@ class FakeTransport : public RuleTransport
 
   void revoke(const std::string &sessionId, uint64_t generation) override { revoked.push_back(Rule{"", sessionId, "", generation}); }
 
+  void onReplicaUnreachable(const std::string &replicaName) override { unreachable.push_back(replicaName); }
+
+  std::vector<std::string> unreachable;
+
   [[nodiscard]] std::vector<Rule> rulesFor(const std::string &sessionId) const
   {
     std::vector<Rule> out;
@@ -329,4 +333,54 @@ TEST(RoutingOptionsTest, AgreeOnThePathButNotOnWhereTheDecisionHappens)
   EXPECT_EQ(ingressStats.rulesPublished, 0);
   EXPECT_EQ(rulesStats.plansComputed, 1);
   EXPECT_EQ(rulesStats.rulesPublished, 2);
+}
+
+TEST(DistributedRulesTest, BoundsStandingPathsAndRevokesWhatItDrops)
+{
+  SessionDirectory        sessions(600.0);
+  RoutingPlanner          planner(RoutingConfig{}, sessions, pipeline());
+  FakeTransport           transport;
+  DistributedRuleStrategy strategy(planner, transport, 3);
+
+  // The key is client-supplied, so an unbounded map grows with whatever ids a
+  // caller sends.
+  for (int i = 0; i < 10; ++i) { (void)strategy.onRequest("s" + std::to_string(i)); }
+  EXPECT_EQ(strategy.activePaths(), 3u);
+
+  // Dropping a path without revoking would leave replicas forwarding along it.
+  EXPECT_FALSE(transport.revoked.empty());
+  EXPECT_EQ(transport.revoked.front().sessionId, "s0");
+}
+
+TEST(DistributedRulesTest, ReuseKeepsAPathFromBeingEvicted)
+{
+  SessionDirectory        sessions(600.0);
+  RoutingPlanner          planner(RoutingConfig{}, sessions, pipeline());
+  FakeTransport           transport;
+  DistributedRuleStrategy strategy(planner, transport, 3);
+
+  const auto kept = strategy.onRequest("keep");
+  for (int i = 0; i < 6; ++i)
+  {
+    (void)strategy.onRequest("other" + std::to_string(i));
+    (void)strategy.onRequest("keep"); // still in use
+  }
+  // Reused every round, so it is never the least recently used.
+  EXPECT_EQ(hopNames(strategy.onRequest("keep")), hopNames(kept));
+  EXPECT_EQ(strategy.stats().plansComputed, 7) << "the kept path was replanned";
+}
+
+TEST(DistributedRulesTest, TellsTheTransportAReplicaIsUnreachable)
+{
+  SessionDirectory        sessions(600.0);
+  RoutingPlanner          planner(RoutingConfig{}, sessions, pipeline());
+  FakeTransport           transport;
+  DistributedRuleStrategy strategy(planner, transport);
+
+  const auto path = strategy.onRequest("s1");
+  strategy.onReplicaLost(path.hops[1].name);
+  // The transport holds a channel per replica; writing to the lost one blocks
+  // once it fills, because nothing is draining it.
+  ASSERT_EQ(transport.unreachable.size(), 1u);
+  EXPECT_EQ(transport.unreachable.front(), path.hops[1].name);
 }

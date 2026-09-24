@@ -116,9 +116,10 @@ void CoordinatorIngressStrategy::onReplicaLost(const std::string &replicaName)
 // Option B
 // ---------------------------------------------------------------------------
 
-DistributedRuleStrategy::DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport)
+DistributedRuleStrategy::DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport, size_t maxPaths)
   : _planner(planner),
-    _transport(transport)
+    _transport(transport),
+    _maxPaths(maxPaths == 0 ? 1 : maxPaths)
 {}
 
 RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
@@ -129,15 +130,36 @@ RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
     // The standing path is reused without consulting the planner. Routing
     // happens once per session -- that is what keeps the decision off the
     // critical path.
-    return existing->second;
+    _order.splice(_order.end(), _order, existing->second.position);
+    return existing->second.path;
   }
 
   _stats.plansComputed += 1;
   RoutingPath path = _planner.plan(sessionId);
   path.generation  = ++_generation;
   publish(path);
-  _paths.emplace(sessionId, path);
+
+  while (_paths.size() >= _maxPaths && !_order.empty())
+  {
+    // Evicting without revoking would leave replicas forwarding along a path
+    // this coordinator no longer knows about.
+    const std::string oldest = _order.front();
+    const auto        it     = _paths.find(oldest);
+    if (it != _paths.end()) { _transport.revoke(oldest, it->second.path.generation); }
+    forget(oldest);
+  }
+
+  const auto position = _order.insert(_order.end(), sessionId);
+  _paths.emplace(sessionId, Standing{path, position});
   return path;
+}
+
+void DistributedRuleStrategy::forget(const std::string &sessionId)
+{
+  const auto it = _paths.find(sessionId);
+  if (it == _paths.end()) { return; }
+  _order.erase(it->second.position);
+  _paths.erase(it);
 }
 
 void DistributedRuleStrategy::publish(const RoutingPath &path)
@@ -153,22 +175,25 @@ void DistributedRuleStrategy::publish(const RoutingPath &path)
 void DistributedRuleStrategy::onReplicaLost(const std::string &replicaName)
 {
   _planner.setReady(replicaName, false);
+  // Before any revoke: the transport must stop writing to this replica's own
+  // channel, which nothing is draining any more.
+  _transport.onReplicaUnreachable(replicaName);
 
   // Every standing path through the lost replica is now wrong. Revoke it rather
   // than leaving replicas forwarding into a dead node, and let the next request
   // replan -- the generation on the new rule is what lets a replica holding the
   // old one recognise it as stale.
   std::vector<std::string> affected;
-  for (const auto &[sessionId, path] : _paths)
+  for (const auto &[sessionId, standing] : _paths)
   {
-    const bool touches = std::any_of(path.hops.begin(), path.hops.end(), [&](const ReplicaSpec &hop) { return hop.name == replicaName; });
+    const bool touches = std::any_of(standing.path.hops.begin(), standing.path.hops.end(), [&](const ReplicaSpec &hop) { return hop.name == replicaName; });
     if (touches) { affected.push_back(sessionId); }
   }
 
   for (const std::string &sessionId : affected)
   {
-    _transport.revoke(sessionId, _paths.at(sessionId).generation);
-    _paths.erase(sessionId);
+    _transport.revoke(sessionId, _paths.at(sessionId).path.generation);
+    forget(sessionId);
     _stats.pathsInvalidated += 1;
   }
 }
