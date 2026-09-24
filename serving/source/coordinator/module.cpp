@@ -12,6 +12,7 @@ Coordinator::Coordinator(CoordinatorConfig config, router::RuleTransport *transp
 
 void Coordinator::initialize()
 {
+  const std::lock_guard<std::mutex> lock(_routingMutex);
   if (_config.replicas.empty()) { throw std::invalid_argument("a coordinator needs at least one replica"); }
 
   std::vector<router::ReplicaSpec> specs;
@@ -31,6 +32,7 @@ void Coordinator::initialize()
 
 router::RoutingPath Coordinator::routeFor(const std::string &sessionId)
 {
+  const std::lock_guard<std::mutex> lock(_routingMutex);
   if (_strategy == nullptr) { throw std::runtime_error("coordinator is not initialized"); }
   return _strategy->onRequest(sessionId);
 }
@@ -43,16 +45,17 @@ void Coordinator::reportReplicaLost(const std::string &replicaName)
 
 void Coordinator::service()
 {
-  if (_strategy == nullptr) { return; }
-
   std::deque<std::string> losses;
   {
     const std::lock_guard<std::mutex> lock(_mutex);
     losses.swap(_pendingLosses);
   }
+  if (losses.empty()) { return; }
 
   // Applied on the service tick, so a heartbeat signal never runs routing policy
   // on the reporting thread.
+  const std::lock_guard<std::mutex> lock(_routingMutex);
+  if (_strategy == nullptr) { return; }
   for (const std::string &replicaName : losses)
   {
     _strategy->onReplicaLost(replicaName);
@@ -62,6 +65,7 @@ void Coordinator::service()
 
 void Coordinator::finalize()
 {
+  const std::lock_guard<std::mutex> lock(_routingMutex);
   _strategy.reset();
   _planner.reset();
   _sessions.reset();
@@ -70,11 +74,28 @@ void Coordinator::finalize()
 
 std::optional<uint64_t> Coordinator::instanceFor(const std::string &replicaName) const
 {
-  const auto it = _instanceByName.find(replicaName);
+  const std::lock_guard<std::mutex> lock(_routingMutex);
+  const auto                        it = _instanceByName.find(replicaName);
   if (it == _instanceByName.end()) { return std::nullopt; }
   return it->second;
 }
 
-router::RoutingStats Coordinator::stats() const { return _strategy == nullptr ? router::RoutingStats{} : _strategy->stats(); }
+router::RoutingStats Coordinator::stats() const
+{
+  const std::lock_guard<std::mutex> lock(_routingMutex);
+  return _strategy == nullptr ? router::RoutingStats{} : _strategy->stats();
+}
+
+bool Coordinator::initialized() const
+{
+  const std::lock_guard<std::mutex> lock(_routingMutex);
+  return _strategy != nullptr;
+}
+
+int Coordinator::lossesApplied() const
+{
+  const std::lock_guard<std::mutex> lock(_routingMutex);
+  return _lossesApplied;
+}
 
 } // namespace serving::coordinator

@@ -35,7 +35,8 @@ struct TokenOutput
   std::string requestId;
   /// Text produced since the previous update.
   std::string delta;
-  /// Cumulative text so far.
+  /// The whole text, on the final update only: carrying it per token is
+  /// quadratic in the generated length. Accumulate `delta` for a running value.
   std::string        text;
   std::optional<int> tokenId;
   bool               finished = false;
@@ -114,7 +115,7 @@ class Engine
   {
     sched::RequestPtr                       request;
     std::shared_ptr<RequestStream>          stream;
-    std::unique_ptr<IncrementalDetokenizer> detokenizer;
+    std::shared_ptr<IncrementalDetokenizer> detokenizer;
     config::GenerateConfig                  generateConfig;
     std::string                             lastText;
   };
