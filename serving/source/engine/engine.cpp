@@ -372,7 +372,8 @@ void Engine::failRequest(const std::string &requestId, const std::string &reason
   TokenOutput update;
   update.requestId    = requestId;
   update.finished     = true;
-  update.finishReason = reason.empty() ? std::string{"error"} : reason;
+  update.finishReason = "FINISHED_ERROR";
+  update.error        = reason.empty() ? std::string{"request failed"} : reason;
   stream->push(std::move(update));
   stream->close();
 }

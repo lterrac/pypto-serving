@@ -326,7 +326,10 @@ TEST(EngineTest, AnExecutorFailureFailsTheRequestNotTheEngine)
 
   ASSERT_FALSE(updates.empty());
   EXPECT_TRUE(updates.back().finished);
-  EXPECT_EQ(updates.back().finishReason, "device exploded");
+  // The failure is an error, not a finish reason: reporting it as one turns a
+  // crashed step into a successful completion at the HTTP layer.
+  EXPECT_EQ(updates.back().error, "device exploded");
+  EXPECT_EQ(updates.back().finishReason, "FINISHED_ERROR");
   // The engine survives it.
   EXPECT_TRUE(engine.isReady());
 
