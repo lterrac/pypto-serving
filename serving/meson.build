@@ -42,6 +42,7 @@ servingSources = files(
   'source/engine/detokenizer.cpp',
   'source/engine/engine.cpp',
   'source/model/chat_template.cpp',
+  'source/server/http_server.cpp',
 )
 
 ####### Optional: Python -- the bridge (embedded) and the bindings (extension)
@@ -170,6 +171,7 @@ if havePythonBindings
       'source/bindings/scheduler_bindings.cpp',
       'source/bindings/tokenizer_bindings.cpp',
       'source/bindings/engine_bindings.cpp',
+      'source/bindings/server_bindings.cpp',
     ),
     cpp_args: bindingsCppArgs,
     include_directories: pybind11Includes,
