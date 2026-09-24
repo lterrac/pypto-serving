@@ -7,3 +7,18 @@
 [submodule "platform/extern/TaskR"]
 	path = platform/extern/TaskR
 	url = https://github.com/huawei-csl/TaskR.git
+[submodule "serving/extern/minja"]
+	path = serving/extern/minja
+	url = https://github.com/google/minja.git
+[submodule "serving/extern/cpp-httplib"]
+	path = serving/extern/cpp-httplib
+	url = https://github.com/yhirose/cpp-httplib.git
+	shallow = true
+[submodule "serving/extern/json"]
+	path = serving/extern/json
+	url = https://github.com/nlohmann/json.git
+	shallow = true
+[submodule "serving/extern/pybind11"]
+	path = serving/extern/pybind11
+	url = https://github.com/pybind/pybind11.git
+	shallow = true
