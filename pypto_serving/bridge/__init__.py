@@ -31,7 +31,9 @@ sampled ids; a request with temperature > 0 is refused.
 
 from __future__ import annotations
 
+import json
 import logging
+import traceback
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -123,6 +125,21 @@ def open_model(
 def page_size() -> int:
     """Tokens per KV block, so the caller can size its own block table."""
     return _require_state().page_size
+
+
+def step(command_json: str) -> str:
+    """One step over JSON. Errors are returned in the payload, not raised."""
+    try:
+        command = json.loads(command_json)
+        tokens = _run_step(command)
+        return json.dumps({"tokens": tokens})
+    except Exception as exc:  # noqa: BLE001 -- the boundary must not raise
+        logger.exception("bridge step failed")
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
+
+
+def _run_step(command: dict[str, Any]) -> dict[str, list[int]]:
+    return run_step(command.get("prefill") or [], command.get("decode") or [])
 
 
 def run_step(prefill: list[dict[str, Any]], decode: list[dict[str, Any]]) -> dict[str, list[int]]:
