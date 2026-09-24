@@ -37,6 +37,7 @@ servingDependencies = [dependency('threads')]
 ####### Library sources
 
 servingSources = files(
+  'source/memory/kv_cache.cpp',
   'source/model/chat_template.cpp',
 )
 
@@ -161,6 +162,7 @@ if havePythonBindings
       'source/bindings/bindings.cpp',
       'source/bindings/config_bindings.cpp',
       'source/bindings/template_bindings.cpp',
+      'source/bindings/kv_cache_bindings.cpp',
     ),
     cpp_args: bindingsCppArgs,
     include_directories: pybind11Includes,
