@@ -283,7 +283,8 @@ int runServing(const Options &options)
   std::printf("[serving] shutting down\n");
   std::fflush(stdout);
 
-  server.stop();
+  // Engine first: it closes the request streams the HTTP workers are parked on.
   engine.stop();
+  server.stop();
   return 0;
 }
