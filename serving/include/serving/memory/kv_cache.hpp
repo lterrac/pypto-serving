@@ -113,6 +113,10 @@ class KvCacheManager
    */
   [[nodiscard]] std::vector<KVCacheBlock *> getComputedBlocks(const std::vector<int> &tokenIds, std::optional<int> maxCacheHitTokens = std::nullopt);
 
+  /// The same lookup against hashes computed earlier, for a caller that already
+  /// holds them. `numTokens` is the length they were computed over.
+  [[nodiscard]] std::vector<KVCacheBlock *> getComputedBlocks(const std::vector<BlockHash> &blockHashes, int numTokens, std::optional<int> maxCacheHitTokens = std::nullopt);
+
   /// Publish blocks `[start, end)` of a request to the prefix cache.
   void cacheBlockIds(const std::vector<int> &blockIds, const std::vector<BlockHash> &blockHashes, int start, int end);
 

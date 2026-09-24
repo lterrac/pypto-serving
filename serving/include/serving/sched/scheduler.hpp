@@ -104,9 +104,11 @@ struct Request
   /// consistent when the next step is scheduled before the in-flight token lands.
   [[nodiscard]] int numTokens() const { return numPromptTokens() + static_cast<int>(outputTokenIds.size()) + numOutputPlaceholders; }
 
-  [[nodiscard]] int              numNewTokensNeeded() const { return numTokens() - numComputedTokens; }
-  [[nodiscard]] bool             isPrefill() const { return numComputedTokens < numPromptTokens(); }
-  [[nodiscard]] std::vector<int> allTokenIds() const;
+  [[nodiscard]] int  numNewTokensNeeded() const { return numTokens() - numComputedTokens; }
+  [[nodiscard]] bool isPrefill() const { return numComputedTokens < numPromptTokens(); }
+  /// Tokens [begin, end) of prompt-then-generated. Building the whole sequence
+  /// to take a chunk out of it is O(context) per chunk.
+  [[nodiscard]] std::vector<int> tokenRange(int begin, int end) const;
 };
 
 using RequestPtr = std::shared_ptr<Request>;
