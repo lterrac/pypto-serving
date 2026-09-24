@@ -346,6 +346,79 @@ TEST(EngineTest, AnExecutorFailureFailsTheRequestNotTheEngine)
   engine.stop();
 }
 
+TEST(EngineTest, StopsOnAStopString)
+{
+  const CharTokenizer tokenizer;
+  // Prompt "go" then generate "abc": the stop string cuts before "b".
+  ScriptedExecutor executor({'a', 'b', 'c'});
+  Engine           engine(makeConfig(), tokenizer, executor);
+  engine.start();
+
+  const auto prompt            = tokenizer.encode("go");
+  executor.promptLengths["r1"] = static_cast<int>(prompt.size());
+
+  GenerateConfig generate;
+  generate.maxNewTokens = 8;
+  generate.stop         = {"b"};
+
+  const auto updates = drain(engine.addRequest("r1", prompt, generate));
+  ASSERT_FALSE(updates.empty());
+  EXPECT_TRUE(updates.back().finished);
+  EXPECT_EQ(updates.back().finishReason, "FINISHED_STOP");
+  // The stop text is not part of the answer, and nothing after it is generated.
+  EXPECT_EQ(updates.back().text, "a");
+  engine.stop();
+}
+
+TEST(EngineTest, OnlyTheFinalUpdateCarriesTheWholeText)
+{
+  const CharTokenizer tokenizer;
+  ScriptedExecutor    executor({'h', 'i', '!'});
+  Engine              engine(makeConfig(), tokenizer, executor);
+  engine.start();
+
+  const auto prompt            = tokenizer.encode("go");
+  executor.promptLengths["r1"] = static_cast<int>(prompt.size());
+
+  GenerateConfig generate;
+  generate.maxNewTokens = 3;
+
+  const auto updates = drain(engine.addRequest("r1", prompt, generate));
+  ASSERT_GE(updates.size(), 2u);
+  // Cumulative text per token is quadratic in the generated length; the deltas
+  // carry the stream and the final update carries the whole answer.
+  std::string accumulated;
+  for (size_t i = 0; i + 1 < updates.size(); ++i)
+  {
+    EXPECT_TRUE(updates[i].text.empty()) << "intermediate update " << i << " carried the whole text";
+    accumulated += updates[i].delta;
+  }
+  accumulated += updates.back().delta;
+  EXPECT_EQ(updates.back().text, "hi!");
+  EXPECT_EQ(accumulated, "hi!");
+  engine.stop();
+}
+
+TEST(EngineTest, AFailedModelLoadLeavesTheEngineUnstarted)
+{
+  class FailingExecutor : public ModelExecutor
+  {
+    public:
+
+    int        registerModel() override { throw std::runtime_error("kernel compile failed"); }
+    StepResult executeStep(const StepCommand &) override { return {}; }
+  };
+
+  const CharTokenizer tokenizer;
+  FailingExecutor     executor;
+  Engine              engine(makeConfig(), tokenizer, executor);
+
+  EXPECT_THROW(engine.start(), std::runtime_error);
+  EXPECT_FALSE(engine.isReady());
+  // Admitting here would reach a scheduler that was never built.
+  EXPECT_THROW((void)engine.addRequest("r1", {1, 2}, GenerateConfig{}), std::runtime_error);
+}
+
 TEST(EngineTest, AbortClosesTheStream)
 {
   const CharTokenizer tokenizer;

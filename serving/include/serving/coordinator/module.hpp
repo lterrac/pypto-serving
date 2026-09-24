@@ -81,7 +81,7 @@ class Coordinator
 
   [[nodiscard]] router::PartitionId partition() const { return _config.partition; }
   [[nodiscard]] router::RoutingMode mode() const { return _config.mode; }
-  [[nodiscard]] bool                initialized() const { return _strategy != nullptr; }
+  [[nodiscard]] bool                initialized() const;
 
   /// The instance serving a routing name, or nullopt if it is not one of ours.
   [[nodiscard]] std::optional<uint64_t> instanceFor(const std::string &replicaName) const;
@@ -89,7 +89,7 @@ class Coordinator
   [[nodiscard]] router::RoutingStats stats() const;
 
   /// Replica-loss reports drained so far, so a test can see the tick did work.
-  [[nodiscard]] int lossesApplied() const { return _lossesApplied; }
+  [[nodiscard]] int lossesApplied() const;
 
   private:
 
@@ -102,9 +102,15 @@ class Coordinator
 
   std::map<std::string, uint64_t> _instanceByName;
 
+  /// Guards the loss queue only, so a heartbeat never waits behind a route.
   mutable std::mutex      _mutex;
   std::deque<std::string> _pendingLosses;
-  int                     _lossesApplied = 0;
+
+  /// Guards the routing state. Requests arrive on their own threads while the
+  /// platform's timer drives service(), and both reach the same strategy,
+  /// planner and session directory.
+  mutable std::mutex _routingMutex;
+  int                _lossesApplied = 0;
 };
 
 } // namespace serving::coordinator

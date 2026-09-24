@@ -195,8 +195,11 @@ void HttpServer::registerRoutes()
       while (auto update = stream->pop())
       {
         if (update->tokenId.has_value()) { completionTokens += 1; }
-        text = update->text;
-        if (update->finished) { finishReason = mapFinishReason(update->finishReason); }
+        if (update->finished)
+        {
+          text         = update->text;
+          finishReason = mapFinishReason(update->finishReason);
+        }
       }
 
       json choice;
