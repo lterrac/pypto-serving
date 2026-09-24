@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 
 #include <system/channels/message.hpp>
@@ -67,9 +68,13 @@ class ChannelRuleTransport final : public router::RuleTransport
     // that is going away.
     for (auto &[name, channel] : _channels)
     {
-      if (channel != nullptr) { send(*channel, _revokeType, generation, payload); }
+      if (channel != nullptr && _unreachable.count(name) == 0) { send(*channel, _revokeType, generation, payload); }
     }
   }
+
+  /// Pushing to a channel whose consumer is gone blocks once it fills, which
+  /// would hang the service tick that is applying the loss.
+  void onReplicaUnreachable(const std::string &replicaName) override { _unreachable.insert(replicaName); }
 
   private:
 
@@ -104,8 +109,10 @@ class ChannelRuleTransport final : public router::RuleTransport
   system::channels::Message::messageType_t _revokeType;
 
   std::map<std::string, system::channels::Output *> _channels;
-  std::map<std::string, uint64_t>                   _instanceByName;
-  uint64_t                                          _sequence = 0;
+
+  std::set<std::string>           _unreachable;
+  std::map<std::string, uint64_t> _instanceByName;
+  uint64_t                        _sequence = 0;
 };
 
 } // namespace serving::coordinator
