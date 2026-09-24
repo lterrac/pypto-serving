@@ -216,15 +216,21 @@ std::vector<BlockHash> KvCacheManager::computeBlockHashes(const std::vector<int>
 
 std::vector<KVCacheBlock *> KvCacheManager::getComputedBlocks(const std::vector<int> &tokenIds, std::optional<int> maxCacheHitTokens)
 {
+  if (!_enablePrefixCache) { return {}; }
+  return getComputedBlocks(iterBlockHashes(tokenIds), static_cast<int>(tokenIds.size()), maxCacheHitTokens);
+}
+
+std::vector<KVCacheBlock *> KvCacheManager::getComputedBlocks(const std::vector<BlockHash> &blockHashes, int numTokens, std::optional<int> maxCacheHitTokens)
+{
   std::vector<KVCacheBlock *> hitBlocks;
   if (!_enablePrefixCache) { return hitBlocks; }
 
   // Hold back the last token by default: the scheduler needs to recompute logits
   // without writing into the final shared prefix-cache block.
-  const int limitTokens  = maxCacheHitTokens.value_or(std::max(0, static_cast<int>(tokenIds.size()) - 1));
+  const int limitTokens  = maxCacheHitTokens.value_or(std::max(0, numTokens - 1));
   const int maxHitBlocks = std::max(0, limitTokens) / _blockSize;
 
-  for (const BlockHash blockHash : iterBlockHashes(tokenIds))
+  for (const BlockHash blockHash : blockHashes)
   {
     if (static_cast<int>(hitBlocks.size()) >= maxHitBlocks) { break; }
     KVCacheBlock *block = getCachedBlock(blockHash);
