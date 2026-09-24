@@ -47,6 +47,7 @@ servingSources = files(
   'source/router/strategy.cpp',
   'source/coordinator/module.cpp',
   'source/coordinator/rule_message.cpp',
+  'source/coordinator/config_file.cpp',
   'source/router/proxy.cpp',
   'source/router/router_server.cpp',
 )

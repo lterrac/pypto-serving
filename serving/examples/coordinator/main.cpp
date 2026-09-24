@@ -2,13 +2,14 @@
  * Runs CoordinatorModule through initialize, routing, a replica loss, a
  * service tick and finalize. No HiCR instances are stood up.
  *
- *   coordinator-module [--routing-mode ingress|rules]
+ *   coordinator-module --config FILE     (coordinator.json is one)
  */
 
 #include <cstdio>
 #include <string>
 #include <vector>
 
+#include <serving/coordinator/config_file.hpp>
 #include <serving/coordinator/platform_module.hpp>
 
 namespace
@@ -31,15 +32,6 @@ class PrintingTransport : public router::RuleTransport
   }
 };
 
-coordinator::ReplicaBinding binding(const std::string &name, int partition, uint64_t instanceId)
-{
-  coordinator::ReplicaBinding b;
-  b.spec.name      = name;
-  b.spec.partition = partition;
-  b.instanceId     = instanceId;
-  return b;
-}
-
 void printPath(const router::RoutingPath &path)
 {
   std::printf("    path: ");
@@ -51,24 +43,40 @@ void printPath(const router::RoutingPath &path)
 
 int main(int argc, char **argv)
 {
-  std::string modeText = "rules";
+  std::string configPath;
   for (int i = 1; i < argc; ++i)
   {
     const std::string arg = argv[i];
-    if (arg == "--routing-mode" && i + 1 < argc) { modeText = argv[++i]; }
+    if (arg == "--config" && i + 1 < argc) { configPath = argv[++i]; }
+    else if (arg == "--help" || arg == "-h")
+    {
+      std::printf("usage: %s --config FILE\n", argv[0]);
+      return 0;
+    }
+  }
+  if (configPath.empty())
+  {
+    std::fprintf(stderr, "usage: %s --config FILE\n", argv[0]);
+    return 2;
   }
 
   coordinator::CoordinatorConfig config;
-  config.partition = 1;
-  config.mode      = router::parseRoutingMode(modeText);
-  config.replicas  = {binding("p0a", 0, 10), binding("p0b", 0, 11), binding("p1a", 1, 20), binding("p1b", 1, 21), binding("p2a", 2, 30), binding("p2b", 2, 31)};
+  try
+  {
+    config = coordinator::loadCoordinatorConfig(configPath);
+  }
+  catch (const std::exception &e)
+  {
+    std::fprintf(stderr, "fatal: %s\n", e.what());
+    return 1;
+  }
 
   PrintingTransport transport;
   // A real deployment registers this with serving::system::Engine::addModule,
   // which then drives the lifecycle below.
   coordinator::CoordinatorModule module(config, &transport);
 
-  std::printf("coordinator for partition %d, mode %s\n\n", config.partition, modeText.c_str());
+  std::printf("coordinator for partition %d, mode %s (from %s)\n\n", config.partition, router::routingModeName(config.mode), configPath.c_str());
 
   std::printf("  initialize()\n");
   module.initialize();

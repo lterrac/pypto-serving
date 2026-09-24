@@ -1,0 +1,16 @@
+{
+  "routing_mode": "rules",
+  "partition": 1,
+  "routing": {
+    "session_ttl_seconds": 1800,
+    "affinity_slack": 8
+  },
+  "replicas": [
+    { "name": "p0a", "host": "10.0.0.1", "port": 8000, "partition": 0, "instance": 10 },
+    { "name": "p0b", "host": "10.0.0.1", "port": 8001, "partition": 0, "instance": 11 },
+    { "name": "p1a", "host": "10.0.0.2", "port": 8000, "partition": 1, "instance": 20 },
+    { "name": "p1b", "host": "10.0.0.2", "port": 8001, "partition": 1, "instance": 21 },
+    { "name": "p2a", "host": "10.0.0.3", "port": 8000, "partition": 2, "instance": 30 },
+    { "name": "p2b", "host": "10.0.0.3", "port": 8001, "partition": 2, "instance": 31 }
+  ]
+}
