@@ -1,0 +1,28 @@
+{
+ "model": "Qwen3-14B",
+ "captured": "2026-09-22",
+ "provenance": {
+  "node": "hg-atlas-01",
+  "container": "terra-router-01",
+  "device": "physical 4 via task-submit, logical 0",
+  "pypto": "d82fbf20 (#2806)",
+  "simpler": "22385d2b",
+  "ptoas": "0.61",
+  "serving": "main c9e1a5c"
+ },
+ "cli": {
+  "max_model_len": 512,
+  "platform": "a2a3",
+  "backend": "npu",
+  "generate_config": {"max_new_tokens": 8}
+ },
+ "cases": [
+  {
+   "name": "capital_of_france",
+   "prompt": "The capital of France is",
+   "expected_text": " Paris. What is the capital of the",
+   "expected_token_ids": [12095, 13, 3555, 374, 279, 6722, 315, 279],
+   "finish_reason": "length"
+  }
+ ]
+}

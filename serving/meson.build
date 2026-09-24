@@ -37,6 +37,7 @@ servingDependencies = [dependency('threads')]
 ####### Library sources
 
 servingSources = files(
+  'source/model/chat_template.cpp',
 )
 
 ####### Optional: Python -- the bridge (embedded) and the bindings (extension)
@@ -126,10 +127,19 @@ if havePythonBridge
   servingDependencies += pythonEmbedDep
 endif
 
+servingLib = static_library(
+  'serving',
+  servingSources,
+  cpp_args: servingBuildCppArgs,
+  include_directories: servingBuildIncludes,
+  dependencies: servingDependencies,
+)
+
 servingBuildDep = declare_dependency(
   compile_args: servingBuildCppArgs,
   include_directories: servingBuildIncludes,
   dependencies: servingDependencies,
+  link_with: servingLib,
 )
 
 ####### The Python bindings
@@ -150,6 +160,7 @@ if havePythonBindings
     files(
       'source/bindings/bindings.cpp',
       'source/bindings/config_bindings.cpp',
+      'source/bindings/template_bindings.cpp',
     ),
     cpp_args: bindingsCppArgs,
     include_directories: pybind11Includes,
