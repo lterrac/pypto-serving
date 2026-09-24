@@ -263,6 +263,27 @@ TEST(HttpServerTest, RejectsAMissingPrompt)
   EXPECT_EQ(response->status, 400);
 }
 
+TEST(HttpServerTest, RefusesSamplingItDoesNotImplement)
+{
+  Fixture fixture;
+  auto    client = fixture.client();
+
+  // Accepting these and sampling greedily anyway returns a different
+  // distribution than the caller asked for, silently.
+  for (const auto &body : {json{{"prompt", "hi"}, {"temperature", 0.7}}, json{{"prompt", "hi"}, {"top_k", 40}}})
+  {
+    const auto response = client.Post("/v1/completions", body.dump(), "application/json");
+    ASSERT_NE(response, nullptr);
+    EXPECT_EQ(response->status, 400) << body.dump();
+    EXPECT_NE(response->body.find("greedy"), std::string::npos) << response->body;
+  }
+
+  // Greedy defaults still work.
+  const auto ok = client.Post("/v1/completions", json{{"prompt", "Say:"}, {"temperature", 0.0}, {"max_tokens", 2}, {"ignore_eos", true}}.dump(), "application/json");
+  ASSERT_NE(ok, nullptr);
+  EXPECT_EQ(ok->status, 200);
+}
+
 TEST(HttpServerTest, AFailedStepIsAnErrorNotACompletion)
 {
   Fixture fixture;
