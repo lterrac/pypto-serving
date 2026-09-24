@@ -1,0 +1,31 @@
+option('buildExamples', type : 'boolean', value : false,
+       description: 'Indicates whether to build example apps'
+)
+
+option('buildTests', type : 'boolean', value : false,
+       description: 'Indicates whether to build tests'
+)
+
+option('compileWarningsAsErrors', type : 'boolean', value : false,
+       description: 'Indicates whether a compilation warning should result in a fatal error. This is useful for CI testing but may result in inconveniences for normal users, hence it should be false by default'
+)
+
+option('pythonBridge', type : 'feature', value : 'auto',
+       description: 'Build the embedded-CPython bridge to the Python model layer. Requires the CPython development headers and a shared libpython'
+)
+
+option('pythonBindings', type : 'feature', value : 'auto',
+       description: 'Build the _pypto_serving extension module, the serving APIs the Python model layer calls. Needs the CPython development headers and extern/pybind11 checked out'
+)
+
+option('pythonPath', type : 'string', value : '',
+       description: 'Interpreter the Python bridge embeds. Empty means whichever python3 is on PATH'
+)
+
+option('tokenizers', type : 'feature', value : 'auto',
+       description: 'Build against tokenizers-cpp. Found through pkg-config; point PKG_CONFIG_PATH at the tokenizers-cpp install tree'
+)
+
+option('platform', type : 'feature', value : 'auto',
+       description: 'Build the coordinator module against platform/ (HiCR + TaskR). Needs the platform submodules checked out'
+)
