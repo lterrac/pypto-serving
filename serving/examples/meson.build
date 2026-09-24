@@ -1,3 +1,5 @@
+subdir('routing_modes')
+
 if haveTokenizers
   subdir('tokenizer_check')
 else
