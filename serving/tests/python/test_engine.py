@@ -81,3 +81,33 @@ def test_dropping_the_server_without_stopping_it_does_not_hang():
         server = s.HttpServer(s.ServerConfig(host="127.0.0.1", port=0), engine, tok)
         server.start()
         del server
+
+
+def test_preemption_replay_reproduces_the_unpreempted_output():
+    """A request preempted mid-generation must resume to the same tokens.
+
+    It keeps what it generated but loses its KV, so on resume it replays prompt
+    plus generated. Feeding that replay as decode instead of prefill leaves the
+    rows in between unwritten; with a scripted executor the tokens diverge.
+    """
+
+    # 1 prompt + 12 generated = 13 tokens = 4 pages of 4.
+    def run(pages):
+        tokenizer, executor = WordTokenizer(), CountingExecutor(pages=pages)
+        engine = s.Engine(config(max_seq_len=256), tokenizer, executor)
+        produced = {}
+        with running(engine):
+            streams = {name: engine.add_request(name, [n + 1], s.GenerateConfig(max_new_tokens=12)) for n, name in enumerate(("r0", "r1"))}
+            for name, stream in streams.items():
+                produced[name], _ = drain(stream)
+            return produced, engine.preemptions, executor.kv_gaps
+
+    reference, none_preempted, clean_gaps = run(64)  # room for both
+    contended, some_preempted, gaps = run(5)         # room for one, not two
+
+    assert none_preempted == 0
+    assert clean_gaps == []
+    assert some_preempted > 0, "the pool was meant to be too small to hold both"
+    # The replay must have written every row the next decode attends.
+    assert gaps == [], f"decode at a position with unwritten rows before it: {gaps}"
+    assert contended == reference

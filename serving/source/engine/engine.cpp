@@ -198,6 +198,7 @@ void Engine::runOneStep()
     }
     else { output = _scheduler->schedule(); }
   }
+  if (!output.preemptedRequests.empty()) { _preemptions += static_cast<int>(output.preemptedRequests.size()); }
 
   if (output.scheduledRequests.empty())
   {

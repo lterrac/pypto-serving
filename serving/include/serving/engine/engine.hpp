@@ -110,6 +110,12 @@ class Engine
   /// Tokens admitted but not yet generated; the router's load signal.
   [[nodiscard]] int pendingTokenLoad() const;
 
+  /// Requests preempted since start. A running request is preempted when the KV
+  /// pool cannot grow it, and it then replays its prompt and everything it had
+  /// generated -- so a non-zero and rising count means the deployment is
+  /// thrashing and wants either fewer concurrent requests or more pages.
+  [[nodiscard]] int preemptions() const { return _preemptions.load(); }
+
   void abortRequest(const std::string &requestId);
 
   private:
@@ -149,6 +155,7 @@ class Engine
   std::atomic<bool> _running{false};
   std::atomic<bool> _started{false};
   std::atomic<bool> _loopAlive{false};
+  std::atomic<int>  _preemptions{0};
   std::atomic<int>  _requestCounter{0};
 };
 
