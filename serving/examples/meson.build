@@ -1,3 +1,9 @@
+if havePlatformChannels
+  subdir('channel_transport')
+else
+  message('channel_transport skipped: the platform channel headers are incomplete')
+endif
+
 if havePlatform
   subdir('coordinator')
 else
