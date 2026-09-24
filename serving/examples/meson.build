@@ -1,3 +1,9 @@
+if havePlatform
+  subdir('coordinator')
+else
+  message('coordinator example skipped: the platform feature is off')
+endif
+
 subdir('routing_modes')
 
 if haveTokenizers

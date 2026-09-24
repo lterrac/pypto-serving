@@ -11,6 +11,7 @@ servingTestSources = files(
   'server/test_http_server.cpp',
   'router/test_routing.cpp',
   'router/test_strategy.cpp',
+  'coordinator/test_coordinator.cpp',
   'router/test_router_server.cpp',
   'model/test_chat_template.cpp',
 )
