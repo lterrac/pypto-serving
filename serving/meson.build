@@ -44,6 +44,8 @@ servingSources = files(
   'source/model/chat_template.cpp',
   'source/server/http_server.cpp',
   'source/router/routing.cpp',
+  'source/router/proxy.cpp',
+  'source/router/router_server.cpp',
 )
 
 ####### Optional: Python -- the bridge (embedded) and the bindings (extension)
@@ -196,6 +198,17 @@ if havePythonBindings
     install: true,
   )
 endif
+
+####### The router binary
+#
+# No Python and no tokenizer: the router never parses a payload.
+
+routerBinary = executable(
+  'pypto-serving-router-cpp',
+  ['source/router_main.cpp'],
+  dependencies: [servingBuildDep],
+  install: true,
+)
 
 ####### Sub-directories
 
