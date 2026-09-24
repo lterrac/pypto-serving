@@ -148,7 +148,10 @@ class Runtime:
             self.stop()
 
     def stop(self) -> None:
+        # Engine first: its stop() closes every request stream, so the HTTP
+        # workers parked in pop() unwind. Stopping the server first joins those
+        # workers and waits for every in-flight generation to reach max_tokens.
+        self.engine.stop()
         if self.server is not None:
             self.server.stop()
             self.server = None
-        self.engine.stop()
