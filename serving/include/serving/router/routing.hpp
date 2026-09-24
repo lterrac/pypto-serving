@@ -44,10 +44,17 @@ class NoReplicaAvailable : public std::runtime_error
 
 [[nodiscard]] std::string newSessionId();
 
+/// Which pipeline stage a replica belongs to. A model split across nodes runs
+/// as a chain of partitions; each has its own coordinator and its own replicas,
+/// and each scales independently of the others.
+using PartitionId = int;
+
 /// One serving replica reachable over HTTP.
 struct ReplicaSpec
 {
   std::string name;
+  /// The partition this replica serves. Single-partition deployments leave it 0.
+  PartitionId partition = 0;
   std::string host;
   int         port = 0;
   /// Per replica so a deployment whose replicas are not on a trusted network can
