@@ -7,45 +7,6 @@ namespace serving::engine
 {
 
 // ---------------------------------------------------------------------------
-// RequestStream
-// ---------------------------------------------------------------------------
-
-void RequestStream::push(TokenOutput output)
-{
-  {
-    const std::lock_guard<std::mutex> lock(_mutex);
-    if (_closed) { return; }
-    _queue.push_back(std::move(output));
-  }
-  _cv.notify_one();
-}
-
-std::optional<TokenOutput> RequestStream::pop()
-{
-  std::unique_lock<std::mutex> lock(_mutex);
-  _cv.wait(lock, [this] { return !_queue.empty() || _closed; });
-  if (_queue.empty()) { return std::nullopt; }
-  TokenOutput output = std::move(_queue.front());
-  _queue.pop_front();
-  return output;
-}
-
-void RequestStream::close()
-{
-  {
-    const std::lock_guard<std::mutex> lock(_mutex);
-    _closed = true;
-  }
-  _cv.notify_all();
-}
-
-bool RequestStream::closed() const
-{
-  const std::lock_guard<std::mutex> lock(_mutex);
-  return _closed;
-}
-
-// ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 
@@ -192,26 +153,18 @@ void Engine::runOneStep()
   sched::SchedulerOutput output;
   {
     const std::lock_guard<std::mutex> lock(_mutex);
-    if (!_scheduler->hasWork())
-    {
-      // Nothing to do; drop the lock before sleeping.
-    }
-    else { output = _scheduler->schedule(); }
+    if (_scheduler->hasWork()) { output = _scheduler->schedule(); }
   }
-  if (!output.preemptedRequests.empty()) { _preemptions += static_cast<int>(output.preemptedRequests.size()); }
+  _preemptions += static_cast<int>(output.preemptedRequests.size());
+
+  // Rejections are delivered whether or not anything was scheduled.
+  for (const auto &[requestId, reason] : output.rejectedRequests) { failRequest(requestId, reason); }
 
   if (output.scheduledRequests.empty())
   {
     std::this_thread::sleep_for(std::chrono::microseconds(_config.idlePollMicroseconds));
-    // Rejections still need delivering even when nothing was scheduled.
-    if (!output.rejectedRequests.empty())
-    {
-      for (const auto &[requestId, reason] : output.rejectedRequests) { failRequest(requestId, reason); }
-    }
     return;
   }
-
-  for (const auto &[requestId, reason] : output.rejectedRequests) { failRequest(requestId, reason); }
 
   const StepCommand command = buildStepCommand(output);
   const StepResult  result  = _executor.executeStep(command);
