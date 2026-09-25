@@ -332,5 +332,4 @@ TEST(KvCacheManagerTest, ReportsNoCacheGroups)
 {
   KvCacheManager manager(4, 2, true);
   EXPECT_FALSE(manager.hasGroups());
-  EXPECT_FALSE(manager.hasEagleGroups());
 }

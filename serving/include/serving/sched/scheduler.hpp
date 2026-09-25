@@ -175,8 +175,6 @@ class Scheduler
   /// Apply worker results. `newTokenIds` maps request id to the tokens it sampled.
   [[nodiscard]] std::vector<RequestOutput> updateFromOutput(const SchedulerOutput &output, const std::unordered_map<std::string, std::vector<int>> &newTokenIds);
 
-  [[nodiscard]] const SchedulerConfig         &config() const { return _config; }
-  [[nodiscard]] memory::KvCacheManager        &kvCacheManager() { return _kvCacheManager; }
   [[nodiscard]] const std::vector<RequestPtr> &running() const { return _running; }
   [[nodiscard]] const std::deque<RequestPtr>  &waiting() const { return _waiting; }
   [[nodiscard]] RequestPtr                     lookup(const std::string &requestId) const;
@@ -215,6 +213,8 @@ class Scheduler
                                                                 SchedulerOutput            &output);
 
   void freeRequestBlocks(Request &request);
+
+  void dropFromRunning(const std::string &requestId);
   void cacheCompletedBlocks(Request &request, std::optional<int> numComputedTokens = std::nullopt);
 
   SchedulerConfig         _config;

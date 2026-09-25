@@ -1,5 +1,7 @@
 #include <serving/router/proxy.hpp>
 
+#include <serving/util/blocking_queue.hpp>
+
 #include <algorithm>
 #include <condition_variable>
 #include <cctype>
@@ -18,6 +20,11 @@ namespace serving::router
 
 namespace
 {
+
+/// Chunks in flight from the replica to the client. Bounded, so a slow client
+/// stops the upstream rather than growing without limit.
+constexpr size_t MAX_CHUNKS_IN_FLIGHT = 256;
+using ChunkQueue                      = util::BlockingQueue<std::string>;
 
 using Json = nlohmann::json;
 
@@ -43,59 +50,6 @@ bool dropFromResponse(const std::string &key)
   const auto k = lower(key);
   return kHopByHop.count(k) != 0 || k == "content-length";
 }
-
-/// Push-to-pull bridge: the upstream thread writes, the response provider reads.
-class ChunkQueue
-{
-  public:
-
-  void push(const char *data, size_t length)
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _cv.wait(lock, [this] { return _chunks.size() < kMaxChunks || _closed; });
-    if (_closed) { return; }
-    _chunks.emplace_back(data, length);
-    lock.unlock();
-    _cv.notify_all();
-  }
-
-  /// Next chunk, or nullopt once the upstream is finished and drained.
-  std::optional<std::string> pop()
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _cv.wait(lock, [this] { return !_chunks.empty() || _closed; });
-    if (_chunks.empty()) { return std::nullopt; }
-    std::string chunk = std::move(_chunks.front());
-    _chunks.pop_front();
-    lock.unlock();
-    _cv.notify_all();
-    return chunk;
-  }
-
-  void close()
-  {
-    {
-      const std::lock_guard<std::mutex> lock(_mutex);
-      _closed = true;
-    }
-    _cv.notify_all();
-  }
-
-  [[nodiscard]] bool closed() const
-  {
-    const std::lock_guard<std::mutex> lock(_mutex);
-    return _closed;
-  }
-
-  private:
-
-  static constexpr size_t kMaxChunks = 256;
-
-  mutable std::mutex      _mutex;
-  std::condition_variable _cv;
-  std::deque<std::string> _chunks;
-  bool                    _closed = false;
-};
 
 void sendError(httplib::Response &response, int status, const std::string &message, const std::string &sessionId)
 {
@@ -172,7 +126,7 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
     });
   };
 
-  auto queue = std::make_shared<ChunkQueue>();
+  auto queue = std::make_shared<ChunkQueue>(MAX_CHUNKS_IN_FLIGHT);
 
   // The upstream status and headers must be known before the body is relayed,
   // so the thread signals once the response handler has fired.
@@ -215,7 +169,7 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
     };
     upstreamRequest.content_receiver = [=](const char *data, size_t length, uint64_t, uint64_t) {
       if (queue->closed()) { return false; } // the client hung up; stop pulling
-      queue->push(data, length);
+      queue->push(std::string(data, length));
       return true;
     };
 
