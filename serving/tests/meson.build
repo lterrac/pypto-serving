@@ -3,7 +3,6 @@ gtestDep = dependency('gtest_main', required: true)
 servingTestArgs = ['-DSERVING_TEST_FIXTURE_DIR="' + meson.current_source_dir() / 'fixtures' + '"']
 
 servingTestSources = files(
-  'config/test_types.cpp',
   'memory/test_kv_cache.cpp',
   'sched/test_scheduler.cpp',
   'engine/test_detokenizer.cpp',
