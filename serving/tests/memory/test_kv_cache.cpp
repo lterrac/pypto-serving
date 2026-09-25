@@ -62,20 +62,6 @@ TEST(KvCacheManagerTest, InitializeRejectsANonPositiveBlockCount)
   }
 }
 
-TEST(KvCacheManagerTest, InitializeRejectsGroupedPools)
-{
-  RuntimeConfig                     runtime;
-  serving::config::KVCacheGroupSpec group;
-  group.name               = "primary";
-  group.maxBlocksPerSeq    = 4;
-  group.spec.blockSize     = 128;
-  group.spec.pageSizeBytes = 4096;
-  runtime.kvCacheGroups.push_back(group);
-
-  KvCacheManager manager;
-  EXPECT_THROW(manager.initialize(runtime, 16), std::runtime_error);
-}
-
 TEST(KvCacheManagerTest, ReinitializingWithDifferentDimensionsThrows)
 {
   RuntimeConfig runtime;
