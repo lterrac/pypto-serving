@@ -78,11 +78,6 @@ void KvCacheManager::initialize(const config::RuntimeConfig &runtime, int numBlo
     // Same message as the Python: it is what a failed kernel compile surfaces as.
     throw std::runtime_error("Worker reported invalid KV cache block count: " + std::to_string(numBlocks));
   }
-  if (!runtime.kvCacheGroups.empty())
-  {
-    throw std::runtime_error("grouped KV cache pools are not supported by this build "
-                             "(kv_cache_groups is DeepSeek-only and out of scope for the C++ port)");
-  }
   initBlocks(numBlocks, runtime.pageSize);
 }
 
