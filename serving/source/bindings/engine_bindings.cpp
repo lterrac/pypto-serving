@@ -110,7 +110,6 @@ void bindEngine(py::module_ &m)
     .def(py::init<>())
     .def_readwrite("scheduler", &engine::EngineConfig::scheduler)
     .def_readwrite("runtime", &engine::EngineConfig::runtime)
-    .def_readwrite("defaults", &engine::EngineConfig::defaults)
     .def_readwrite("idle_poll_microseconds", &engine::EngineConfig::idlePollMicroseconds);
 
   py::class_<engine::TokenOutput>(m, "TokenOutput", "One streamed update for a request.")

@@ -47,7 +47,7 @@ def test_kv_cache_manager_prefix_cache_round_trip():
     m.release_cached_blocks(full)
 
     assert m.get_computed_blocks([9, 9, 9, 9]) == []
-    assert not m.has_groups() and not m.has_eagle_groups()
+    assert not m.has_groups()
 
 
 def test_kv_cache_manager_initialize_from_runtime_config():

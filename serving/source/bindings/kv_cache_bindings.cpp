@@ -18,7 +18,6 @@ using namespace serving::memory;
 
 void bindKvCache(py::module_ &m)
 {
-  py::register_exception<KVCacheCapacityError>(m, "KVCacheCapacityError", PyExc_RuntimeError);
 
   // Blocks are owned by the manager and handed out by reference; Python never
   // creates one. reference_internal keeps the manager alive while a block is held.
@@ -50,7 +49,6 @@ void bindKvCache(py::module_ &m)
          py::return_value_policy::reference_internal)
     .def("cache_block_ids", &KvCacheManager::cacheBlockIds, py::arg("block_ids"), py::arg("block_hashes"), py::arg("start"), py::arg("end"))
     .def("has_groups", &KvCacheManager::hasGroups)
-    .def("has_eagle_groups", &KvCacheManager::hasEagleGroups)
     .def("block_at", &KvCacheManager::blockAt, py::arg("block_id"), py::return_value_policy::reference_internal)
     .def("__repr__", [](const KvCacheManager &k) {
       return Repr("KvCacheManager")

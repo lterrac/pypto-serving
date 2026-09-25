@@ -247,9 +247,10 @@ void HttpServer::registerRoutes()
 
     // SSE. The chunk provider runs on this handler thread and drains the
     // request's own queue, so streaming one response never touches the engine.
-    const std::string objectNameStr    = objectName;
-    auto              completionTokens = std::make_shared<int>(0);
-    auto              done             = std::make_shared<bool>(false);
+    // The same four fields on every chunk; only choices and usage differ.
+    const json envelope{{"id", requestId}, {"object", std::string(objectName)}, {"created", nowSeconds()}, {"model", model}};
+    auto       completionTokens = std::make_shared<int>(0);
+    auto       done             = std::make_shared<bool>(false);
 
     // httplib stops calling the provider once the peer is gone, so the only
     // reliable hook is the destruction of this closure: without it a client
@@ -261,7 +262,7 @@ void HttpServer::registerRoutes()
     });
 
     response.set_chunked_content_provider(
-      "text/event-stream", [stream, requestId, model, objectNameStr, chat, promptTokens, completionTokens, done, engine, abortIfUnfinished](size_t, httplib::DataSink &sink) {
+      "text/event-stream", [stream, requestId, envelope, chat, promptTokens, completionTokens, done, engine, abortIfUnfinished](size_t, httplib::DataSink &sink) {
         if (*done)
         {
           sink.done();
@@ -296,7 +297,8 @@ void HttpServer::registerRoutes()
         if (chat) { choice = json{{"index", 0}, {"delta", {{"content", update->delta}}}, {"finish_reason", finishReason}}; }
         else { choice = json{{"index", 0}, {"text", update->delta}, {"finish_reason", finishReason}}; }
 
-        const json        chunk{{"id", requestId}, {"object", objectNameStr}, {"created", nowSeconds()}, {"model", model}, {"choices", json::array({choice})}};
+        json chunk                = envelope;
+        chunk["choices"]          = json::array({choice});
         const std::string payload = "data: " + chunk.dump() + "\n\n";
         if (!sink.write(payload.data(), payload.size()))
         {
@@ -310,12 +312,9 @@ void HttpServer::registerRoutes()
         {
           // Terminal usage chunk: empty choices, authoritative counts. Same
           // shape as OpenAI's stream_options.include_usage.
-          const json        usageChunk{{"id", requestId},
-                                       {"object", objectNameStr},
-                                       {"created", nowSeconds()},
-                                       {"model", model},
-                                       {"choices", json::array()},
-                                       {"usage", {{"prompt_tokens", promptTokens}, {"completion_tokens", *completionTokens}, {"total_tokens", promptTokens + *completionTokens}}}};
+          json usageChunk                = envelope;
+          usageChunk["choices"]          = json::array();
+          usageChunk["usage"]            = {{"prompt_tokens", promptTokens}, {"completion_tokens", *completionTokens}, {"total_tokens", promptTokens + *completionTokens}};
           const std::string usagePayload = "data: " + usageChunk.dump() + "\n\n";
           sink.write(usagePayload.data(), usagePayload.size());
         }

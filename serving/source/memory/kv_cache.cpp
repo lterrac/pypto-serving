@@ -36,11 +36,6 @@ void FreeKVCacheBlockQueue::append(KVCacheBlock *block)
   _count += 1;
 }
 
-void FreeKVCacheBlockQueue::appendN(const std::vector<KVCacheBlock *> &blocks)
-{
-  for (KVCacheBlock *block : blocks) { append(block); }
-}
-
 KVCacheBlock *FreeKVCacheBlockQueue::popleft()
 {
   if (_head == nullptr) { return nullptr; }

@@ -21,16 +21,6 @@
 namespace serving::memory
 {
 
-/// Raised when a cache allocation cannot fit in the physical pools.
-class KVCacheCapacityError : public std::runtime_error
-{
-  public:
-
-  explicit KVCacheCapacityError(const std::string &what)
-    : std::runtime_error(what)
-  {}
-};
-
 using BlockHash = uint64_t;
 
 /// Seed of every hash chain. Mirrors the Python module's NONE_HASH sentinel.
@@ -57,7 +47,6 @@ class FreeKVCacheBlockQueue
   public:
 
   void append(KVCacheBlock *block);
-  void appendN(const std::vector<KVCacheBlock *> &blocks);
 
   /// Take the least recently freed block, or nullptr when empty.
   KVCacheBlock *popleft();
@@ -120,9 +109,8 @@ class KvCacheManager
   /// Publish blocks `[start, end)` of a request to the prefix cache.
   void cacheBlockIds(const std::vector<int> &blockIds, const std::vector<BlockHash> &blockHashes, int start, int end);
 
-  /// Always false here: the grouped pools are DeepSeek-only and not ported.
+  /// Always false: the grouped pools are DeepSeek-only and not ported.
   [[nodiscard]] bool hasGroups() const { return false; }
-  [[nodiscard]] bool hasEagleGroups() const { return false; }
 
   // Exposed for tests, which need to assert on refcounts and hash bookkeeping.
   [[nodiscard]] const KVCacheBlock &blockAt(int blockId) const { return _blocks.at(static_cast<size_t>(blockId)); }

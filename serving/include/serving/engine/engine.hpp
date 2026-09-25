@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <serving/config/types.hpp>
+#include <serving/util/blocking_queue.hpp>
 #include <serving/engine/detokenizer.hpp>
 #include <serving/engine/executor.hpp>
 #include <serving/memory/kv_cache.hpp>
@@ -46,39 +47,14 @@ struct TokenOutput
   std::string error;
 };
 
-/**
- * A request's output channel.
- *
- * The engine thread pushes; a caller thread pops. `pop` blocks until an update
- * arrives or the stream finishes, so an SSE handler is a plain loop.
- */
-class RequestStream
-{
-  public:
-
-  void push(TokenOutput output);
-
-  /// Next update, or nullopt once the stream is finished and drained.
-  std::optional<TokenOutput> pop();
-
-  /// Mark the stream complete; a blocked `pop` returns once drained.
-  void close();
-
-  [[nodiscard]] bool closed() const;
-
-  private:
-
-  mutable std::mutex      _mutex;
-  std::condition_variable _cv;
-  std::deque<TokenOutput> _queue;
-  bool                    _closed = false;
-};
+/// A request's updates in order: the engine thread pushes, a caller thread pops
+/// until nullopt.
+using RequestStream = util::BlockingQueue<TokenOutput>;
 
 struct EngineConfig
 {
   sched::SchedulerConfig scheduler;
   config::RuntimeConfig  runtime;
-  config::GenerateConfig defaults;
 
   /// How long the engine thread waits when there is nothing to do.
   int idlePollMicroseconds = 200;

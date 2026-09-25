@@ -14,19 +14,10 @@
 #include <vector>
 
 #include <serving/router/router_server.hpp>
+#include <serving/util/signals.hpp>
 
 namespace
 {
-
-std::mutex              g_shutdownMutex;
-std::condition_variable g_shutdownCv;
-std::atomic<bool>       g_shutdown{false};
-
-extern "C" void onSignal(int)
-{
-  g_shutdown = true;
-  g_shutdownCv.notify_all();
-}
 
 [[noreturn]] void usage(const char *argv0, int code)
 {
@@ -63,6 +54,10 @@ serving::router::ReplicaSpec parseReplica(const std::string &text)
 
 int main(int argc, char **argv)
 {
+  // Before any thread exists: threads inherit the mask, and a shutdown signal
+  // delivered to one that is not waiting would terminate the process.
+  serving::util::blockShutdownSignals();
+
   serving::router::RouterServerConfig       config;
   std::vector<serving::router::ReplicaSpec> replicas;
 
@@ -102,12 +97,7 @@ int main(int argc, char **argv)
     for (const auto &replica : replicas) { std::printf("[router]   %s -> %s\n", replica.name.c_str(), replica.baseUrl().c_str()); }
     std::fflush(stdout);
 
-    std::signal(SIGINT, onSignal);
-    std::signal(SIGTERM, onSignal);
-    {
-      std::unique_lock<std::mutex> lock(g_shutdownMutex);
-      g_shutdownCv.wait(lock, [] { return g_shutdown.load(); });
-    }
+    serving::util::awaitShutdownSignal();
     std::printf("[router] shutting down\n");
     router.stop();
     return 0;

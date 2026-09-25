@@ -29,22 +29,12 @@
 #include <serving/model/chat_template.hpp>
 #include <serving/model/hf_tokenizer.hpp>
 #include <serving/server/http_server.hpp>
+#include <serving/util/signals.hpp>
 
 namespace
 {
 
 using Json = nlohmann::json;
-
-/// Set by the signal handler; the main thread waits on it.
-std::mutex              g_shutdownMutex;
-std::condition_variable g_shutdownCv;
-std::atomic<bool>       g_shutdown{false};
-
-extern "C" void onSignal(int)
-{
-  g_shutdown = true;
-  g_shutdownCv.notify_all();
-}
 
 struct Options
 {
@@ -176,6 +166,10 @@ int runServing(const Options &options);
 
 int main(int argc, char **argv)
 {
+  // Before any thread exists: threads inherit the mask, and a shutdown signal
+  // delivered to one that is not waiting would terminate the process.
+  serving::util::blockShutdownSignals();
+
   const Options options = parseArgs(argc, argv);
   try
   {
@@ -271,15 +265,9 @@ int runServing(const Options &options)
   std::printf("[serving] listening on %s:%d\n", options.host.c_str(), server.boundPort());
   std::fflush(stdout);
 
-  // Wait for SIGINT/SIGTERM rather than for stdin. A server launched by a job
-  // runner usually has no stdin to speak of, and reading it would make the
-  // process exit the moment the pipe closed.
-  std::signal(SIGINT, onSignal);
-  std::signal(SIGTERM, onSignal);
-  {
-    std::unique_lock<std::mutex> lock(g_shutdownMutex);
-    g_shutdownCv.wait(lock, [] { return g_shutdown.load(); });
-  }
+  // Not stdin: a server launched by a job runner usually has none, and reading
+  // it would exit the moment the pipe closed.
+  serving::util::awaitShutdownSignal();
   std::printf("[serving] shutting down\n");
   std::fflush(stdout);
 

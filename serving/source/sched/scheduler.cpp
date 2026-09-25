@@ -116,6 +116,11 @@ void Scheduler::addRequest(const RequestPtr &request)
   _requests[request->requestId] = request;
 }
 
+void Scheduler::dropFromRunning(const std::string &requestId)
+{
+  std::erase_if(_running, [&](const RequestPtr &r) { return r->requestId == requestId; });
+}
+
 void Scheduler::abortRequest(const std::string &requestId)
 {
   const auto it = _requests.find(requestId);
@@ -123,13 +128,8 @@ void Scheduler::abortRequest(const std::string &requestId)
   const RequestPtr request = it->second;
   request->status          = RequestStatus::FinishedAborted;
   freeRequestBlocks(*request);
-  _running.erase(std::remove_if(_running.begin(), _running.end(), [&](const RequestPtr &r) { return r->requestId == requestId; }), _running.end());
-  std::deque<RequestPtr> kept;
-  for (const auto &r : _waiting)
-  {
-    if (r->requestId != requestId) { kept.push_back(r); }
-  }
-  _waiting = std::move(kept);
+  dropFromRunning(requestId);
+  std::erase_if(_waiting, [&](const RequestPtr &r) { return r->requestId == requestId; });
   _requests.erase(it);
 }
 
@@ -139,7 +139,7 @@ void Scheduler::finishRequest(const std::string &requestId, RequestStatus status
   if (it == _requests.end()) { return; }
   it->second->status = status;
   freeRequestBlocks(*it->second);
-  _running.erase(std::remove_if(_running.begin(), _running.end(), [&](const RequestPtr &r) { return r->requestId == requestId; }), _running.end());
+  dropFromRunning(requestId);
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +543,7 @@ std::vector<RequestOutput> Scheduler::updateFromOutput(const SchedulerOutput &ou
   {
     const auto it = _requests.find(requestId);
     if (it != _requests.end()) { freeRequestBlocks(*it->second); }
-    _running.erase(std::remove_if(_running.begin(), _running.end(), [&](const RequestPtr &r) { return r->requestId == requestId; }), _running.end());
+    dropFromRunning(requestId);
   }
 
   return outputs;
@@ -669,7 +669,7 @@ std::optional<Scheduler::Preemption> Scheduler::preemptLowestPriority(const Requ
   victim->numOutputPlaceholders   = 0;
   victim->terminalPrefillInFlight = false;
 
-  _running.erase(std::remove_if(_running.begin(), _running.end(), [&](const RequestPtr &r) { return r->requestId == victim->requestId; }), _running.end());
+  dropFromRunning(victim->requestId);
   _waiting.push_front(victim);
 
   return Preemption{victim, returnedTokens};
