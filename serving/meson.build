@@ -42,6 +42,7 @@ servingSources = files(
   'source/engine/detokenizer.cpp',
   'source/engine/engine.cpp',
   'source/model/chat_template.cpp',
+  'source/model/model_files.cpp',
   'source/server/http_server.cpp',
   'source/router/routing.cpp',
   'source/router/strategy.cpp',

@@ -96,15 +96,7 @@ class Runtime:
             tokenizer = cpp.HfTokenizer.from_model_dir(options.model_dir)
         self.tokenizer = tokenizer
         self.chat_template = chat_template if chat_template is not None else cpp.load_chat_template(options.model_dir)
-        self.executor = executor or PyptoModelExecutor(
-            options.model_dir,
-            options.device,
-            platform=options.platform,
-            max_model_len=options.max_model_len,
-            block_size=options.block_size,
-            max_num_seqs=options.max_num_seqs,
-            pypto_build_dir=options.pypto_build_dir,
-        )
+        self.executor = executor or PyptoModelExecutor(options)
         self.engine = cpp.Engine(engine_config(options), self.tokenizer, self.executor)
         self.server: cpp.HttpServer | None = None
 

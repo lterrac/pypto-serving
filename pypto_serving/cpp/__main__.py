@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import sys
@@ -23,7 +24,7 @@ from pypto_serving.cpp.runtime import Runtime, ServingOptions
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m pypto_serving.cpp", description=__doc__)
-    parser.add_argument("--model", required=True, help="model directory")
+    parser.add_argument("--model", dest="model_dir", required=True, help="model directory")
     parser.add_argument("--served-model-name", default="", help="name reported by the API (default: the directory name)")
     parser.add_argument("--platform", default="a2a3")
     parser.add_argument("--device", type=int, default=0)
@@ -56,22 +57,10 @@ def generate_config(text: str) -> cpp.GenerateConfig:
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = build_parser().parse_args(argv)
-    options = ServingOptions(
-        model_dir=args.model,
-        served_model_name=args.served_model_name,
-        platform=args.platform,
-        device=args.device,
-        max_model_len=args.max_model_len,
-        block_size=args.block_size,
-        max_num_seqs=args.max_num_seqs,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        long_prefill_token_threshold=args.long_prefill_token_threshold,
-        enable_prefix_caching=args.enable_prefix_caching,
-        enable_chunked_prefill=args.enable_chunked_prefill,
-        host=args.host,
-        port=args.port,
-        pypto_build_dir=args.pypto_build_dir,
-    )
+    # Flags are named after ServingOptions' fields, so nothing is copied across
+    # by hand; --prompt and --generate-config control this run, not the server.
+    fields = {f.name for f in dataclasses.fields(ServingOptions)}
+    options = ServingOptions(**{name: value for name, value in vars(args).items() if name in fields})
 
     runtime = Runtime(options)
     print(f"[serving] loading {options.model_dir} on device {options.device} ...", flush=True)

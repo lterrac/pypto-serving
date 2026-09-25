@@ -1,5 +1,7 @@
 #include <serving/model/hf_tokenizer.hpp>
 
+#include <serving/model/model_files.hpp>
+
 #include <algorithm>
 #include <fstream>
 #include <sstream>
@@ -12,29 +14,7 @@ namespace serving::model
 {
 
 namespace
-{
-
-std::string readFile(const std::string &path)
-{
-  std::ifstream in(path, std::ios::binary);
-  if (!in) { throw std::runtime_error("cannot open " + path); }
-  std::ostringstream buffer;
-  buffer << in.rdbuf();
-  return buffer.str();
-}
-
-/// The token text for a tokenizer_config.json entry, which is either a bare
-/// string or an object carrying "content". Qwen3 uses the object form.
-std::string specialTokenContent(const nlohmann::json &config, const std::string &key)
-{
-  if (!config.contains(key) || config.at(key).is_null()) { return {}; }
-  const auto &entry = config.at(key);
-  if (entry.is_string()) { return entry.get<std::string>(); }
-  if (entry.is_object() && entry.contains("content")) { return entry.at("content").get<std::string>(); }
-  return {};
-}
-
-} // namespace
+{} // namespace
 
 HfTokenizer::HfTokenizer(std::unique_ptr<tokenizers::Tokenizer> tokenizer, std::optional<int> bos, std::optional<int> eos, std::unordered_set<int> specialIds)
   : _tokenizer(std::move(tokenizer)),
@@ -47,9 +27,10 @@ HfTokenizer::~HfTokenizer() = default;
 
 std::unique_ptr<HfTokenizer> HfTokenizer::fromModelDir(const std::string &modelDir)
 {
-  const std::string tokenizerJson = readFile(modelDir + "/tokenizer.json");
+  const auto tokenizerJson = readFile(modelDir + "/tokenizer.json");
+  if (!tokenizerJson.has_value()) { throw std::runtime_error("cannot read tokenizer.json in " + modelDir); }
 
-  auto tokenizer = tokenizers::Tokenizer::FromBlobJSON(tokenizerJson);
+  auto tokenizer = tokenizers::Tokenizer::FromBlobJSON(*tokenizerJson);
   if (tokenizer == nullptr) { throw std::runtime_error("failed to parse tokenizer.json in " + modelDir); }
 
   // `added_tokens` is the authoritative id <-> content table for special tokens;
@@ -58,7 +39,7 @@ std::unique_ptr<HfTokenizer> HfTokenizer::fromModelDir(const std::string &modelD
   std::map<std::string, int> contentToId;
   try
   {
-    const auto parsed = nlohmann::json::parse(tokenizerJson);
+    const auto parsed = nlohmann::json::parse(*tokenizerJson);
     if (parsed.contains("added_tokens"))
     {
       for (const auto &entry : parsed.at("added_tokens"))
@@ -81,7 +62,10 @@ std::unique_ptr<HfTokenizer> HfTokenizer::fromModelDir(const std::string &modelD
   std::optional<int> eos;
   try
   {
-    const auto config     = nlohmann::json::parse(readFile(modelDir + "/tokenizer_config.json"));
+    // Absent or malformed leaves bos/eos unset, which is what the catch below
+    // is for: a tokenizer without them still works.
+    const auto configText = readFile(modelDir + "/tokenizer_config.json");
+    const auto config     = nlohmann::json::parse(configText.value_or(""));
     const auto bosContent = specialTokenContent(config, "bos_token");
     const auto eosContent = specialTokenContent(config, "eos_token");
     if (const auto it = contentToId.find(bosContent); !bosContent.empty() && it != contentToId.end()) { bos = it->second; }
