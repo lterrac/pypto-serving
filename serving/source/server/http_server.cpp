@@ -208,16 +208,14 @@ void HttpServer::registerRoutes()
     }
 
     const auto generate = parseGenerateConfig(body);
-    // Sampling runs greedily on device; accepting these and ignoring them
-    // would return a different distribution than the caller asked for.
-    if (generate.temperature > 0.0)
+    if (generate.topK.has_value() && *generate.topK <= 0)
     {
-      sendError(response, "temperature > 0 is not supported yet: sampling is greedy", 400);
+      sendError(response, "top_k must be positive", 400);
       return;
     }
-    if (generate.topK.has_value())
+    if (generate.topP <= 0.0 || generate.topP > 1.0)
     {
-      sendError(response, "top_k is not supported yet: sampling is greedy", 400);
+      sendError(response, "top_p must be in (0, 1]", 400);
       return;
     }
     const std::string      requestId    = _engine.generateRequestId();
