@@ -2,16 +2,35 @@
 
 /**
  * The model as the engine drives it: a StepCommand of prefill chunks and
- * decode slots in, a StepResult of tokens out. Token ids, block ids and
- * lengths only.
+ * decode slots in, a StepResult of tokens out. Token ids, block ids, lengths
+ * and the scalars that describe how to sample -- never a tensor.
  */
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace serving::engine
 {
+
+/// How a request's next token is to be drawn, mirroring the Python
+/// `SamplingParams`. Defaults are greedy, which is what the executor's own
+/// device sampling does.
+struct SamplingParams
+{
+  double                  temperature = 0.0;
+  double                  topP        = 1.0;
+  std::optional<int>      topK        = std::nullopt;
+  std::optional<uint64_t> seed        = std::nullopt;
+
+  /// Greedy needs no distribution, so the executor may sample on device and
+  /// return the id alone.
+  [[nodiscard]] bool isGreedy() const { return temperature <= 0.0; }
+
+  bool operator==(const SamplingParams &) const = default;
+};
 
 /// One request's prefill chunk for this step.
 struct PrefillItem
@@ -26,6 +45,9 @@ struct PrefillItem
   /// those rows without emitting a duplicate token.
   int              sampleAtLength = 0;
   std::vector<int> blockIds;
+  /// Only consulted on the chunk that reaches `sampleAtLength`; earlier chunks
+  /// of the same prompt sample nothing.
+  SamplingParams sampling;
 };
 
 /// One request's decode slot for this step.
@@ -36,6 +58,7 @@ struct DecodeItem
   /// Sequence length including the token being fed in.
   int              seqLen = 0;
   std::vector<int> blockIds;
+  SamplingParams   sampling;
 };
 
 struct StepCommand

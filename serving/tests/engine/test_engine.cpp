@@ -356,6 +356,60 @@ TEST(EngineTest, RejectsAPromptLongerThanMaxSeqLen)
   engine.stop();
 }
 
+TEST(EngineTest, CarriesEachRequestsSamplingParamsToTheExecutor)
+{
+  CharTokenizer    tokenizer;
+  ScriptedExecutor executor(ScriptedExecutor::fromText("ab"));
+  executor.promptLength = 2;
+
+  EngineConfig config;
+  config.runtime.pageSize            = 4;
+  config.scheduler.enablePrefixCache = false;
+  config.scheduler.maxSeqLen         = 64;
+  config.idlePollMicroseconds        = 50;
+
+  Engine engine(config, tokenizer, executor);
+  engine.start();
+
+  GenerateConfig greedy;
+  greedy.maxNewTokens = 2;
+  greedy.ignoreEos    = true;
+
+  GenerateConfig sampled = greedy;
+  sampled.temperature    = 0.7;
+  sampled.topP           = 0.95;
+  sampled.topK           = 40;
+  sampled.seed           = 1234U;
+
+  // Two requests in flight at once, so the step that carries them is a mixed
+  // batch: the executor must see each request's own parameters, not one
+  // batch-wide setting.
+  auto greedyStream  = engine.addRequest("greedy", tokenizer.encode("hi"), greedy);
+  auto sampledStream = engine.addRequest("sampled", tokenizer.encode("yo"), sampled);
+  drain(greedyStream);
+  drain(sampledStream);
+
+  const auto greedySeen = executor.samplingFor("greedy");
+  ASSERT_TRUE(greedySeen.has_value());
+  EXPECT_TRUE(greedySeen->isGreedy());
+  EXPECT_EQ(greedySeen->temperature, 0.0);
+  EXPECT_EQ(greedySeen->topP, 1.0);
+  EXPECT_FALSE(greedySeen->topK.has_value());
+  EXPECT_FALSE(greedySeen->seed.has_value());
+
+  const auto sampledSeen = executor.samplingFor("sampled");
+  ASSERT_TRUE(sampledSeen.has_value());
+  EXPECT_FALSE(sampledSeen->isGreedy());
+  EXPECT_DOUBLE_EQ(sampledSeen->temperature, 0.7);
+  EXPECT_DOUBLE_EQ(sampledSeen->topP, 0.95);
+  ASSERT_TRUE(sampledSeen->topK.has_value());
+  EXPECT_EQ(*sampledSeen->topK, 40);
+  ASSERT_TRUE(sampledSeen->seed.has_value());
+  EXPECT_EQ(*sampledSeen->seed, 1234U);
+
+  engine.stop();
+}
+
 TEST(EngineTest, GeneratesDistinctRequestIds)
 {
   const CharTokenizer tokenizer;

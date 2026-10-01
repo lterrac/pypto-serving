@@ -111,3 +111,31 @@ def test_preemption_replay_reproduces_the_unpreempted_output():
     # The replay must have written every row the next decode attends.
     assert gaps == [], f"decode at a position with unwritten rows before it: {gaps}"
     assert contended == reference
+
+
+def test_a_python_executor_sees_each_requests_sampling_params():
+    tok, ex = WordTokenizer(), CountingExecutor()
+    engine = s.Engine(config(), tok, ex)
+
+    with running(engine):
+        greedy = s.GenerateConfig(max_new_tokens=2, ignore_eos=True)
+        sampled = s.GenerateConfig(max_new_tokens=2, ignore_eos=True, temperature=0.7, top_p=0.95, top_k=40, seed=1234)
+        # Both in flight at once: a step batches them, and each item carries its
+        # own parameters rather than one batch-wide setting.
+        a = engine.add_request("greedy", tok.encode("one two"), greedy)
+        b = engine.add_request("sampled", tok.encode("three four"), sampled)
+        drain(a)
+        drain(b)
+
+    assert ex.sampling["greedy"].is_greedy
+    assert ex.sampling["greedy"].temperature == 0.0
+    assert ex.sampling["greedy"].top_k is None
+    assert ex.sampling["greedy"].seed is None
+
+    seen = ex.sampling["sampled"]
+    assert not seen.is_greedy
+    assert seen.temperature == pytest.approx(0.7)
+    assert seen.top_p == pytest.approx(0.95)
+    assert seen.top_k == 40
+    assert seen.seed == 1234
+    assert repr(seen) == "SamplingParams(temperature=0.7, top_p=0.95, top_k=40, seed=1234)"

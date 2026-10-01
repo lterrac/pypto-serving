@@ -47,6 +47,13 @@ class PyptoModelExecutor(cpp.ModelExecutor):
     def page_size(self) -> int:
         return bridge.page_size()
 
+    @staticmethod
+    def _sampling(item) -> dict:
+        """The same block ``BridgeExecutor`` puts on the wire, so both entry
+        points hand the bridge one shape."""
+        sampling = item.sampling
+        return {"temperature": sampling.temperature, "top_p": sampling.top_p, "top_k": sampling.top_k, "seed": sampling.seed}
+
     def execute_step(self, command: cpp.StepCommand) -> cpp.StepResult:
         prefill = [
             {
@@ -55,6 +62,7 @@ class PyptoModelExecutor(cpp.ModelExecutor):
                 "num_computed": item.num_computed_tokens,
                 "sample_at_length": item.sample_at_length,
                 "block_ids": list(item.block_ids),
+                "sampling": self._sampling(item),
             }
             for item in command.prefill
         ]
@@ -64,6 +72,7 @@ class PyptoModelExecutor(cpp.ModelExecutor):
                 "last_token": item.last_token,
                 "seq_len": item.seq_len,
                 "block_ids": list(item.block_ids),
+                "sampling": self._sampling(item),
             }
             for item in command.decode
         ]

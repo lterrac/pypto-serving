@@ -189,6 +189,16 @@ StepCommand Engine::buildStepCommand(const sched::SchedulerOutput &output) const
   for (const auto &scheduled : output.scheduledRequests)
   {
     const sched::Request &request = *scheduled.request;
+
+    // The scheduler carries these per request; the executor is what acts on
+    // them, so every item repeats its own. A batch is not homogeneous: two
+    // requests in one step can want different temperatures.
+    SamplingParams sampling;
+    sampling.temperature = request.temperature;
+    sampling.topP        = request.topP;
+    sampling.topK        = request.topK;
+    sampling.seed        = request.seed;
+
     if (scheduled.isPrefill)
     {
       PrefillItem item;
@@ -196,6 +206,8 @@ StepCommand Engine::buildStepCommand(const sched::SchedulerOutput &output) const
       item.blockIds          = scheduled.blockIds;
       item.numComputedTokens = scheduled.numComputedTokens;
       item.sampleAtLength    = request.sampleAtLength();
+
+      item.sampling = sampling;
 
       item.chunkTokens = request.tokenRange(scheduled.numComputedTokens, scheduled.numComputedTokens + scheduled.numNewTokens);
       command.prefill.push_back(std::move(item));
@@ -207,6 +219,7 @@ StepCommand Engine::buildStepCommand(const sched::SchedulerOutput &output) const
       item.blockIds  = scheduled.blockIds;
       item.lastToken = request.outputTokenIds.empty() ? 0 : request.outputTokenIds.back();
       item.seqLen    = request.numPromptTokens() + static_cast<int>(request.outputTokenIds.size());
+      item.sampling  = sampling;
       command.decode.push_back(std::move(item));
     }
   }

@@ -50,6 +50,8 @@ class CountingExecutor(s.ModelExecutor):
         self._written: dict = {}
         #: Fail the step rather than let a livelocking schedule hang the suite.
         self.max_steps = 100_000
+        #: The sampling parameters the latest step carried, per request id.
+        self.sampling: dict = {}
 
     def register_model(self):
         self.registered += 1
@@ -60,6 +62,8 @@ class CountingExecutor(s.ModelExecutor):
         if self.steps > self.max_steps:
             raise RuntimeError(f"executor gave up after {self.max_steps} steps: the schedule is not making progress")
         new = {}
+        for item in list(command.prefill) + list(command.decode):
+            self.sampling[item.request_id] = item.sampling
         for item in command.prefill:
             # A prefill writes the KV rows for the positions it feeds.
             self._written.setdefault(item.request_id, set()).update(
