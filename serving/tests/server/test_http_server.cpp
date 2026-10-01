@@ -37,15 +37,17 @@ using serving::testing::ScriptedExecutor;
 /// Engine + server on an ephemeral port, torn down in the right order.
 struct Fixture
 {
-  CharTokenizer               tokenizer;
-  ScriptedExecutor            executor;
-  std::unique_ptr<Engine>     engine;
-  std::unique_ptr<HttpServer> server;
+  CharTokenizer                                 tokenizer;
+  ScriptedExecutor                              executor;
+  std::unique_ptr<serving::model::ChatTemplate> chatTemplate;
+  std::unique_ptr<Engine>                       engine;
+  std::unique_ptr<HttpServer>                   server;
 
-  explicit Fixture(std::string script = "hi!", int promptLength = 4)
+  explicit Fixture(std::string script = "hi!", int promptLength = 4, const std::string &chatTemplateSource = "")
     : executor(ScriptedExecutor::fromText(script))
   {
     executor.promptLength = promptLength;
+    if (!chatTemplateSource.empty()) { chatTemplate = std::make_unique<serving::model::ChatTemplate>(chatTemplateSource, "", "<|im_end|>"); }
 
     EngineConfig engineConfig;
     engineConfig.runtime.pageSize            = 4;
@@ -59,7 +61,7 @@ struct Fixture
     serverConfig.host    = "127.0.0.1";
     serverConfig.port    = 0; // ephemeral
     serverConfig.modelId = "test-model";
-    server               = std::make_unique<HttpServer>(serverConfig, *engine, tokenizer);
+    server               = std::make_unique<HttpServer>(serverConfig, *engine, tokenizer, chatTemplate.get());
     server->start();
   }
 
@@ -253,6 +255,77 @@ TEST(HttpServerTest, RejectsAPromptTheSchedulerCannotAdmit)
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, 400);
   EXPECT_NE(response->body.find("leaves no room for generation within max_seq_len"), std::string::npos);
+}
+
+/// Renders the role and the content, then shows whatever template
+/// keywords reached it. With a one-character-per-token tokenizer the rendered
+/// length is the reported `prompt_tokens`, so a test can see what was passed.
+constexpr const char *KWARG_TEMPLATE = "{%- for m in messages %}{{ m.role }}:{{ m.content }}{%- endfor %}"
+                                       "{%- if enable_thinking is defined and not enable_thinking %}|nothink{%- endif %}"
+                                       "{%- if reasoning_effort is defined %}|e={{ reasoning_effort }}{%- endif %}";
+
+/// The prompt the template rendered, read back off the usage block.
+static int renderedLength(httplib::Client &client, const Json &body)
+{
+  const auto response = client.Post("/v1/chat/completions", body.dump(), "application/json");
+  EXPECT_NE(response, nullptr);
+  if (response == nullptr) { return -1; }
+  EXPECT_EQ(response->status, 200) << response->body;
+  if (response->status != 200) { return -1; }
+  return Json::parse(response->body).at("usage").at("prompt_tokens").get<int>();
+}
+
+TEST(HttpServerTest, ForwardsChatTemplateKwargs)
+{
+  Fixture fixture("hi!", 1, KWARG_TEMPLATE);
+  auto    client = fixture.client();
+
+  const Json messages = Json::array({json{{"role", "user"}, {"content", "hi"}}});
+  const Json base{{"messages", messages}, {"max_tokens", 1}};
+
+  // "user:hi" -- a request carrying neither field renders as if the template took
+  // no keywords at all, which is what the Python server passes.
+  EXPECT_EQ(renderedLength(client, base), 7);
+
+  // "user:hi|nothink"
+  Json withKwargs                    = base;
+  withKwargs["chat_template_kwargs"] = json{{"enable_thinking", false}};
+  EXPECT_EQ(renderedLength(client, withKwargs), 15);
+
+  // "user:hi|e=high" -- reasoning_effort supplies enable_thinking=true.
+  Json effort                = base;
+  effort["reasoning_effort"] = "high";
+  EXPECT_EQ(renderedLength(client, effort), 14);
+
+  // "user:hi|nothink|e=none" -- and enable_thinking=false for "none".
+  Json none                = base;
+  none["reasoning_effort"] = "none";
+  EXPECT_EQ(renderedLength(client, none), 22);
+
+  // "user:hi|e=none" -- an explicit enable_thinking wins over the one
+  // reasoning_effort would have supplied, matching the Python's setdefault.
+  Json both                    = base;
+  both["chat_template_kwargs"] = json{{"enable_thinking", true}};
+  both["reasoning_effort"]     = "none";
+  EXPECT_EQ(renderedLength(client, both), 14);
+}
+
+TEST(HttpServerTest, RejectsMalformedChatTemplateKwargs)
+{
+  Fixture fixture("hi!", 1, KWARG_TEMPLATE);
+  auto    client = fixture.client();
+
+  const Json messages = Json::array({json{{"role", "user"}, {"content", "hi"}}});
+  for (const auto &body : {json{{"messages", messages}, {"chat_template_kwargs", "enable_thinking"}}, json{{"messages", messages}, {"reasoning_effort", 3}}})
+  {
+    const auto response = client.Post("/v1/chat/completions", body.dump(), "application/json");
+    ASSERT_NE(response, nullptr);
+    EXPECT_EQ(response->status, 400) << body.dump();
+  }
+
+  // An explicit null is the same as omitting the field.
+  const Json nulls{{"messages", messages}, {"max_tokens", 1}, {"chat_template_kwargs", nullptr}, {"reasoning_effort", nullptr}};
+  EXPECT_EQ(renderedLength(client, nulls), 7);
 }
 
 TEST(HttpServerTest, ChatCompletionsNeedATemplate)

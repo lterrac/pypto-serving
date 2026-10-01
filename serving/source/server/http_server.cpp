@@ -43,6 +43,40 @@ config::GenerateConfig parseGenerateConfig(const json &body)
   return generate;
 }
 
+/**
+ * The template-specific keyword arguments a chat request carries.
+ *
+ * Applied in the Python server's order (`server.py:_apply_chat_template`):
+ * `chat_template_kwargs` first, then `reasoning_effort`, which only supplies
+ * `enable_thinking` when the caller did not set it explicitly. A request
+ * carrying neither renders exactly as one that omits both.
+ *
+ * Returns an error message, empty when `context` was filled.
+ */
+std::string buildChatTemplateContext(const json &body, nlohmann::ordered_json &context)
+{
+  context = nlohmann::ordered_json::object();
+
+  if (body.contains("chat_template_kwargs") && !body.at("chat_template_kwargs").is_null())
+  {
+    const auto &kwargs = body.at("chat_template_kwargs");
+    if (!kwargs.is_object()) { return "chat_template_kwargs must be an object"; }
+    for (const auto &entry : kwargs.items()) { context[entry.key()] = nlohmann::ordered_json(entry.value()); }
+  }
+
+  if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null())
+  {
+    const auto &effort = body.at("reasoning_effort");
+    if (!effort.is_string()) { return "reasoning_effort must be a string"; }
+    const auto value = effort.get<std::string>();
+    // setdefault: an explicit enable_thinking in chat_template_kwargs wins.
+    if (!context.contains("enable_thinking")) { context["enable_thinking"] = value != "none"; }
+    context["reasoning_effort"] = value;
+  }
+
+  return {};
+}
+
 void sendJson(httplib::Response &response, const json &payload, int status = 200)
 {
   response.status = status;
@@ -147,9 +181,15 @@ void HttpServer::registerRoutes()
         sendError(response, "this model has no chat template", 400);
         return;
       }
+      nlohmann::ordered_json extraContext;
+      if (const auto error = buildChatTemplateContext(body, extraContext); !error.empty())
+      {
+        sendError(response, error, 400);
+        return;
+      }
       try
       {
-        prompt = _chatTemplate->apply(body.at("messages"), true);
+        prompt = _chatTemplate->apply(body.at("messages"), true, extraContext);
       }
       catch (const std::exception &e)
       {
