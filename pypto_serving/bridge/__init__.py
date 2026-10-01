@@ -19,14 +19,16 @@ other thread exists.
 Items::
 
     prefill: {"request_id": str, "tokens": [int], "num_computed": int,
-              "sample_at_length": int, "block_ids": [int]}
+              "sample_at_length": int, "block_ids": [int], "sampling": {...}}
     decode:  {"request_id": str, "last_token": int, "seq_len": int,
-              "block_ids": [int]}
+              "block_ids": [int], "sampling": {...}}
+    sampling: {"temperature": float, "top_p": float, "top_k": int | None,
+               "seed": int | None}      # absent means greedy
 
     run_step(prefill, decode) -> {request_id: [int]}
 
-Greedy only: Qwen samples on device and the fused decode kernel emits the
-sampled ids; a request with temperature > 0 is refused.
+Sampling follows whichever of the three paths the batch qualifies for; see
+``pypto_serving.bridge.sampling``.
 """
 
 from __future__ import annotations
@@ -35,6 +37,14 @@ import json
 import logging
 import traceback
 from typing import Any
+
+from pypto_serving.bridge.sampling import (
+    Sampling,
+    allow_device_sampled_ids,
+    allow_device_topk_sampling,
+    logits_row,
+    sample_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +57,14 @@ _state: "_BridgeState | None" = None
 class _BridgeState:
     """Everything the bridge needs between ``open_model`` and ``close``."""
 
-    def __init__(self, executor: Any, record: Any, num_pages: int) -> None:
+    def __init__(self, executor: Any, record: Any, num_pages: int, sampler: Any) -> None:
         self.executor = executor
         self.record = record
         self.num_pages = num_pages
         self.page_size = record.runtime.page_size
+        #: Holds a torch.Generator per seeded request, so a seed is stable
+        #: across the steps of one answer rather than per step.
+        self.sampler = sampler
 
 
 def _require_state() -> _BridgeState:
@@ -85,6 +98,7 @@ def open_model(
     # Imported lazily: these pull torch and the pypto toolchain, and that cost
     # belongs to this call rather than to `import pypto_serving.bridge`.
     from pypto_serving.config.types import ModelRecord, RuntimeConfig  # noqa: PLC0415
+    from pypto_serving.model.common.executor.sampler import Sampler  # noqa: PLC0415
     from pypto_serving.model.model_loader import ModelLoader  # noqa: PLC0415
     from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor  # noqa: PLC0415
 
@@ -117,7 +131,7 @@ def open_model(
     )
 
     num_pages = int(executor.register_model(_MODEL_ID, record))
-    _state = _BridgeState(executor, record, num_pages)
+    _state = _BridgeState(executor, record, num_pages, Sampler())
     logger.info("bridge open: %d KV pages, page_size=%d", num_pages, _state.page_size)
     return num_pages
 
@@ -162,6 +176,8 @@ def _run_prefill(state: _BridgeState, items: list[dict[str, Any]]) -> dict[str, 
     chunk_starts = [int(item["num_computed"]) for item in items]
     seq_lens = [start + len(chunk) for start, chunk in zip(chunk_starts, token_chunks, strict=True)]
     block_ids = [[int(b) for b in item["block_ids"]] for item in items]
+    sampling = [Sampling.from_wire(item.get("sampling")) for item in items]
+    allow_device, allow_topk = _sampling_paths(state, sampling)
 
     batch = pack_prefill_batch(
         request_ids=request_ids,
@@ -170,8 +186,8 @@ def _run_prefill(state: _BridgeState, items: list[dict[str, Any]]) -> dict[str, 
         chunk_starts=chunk_starts,
         device=state.record.runtime.device,
         embedding_lookup=None,  # Qwen embeds on device
-        allow_device_greedy_sampling=True,
-        allow_device_topk_sampling=False,
+        allow_device_greedy_sampling=allow_device,
+        allow_device_topk_sampling=allow_topk,
         block_ids=block_ids,
         block_ids_by_group=[{} for _ in items],
         cache_partitions=[None for _ in items],
@@ -184,14 +200,26 @@ def _run_prefill(state: _BridgeState, items: list[dict[str, Any]]) -> dict[str, 
     sampled: dict[str, list[int]] = {}
     completed_ids: list[str] = []
     completed_tokens: list[int] = []
+    completed_params: list[Any] = []
     for index, item in enumerate(items):
         covered = chunk_starts[index] + len(token_chunks[index])
         if covered < int(item["sample_at_length"]):
             continue
-        token_id = _sampled_id(result, index, "prefill")
+        params = _params(sampling[index])
+        token_id = sample_row(
+            state.sampler,
+            result,
+            logits_row(getattr(result, "logits", None), index),
+            params,
+            item["request_id"],
+            index,
+            allow_device=allow_device,
+            allow_topk=allow_topk,
+        )
         sampled[item["request_id"]] = [token_id]
         completed_ids.append(item["request_id"])
         completed_tokens.append(token_id)
+        completed_params.append(params)
 
     if completed_ids:
         # A no-op for Qwen, but it is what the worker does; keep the shapes identical.
@@ -199,7 +227,7 @@ def _run_prefill(state: _BridgeState, items: list[dict[str, Any]]) -> dict[str, 
             state.record.runtime_model,
             completed_ids,
             completed_tokens,
-            [_greedy_params() for _ in completed_ids],
+            completed_params,
         )
     return sampled
 
@@ -212,15 +240,18 @@ def _run_decode(state: _BridgeState, items: list[dict[str, Any]]) -> dict[str, l
     device = state.record.runtime.device
     decode_tokens = [int(item["last_token"]) for item in items]
     seq_lens = [int(item["seq_len"]) for item in items]
+    sampling = [Sampling.from_wire(item.get("sampling")) for item in items]
+    params = [_params(one) for one in sampling]
+    allow_device, allow_topk = _sampling_paths(state, sampling)
 
     batch = DecodeBatch(
         request_ids=[item["request_id"] for item in items],
         token_ids=torch.tensor(decode_tokens, dtype=torch.long, device=device).unsqueeze(1),
         hidden_states=None,  # Qwen gathers embeddings on device
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-        allow_device_greedy_sampling=True,
-        allow_device_topk_sampling=False,
-        sampling_params=[_greedy_params() for _ in items],
+        allow_device_greedy_sampling=allow_device,
+        allow_device_topk_sampling=allow_topk,
+        sampling_params=params,
         block_ids=[[int(b) for b in item["block_ids"]] for item in items],
         block_ids_by_group=[{} for _ in items],
         cache_partitions=[None for _ in items],
@@ -228,7 +259,18 @@ def _run_decode(state: _BridgeState, items: list[dict[str, Any]]) -> dict[str, l
     result = state.executor.run_decode(state.record.runtime_model, batch)
 
     return {
-        item["request_id"]: [_sampled_id(result, index, "decode")]
+        item["request_id"]: [
+            sample_row(
+                state.sampler,
+                result,
+                logits_row(result.logits, index),
+                params[index],
+                item["request_id"],
+                index,
+                allow_device=allow_device,
+                allow_topk=allow_topk,
+            )
+        ]
         for index, item in enumerate(items)
     }
 
@@ -244,21 +286,32 @@ def close() -> None:
         _state = None
 
 
-def _greedy_params():
+def _params(sampling: Sampling):
+    """The executor's own SamplingParams for one request."""
     from pypto_serving.config.types import SamplingParams  # noqa: PLC0415
 
-    return SamplingParams(temperature=0.0, top_p=1.0, top_k=None, seed=None)
+    return SamplingParams(
+        temperature=sampling.temperature,
+        top_p=sampling.top_p,
+        top_k=sampling.top_k,
+        seed=sampling.seed,
+    )
 
 
-def _sampled_id(result: Any, row: int, phase: str) -> int:
-    """Pull one row out of an executor result's device-sampled token ids."""
-    sampled = getattr(result, "sampled_token_ids", None)
-    if sampled is None:
-        raise RuntimeError(
-            f"{phase} returned no sampled_token_ids; the bridge is greedy-only and "
-            "relies on the executor's device sampling"
-        )
-    flat = sampled.view(-1)
-    if flat.numel() <= row:
-        raise RuntimeError(f"{phase} returned {flat.numel()} sampled rows, expected row {row}")
-    return int(flat[row].item())
+def _sampling_paths(state: _BridgeState, sampling: list[Sampling]) -> tuple[bool, bool]:
+    """The two flags the batch carries, from the executor's capabilities."""
+    executor = state.executor
+    allow_device = allow_device_sampled_ids(
+        sampling,
+        supports_device_sampling=bool(executor.supports_device_sampling),
+        supports_device_stochastic_sampling=bool(
+            getattr(executor, "supports_device_stochastic_sampling", False)
+        ),
+    )
+    allow_topk = allow_device_topk_sampling(
+        sampling,
+        device_topk_sampling_k=int(getattr(executor, "device_topk_sampling_k", 0)),
+    )
+    return allow_device, allow_topk
+
+

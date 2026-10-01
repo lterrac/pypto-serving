@@ -210,19 +210,26 @@ TEST(HttpServerTest, RejectsAMissingPrompt)
   EXPECT_EQ(response->status, 400);
 }
 
-TEST(HttpServerTest, RefusesSamplingItDoesNotImplement)
+TEST(HttpServerTest, AcceptsSamplingAndRefusesOnlyNonsense)
 {
   Fixture fixture;
   auto    client = fixture.client();
 
-  // Accepting these and sampling greedily anyway returns a different
-  // distribution than the caller asked for, silently.
-  for (const auto &body : {json{{"prompt", "hi"}, {"temperature", 0.7}}, json{{"prompt", "hi"}, {"top_k", 40}}})
+  // The executor decides how a request is sampled; the server's job is to pass
+  // the parameters down, not to second-guess them.
+  const auto sampled = client.Post("/v1/completions",
+                                   json{{"prompt", "Say:"}, {"temperature", 0.7}, {"top_p", 0.95}, {"top_k", 40}, {"seed", 7}, {"max_tokens", 2}, {"ignore_eos", true}}.dump(),
+                                   "application/json");
+  ASSERT_NE(sampled, nullptr);
+  EXPECT_EQ(sampled->status, 200) << sampled->body;
+
+  // Values no sampler can act on are still refused here, where the caller can
+  // be told which field was wrong.
+  for (const auto &body : {json{{"prompt", "hi"}, {"top_k", 0}}, json{{"prompt", "hi"}, {"top_p", 0.0}}, json{{"prompt", "hi"}, {"top_p", 1.5}}})
   {
     const auto response = client.Post("/v1/completions", body.dump(), "application/json");
     ASSERT_NE(response, nullptr);
     EXPECT_EQ(response->status, 400) << body.dump();
-    EXPECT_NE(response->body.find("greedy"), std::string::npos) << response->body;
   }
 
   // Greedy defaults still work.
