@@ -80,6 +80,12 @@ class ScriptedExecutor : public engine::ModelExecutor
       return result;
     }
 
+    {
+      const std::lock_guard<std::mutex> lock(_decodedMutex);
+      for (const auto &item : command.prefill) { _sampling[item.requestId] = item.sampling; }
+      for (const auto &item : command.decode) { _sampling[item.requestId] = item.sampling; }
+    }
+
     for (const auto &item : command.prefill)
     {
       const auto it      = promptLengths.find(item.requestId);
@@ -119,6 +125,14 @@ class ScriptedExecutor : public engine::ModelExecutor
     _decodedIds.clear();
   }
 
+  /// The sampling parameters the most recent step carried for a request.
+  std::optional<engine::SamplingParams> samplingFor(const std::string &requestId)
+  {
+    const std::lock_guard<std::mutex> lock(_decodedMutex);
+    const auto                        it = _sampling.find(requestId);
+    return it == _sampling.end() ? std::nullopt : std::optional{it->second};
+  }
+
   private:
 
   int next(const std::string &requestId)
@@ -127,11 +141,12 @@ class ScriptedExecutor : public engine::ModelExecutor
     return _script[index % _script.size()];
   }
 
-  std::mutex                    _decodedMutex;
-  std::vector<std::string>      _decodedIds;
-  std::vector<int>              _script;
-  int                           _numPages;
-  std::map<std::string, size_t> _emitted;
+  std::mutex                                    _decodedMutex;
+  std::vector<std::string>                      _decodedIds;
+  std::map<std::string, engine::SamplingParams> _sampling;
+  std::vector<int>                              _script;
+  int                                           _numPages;
+  std::map<std::string, size_t>                 _emitted;
 };
 
 /// Every update a request produces, in order.
