@@ -9,6 +9,7 @@
 
 #include <pybind11/stl.h>
 
+#include <serving/bindings/repr.hpp>
 #include <serving/engine/engine.hpp>
 #include <serving/engine/executor.hpp>
 #include <serving/model/tokenizer.hpp>
@@ -62,18 +63,30 @@ class PyModelExecutor : public engine::ModelExecutor
 
 void bindExecutorTypes(py::module_ &m)
 {
+  py::class_<engine::SamplingParams>(m, "SamplingParams", "How a request's next token is to be drawn. Defaults are greedy.")
+    .def_readonly("temperature", &engine::SamplingParams::temperature)
+    .def_readonly("top_p", &engine::SamplingParams::topP)
+    .def_readonly("top_k", &engine::SamplingParams::topK)
+    .def_readonly("seed", &engine::SamplingParams::seed)
+    .def_property_readonly("is_greedy", &engine::SamplingParams::isGreedy)
+    .def("__repr__", [](const engine::SamplingParams &p) {
+      return bindings::Repr("SamplingParams").field("temperature", p.temperature).field("top_p", p.topP).field("top_k", p.topK).field("seed", p.seed).str();
+    });
+
   py::class_<engine::PrefillItem>(m, "PrefillItem", "One request's prompt chunk in a step.")
     .def_readonly("request_id", &engine::PrefillItem::requestId)
     .def_readonly("chunk_tokens", &engine::PrefillItem::chunkTokens)
     .def_readonly("num_computed_tokens", &engine::PrefillItem::numComputedTokens)
     .def_readonly("sample_at_length", &engine::PrefillItem::sampleAtLength)
-    .def_readonly("block_ids", &engine::PrefillItem::blockIds);
+    .def_readonly("block_ids", &engine::PrefillItem::blockIds)
+    .def_readonly("sampling", &engine::PrefillItem::sampling);
 
   py::class_<engine::DecodeItem>(m, "DecodeItem", "One request's decode slot in a step.")
     .def_readonly("request_id", &engine::DecodeItem::requestId)
     .def_readonly("last_token", &engine::DecodeItem::lastToken)
     .def_readonly("seq_len", &engine::DecodeItem::seqLen)
-    .def_readonly("block_ids", &engine::DecodeItem::blockIds);
+    .def_readonly("block_ids", &engine::DecodeItem::blockIds)
+    .def_readonly("sampling", &engine::DecodeItem::sampling);
 
   py::class_<engine::StepCommand>(m, "StepCommand", "What the engine asks the executor to run: prefill chunks and decode slots for one step.")
     .def_readonly("prefill", &engine::StepCommand::prefill)

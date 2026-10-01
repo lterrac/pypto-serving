@@ -103,6 +103,21 @@ int BridgeExecutor::registerModel()
   return static_cast<int>(numPages);
 }
 
+namespace
+{
+
+/// The sampling block of a step payload. Optionals become JSON null, which is
+/// the `None` the Python `SamplingParams` carries.
+Json samplingJson(const SamplingParams &sampling)
+{
+  return Json{{"temperature", sampling.temperature},
+              {"top_p", sampling.topP},
+              {"top_k", sampling.topK.has_value() ? Json(*sampling.topK) : Json(nullptr)},
+              {"seed", sampling.seed.has_value() ? Json(*sampling.seed) : Json(nullptr)}};
+}
+
+} // namespace
+
 StepResult BridgeExecutor::executeStep(const StepCommand &command)
 {
   StepResult result;
@@ -116,11 +131,13 @@ StepResult BridgeExecutor::executeStep(const StepCommand &command)
                                       {"tokens", item.chunkTokens},
                                       {"num_computed", item.numComputedTokens},
                                       {"sample_at_length", item.sampleAtLength},
-                                      {"block_ids", item.blockIds}});
+                                      {"block_ids", item.blockIds},
+                                      {"sampling", samplingJson(item.sampling)}});
   }
   for (const DecodeItem &item : command.decode)
   {
-    payload["decode"].push_back(Json{{"request_id", item.requestId}, {"last_token", item.lastToken}, {"seq_len", item.seqLen}, {"block_ids", item.blockIds}});
+    payload["decode"].push_back(
+      Json{{"request_id", item.requestId}, {"last_token", item.lastToken}, {"seq_len", item.seqLen}, {"block_ids", item.blockIds}, {"sampling", samplingJson(item.sampling)}});
   }
   const std::string request = payload.dump();
 
