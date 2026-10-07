@@ -258,3 +258,43 @@ TEST(MapSyncTest, LosingEveryReplicaOfAPartitionLeavesThePipelineUnservable)
   // routing to a replica that is gone.
   EXPECT_THROW((void)coordinator.routeFor("chat-1"), NoReplicaAvailable);
 }
+
+// ---------------------------------------------------------------------------
+// The document as the thing two processes agree through
+// ---------------------------------------------------------------------------
+
+#include <serving/infra/document.hpp>
+
+TEST(MapSyncTest, AdoptingADocumentRePlansRouting)
+{
+  Coordinator coordinator(config(), nullptr);
+  coordinator.initialize();
+  ASSERT_EQ(hopsSeen(coordinator, 8).size(), 2U);
+
+  // Something else -- a scaling policy, an operator, the replica itself --
+  // wrote a document saying one of them is draining. Adopting it is the whole
+  // integration: the coordinator does not learn this through an API call.
+  serving::infra::StateMap wanted = coordinator.stateMap();
+  wanted.setPhase("p0b", Phase::Draining);
+  const std::string document = serving::infra::writeDocument(wanted);
+
+  coordinator.stateMap() = serving::infra::readDocument(document);
+  coordinator.service();
+
+  EXPECT_EQ(hopsSeen(coordinator, 8), (std::vector<std::string>{"p0a"}));
+  EXPECT_EQ(coordinator.syncedVersion(), coordinator.stateMap().version());
+}
+
+TEST(MapSyncTest, ADocumentThatRemovesAReplicaTakesItOutOfRouting)
+{
+  Coordinator coordinator(config(), nullptr);
+  coordinator.initialize();
+
+  serving::infra::StateMap wanted = coordinator.stateMap();
+  ASSERT_TRUE(wanted.removeReplica("p0b"));
+
+  coordinator.stateMap() = serving::infra::readDocument(serving::infra::writeDocument(wanted));
+  coordinator.service();
+
+  EXPECT_EQ(hopsSeen(coordinator, 8), (std::vector<std::string>{"p0a"}));
+}

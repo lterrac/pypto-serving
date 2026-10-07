@@ -115,3 +115,61 @@ def test_describe_replica_uses_the_granted_card_not_the_logical_one(monkeypatch)
     r = infra.describe_replica("qwen-0", node="hg-atlas-01", port=8000, device=0)
     assert r.devices == [4]
     assert r.node == "hg-atlas-01" and r.port == 8000
+
+
+# ---------------------------------------------------------------------------
+# the document
+# ---------------------------------------------------------------------------
+
+
+def _deployment(dev: str):
+    m = s.StateMap()
+    m.add_node(s.local_node("hg-atlas-01", "192.168.150.11", dev))
+    m.add_replica(s.Replica("qwen-0", node="hg-atlas-01", devices=[4], port=8000, phase=s.Phase.ACTIVE))
+    return m
+
+
+def test_a_document_round_trips_and_keeps_its_version(dev):
+    m = _deployment(dev)
+    back = s.read_document(s.write_document(m))
+
+    assert back.version == m.version
+    assert [r.name for r in back.replicas] == ["qwen-0"]
+    assert back.replica("qwen-0").devices == [4]
+    assert back.devices_free("hg-atlas-01") == [0, 1, 2, 3, 5, 6, 7]
+
+
+def test_the_document_is_strict(dev):
+    with pytest.raises(ValueError, match="unknown key"):
+        s.read_document('{"replicaz": []}')
+    with pytest.raises(ValueError, match="unknown phase"):
+        s.read_document('{"replicas": [{"name": "r", "phase": "zombie"}]}')
+    with pytest.raises(ValueError):
+        s.read_document("not json")
+
+
+def test_two_processes_agree_through_a_file(dev, tmp_path):
+    # The writer: a replica recording where it landed.
+    path = str(tmp_path / "deployment.json")
+    s.save_document(_deployment(dev), path)
+
+    # The reader: anything that needs to know what runs where.
+    loaded = s.load_document(path)
+    assert s.validate(loaded) == []
+    assert loaded.devices_in_use("hg-atlas-01") == [4]
+
+    # And a phase written by one side is seen by the other.
+    loaded.set_phase("qwen-0", s.Phase.DEAD)
+    s.save_document(loaded, path)
+    assert s.load_document(path).devices_free("hg-atlas-01") == list(range(8))
+
+
+def test_saving_leaves_no_temporary_behind(dev, tmp_path):
+    # Its own directory: the `dev` fixture puts fake device nodes in tmp_path.
+    target = tmp_path / "state"
+    target.mkdir()
+    s.save_document(_deployment(dev), str(target / "deployment.json"))
+
+    # A reader polling the document must never catch it half-written, which is
+    # why it is renamed into place; the temporary must not survive either.
+    assert sorted(p.name for p in target.iterdir()) == ["deployment.json"]

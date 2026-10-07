@@ -161,6 +161,14 @@ class StateMap
   bool place(const std::string &name, const std::string &nodeName, std::vector<int> devices);
   bool removeReplica(const std::string &name);
 
+  /// Put the version back where a loaded document left it.
+  ///
+  /// Building a map replica by replica bumps the version once per edit, so a
+  /// freshly loaded document would come back with a version counting the load
+  /// rather than the edits it records -- and a reader that cached a version
+  /// would draw the wrong conclusion from it. Only a loader should call this.
+  void restoreVersion(uint64_t version) { _version = version; }
+
   private:
 
   void bump() { _version += 1; }
