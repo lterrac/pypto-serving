@@ -44,6 +44,7 @@ servingSources = files(
   'source/infra/launcher.cpp',
   'source/infra/process_starter.cpp',
   'source/infra/monitor.cpp',
+  'source/infra/document.cpp',
   'source/memory/kv_cache.cpp',
   'source/sched/scheduler.cpp',
   'source/engine/detokenizer.cpp',
@@ -177,7 +178,7 @@ if havePythonBridge
 endif
 
 if haveCloudr
-  servingSources      += files('source/infra/cloudr_capacity.cpp')
+  servingSources      += files('source/infra/cloudr_capacity.cpp', 'source/infra/document_rpc.cpp')
   servingDependencies += cloudrBuildDep
   servingBuildCppArgs += ['-DSERVING_HAVE_CLOUDR=1']
 endif

@@ -14,6 +14,7 @@ subdir('routing_modes')
 
 if haveCloudr
   subdir('cloudr_capacity')
+  subdir('document_rpc')
 else
   message('cloudr_capacity skipped: the cloudr feature is off')
 endif
