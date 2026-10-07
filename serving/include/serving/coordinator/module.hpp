@@ -18,10 +18,29 @@
 #include <string>
 #include <vector>
 
+#include <serving/infra/state.hpp>
 #include <serving/router/strategy.hpp>
 
 namespace serving::coordinator
 {
+
+/// What one synchronisation changed, so a caller (and a test) can see the tick
+/// did work without reading the registries.
+struct SyncReport
+{
+  int added   = 0;
+  int removed = 0;
+  /// Replicas whose routable state changed.
+  int rephased = 0;
+  /// Replicas that went to `dead`, which is the loss path: paths through them
+  /// are revoked and their sessions released.
+  std::vector<std::string> lost;
+  /// Replicas the map has in a partition routing does not know about.
+  /// Repartitioning is M1's problem, not a routing update's.
+  std::vector<std::string> unplaceable;
+
+  [[nodiscard]] bool empty() const { return added == 0 && removed == 0 && rephased == 0 && lost.empty(); }
+};
 
 /// A replica as the coordinator sees it: a routing identity plus the instance
 /// that serves it. The routing layer works in names; the platform works in
@@ -73,8 +92,27 @@ class Coordinator
    */
   void reportReplicaLost(const std::string &replicaName);
 
-  /// One tick of the platform's service timer: apply whatever has been reported.
+  /// One tick of the platform's service timer: apply whatever has been reported,
+  /// then take routing to whatever the state map now says.
   void service();
+
+  /**
+   * The infrastructure state map this coordinator routes from.
+   *
+   * Writers edit it; `service()` notices the version moved and brings routing
+   * into line. Deliberately not applied on the writing thread: a health signal
+   * marking a replica dead must not run routing policy where it lands, the same
+   * reason `reportReplicaLost` queues.
+   */
+  [[nodiscard]] infra::StateMap       &stateMap() { return _stateMap; }
+  [[nodiscard]] const infra::StateMap &stateMap() const { return _stateMap; }
+
+  /// Bring routing to the map, now, and say what changed. `service()` calls
+  /// this; a test calls it directly.
+  SyncReport syncFromMap();
+
+  /// The map version routing currently reflects.
+  [[nodiscard]] uint64_t syncedVersion() const;
 
   /// Release the strategy. Mirrors Module::finalize.
   void finalize();
@@ -92,6 +130,9 @@ class Coordinator
   [[nodiscard]] int lossesApplied() const;
 
   private:
+
+  /// Caller holds `_routingMutex`.
+  SyncReport syncLocked();
 
   CoordinatorConfig      _config;
   router::RuleTransport *_transport = nullptr;
@@ -111,6 +152,13 @@ class Coordinator
   /// planner and session directory.
   mutable std::mutex _routingMutex;
   int                _lossesApplied = 0;
+
+  /// What runs where. Guarded by `_routingMutex` like the routing state it
+  /// feeds, so a write and a sync cannot interleave.
+  infra::StateMap _stateMap;
+  /// The version `syncFromMap` last brought routing to. Starts at the version
+  /// `initialize()` seeded, so an untouched map costs nothing per tick.
+  uint64_t _syncedVersion = 0;
 };
 
 } // namespace serving::coordinator

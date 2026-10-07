@@ -13,6 +13,7 @@ void bindServing(pybind11::module_ &m)
   bindTokenizer(m);
   bindEngine(m);
   bindServer(m);
+  bindInfra(m);
 }
 
 } // namespace serving::bindings
