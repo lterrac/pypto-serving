@@ -21,3 +21,14 @@ minja is upstream, not llama.cpp's copy: that copy's `in` operator has no string
 containment, so Qwen3's `{%- if '</think>' in content %}` never fires and reasoning
 blocks leak into the prompt. `tests/model/test_chat_template.cpp` checks rendering
 against the Python output.
+
+## CloudR
+
+`CloudR` is a HiCR-based cloud emulator: it creates instances with arbitrary
+topologies on one machine. It backs `infra/cloudr_capacity.hpp`, which is how
+the "ask a provider for a node" half of M2 is exercised without a second
+machine. Behind `-Dcloudr=`; the default build links no MPI.
+
+It does not pull HiCR in when used as a subproject, so `serving/meson.build`
+supplies it from `extern/CloudR/extern/HiCR`. That is the same commit
+`platform/` pins, so one copy serves both.

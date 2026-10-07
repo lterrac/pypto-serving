@@ -12,6 +12,12 @@ endif
 
 subdir('routing_modes')
 
+if haveCloudr
+  subdir('cloudr_capacity')
+else
+  message('cloudr_capacity skipped: the cloudr feature is off')
+endif
+
 if havePythonBridge and havePythonBindings
   subdir('bindings_embedded')
 else

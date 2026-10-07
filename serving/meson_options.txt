@@ -29,3 +29,7 @@ option('tokenizers', type : 'feature', value : 'auto',
 option('platform', type : 'feature', value : 'auto',
        description: 'Build the coordinator module against platform/ (HiCR + TaskR). Needs the platform submodules checked out'
 )
+
+option('cloudr', type : 'feature', value : 'auto',
+       description: 'Build the CloudR-backed capacity provider. Needs extern/CloudR checked out, plus MPI and hwloc'
+)

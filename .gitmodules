@@ -22,3 +22,6 @@
 	path = serving/extern/pybind11
 	url = https://github.com/pybind/pybind11.git
 	shallow = true
+[submodule "serving/extern/CloudR"]
+	path = serving/extern/CloudR
+	url = https://github.com/Algebraic-Programming/CloudR.git

@@ -39,6 +39,8 @@ servingDependencies = [dependency('threads')]
 servingSources = files(
   'source/infra/state.cpp',
   'source/infra/discovery.cpp',
+  'source/infra/capacity.cpp',
+  'source/infra/scaling.cpp',
   'source/memory/kv_cache.cpp',
   'source/sched/scheduler.cpp',
   'source/engine/detokenizer.cpp',
@@ -103,6 +105,32 @@ endif
 havePlatform         = false
 havePlatformChannels = false
 platformBuildDep  = dependency('threads')
+####### Optional: CloudR -- the cloud emulator behind the capacity provider
+#
+# A HiCR backend that emulates instances with arbitrary topologies on one
+# machine, so the "ask a provider for a node" path can be exercised without a
+# second machine. Needs MPI and hwloc; infra/capacity.hpp stays free of both.
+cloudrOption = get_option('cloudr')
+haveCloudr   = false
+if not cloudrOption.disabled()
+  if fs.exists('extern/CloudR/extern/HiCR/meson.build')
+    # CloudR does not pull HiCR in when it is itself a subproject: the parent
+    # is expected to supply it. platform/ pins the same HiCR commit, so one
+    # copy serves both; meson would object loudly if they ever diverged.
+    hicrProject = subproject('HiCR', required: cloudrOption,
+                             default_options: ['backends=mpi,hwloc,pthreads', 'frontends=RPCEngine,channel'])
+    cloudrProject = subproject('CloudR', required: cloudrOption)
+    if cloudrProject.found() and hicrProject.found()
+      cloudrBuildDep = declare_dependency(dependencies: [cloudrProject.get_variable('CloudRBuildDep'), hicrProject.get_variable('hicrBuildDep')])
+      haveCloudr     = true
+    endif
+  elif cloudrOption.enabled()
+    error('extern/CloudR is not checked out: git submodule update --init --recursive serving/extern/CloudR')
+  else
+    message('cloudr skipped: extern/CloudR is not checked out')
+  endif
+endif
+
 platformOption    = get_option('platform')
 if not platformOption.disabled()
   if fs.exists('subprojects/platform/extern/HiCR/meson.build')
@@ -143,6 +171,12 @@ endif
 if havePythonBridge
   servingSources += files('source/engine/bridge_executor.cpp')
   servingDependencies += pythonEmbedDep
+endif
+
+if haveCloudr
+  servingSources      += files('source/infra/cloudr_capacity.cpp')
+  servingDependencies += cloudrBuildDep
+  servingBuildCppArgs += ['-DSERVING_HAVE_CLOUDR=1']
 endif
 
 servingLib = static_library(

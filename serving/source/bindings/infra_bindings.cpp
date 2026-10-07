@@ -7,6 +7,8 @@
 
 #include <serving/bindings/repr.hpp>
 #include <serving/infra/discovery.hpp>
+#include <serving/infra/capacity.hpp>
+#include <serving/infra/scaling.hpp>
 #include <serving/infra/state.hpp>
 
 namespace py = pybind11;
@@ -118,6 +120,89 @@ void bindInfra(py::module_ &m)
     .def("__repr__", [](const infra::StateMap &map) {
       return "StateMap(version=" + std::to_string(map.version()) + ", nodes=" + std::to_string(map.nodes().size()) + ", replicas=" + std::to_string(map.replicas().size()) + ")";
     });
+
+  py::class_<infra::CapacityRequest>(m, "CapacityRequest", "What a scaling decision asks for.")
+    .def(py::init([](infra::PartitionId partition, int devices, std::string name, int port) {
+           return infra::CapacityRequest{partition, devices, std::move(name), port};
+         }),
+         py::arg("partition") = 0,
+         py::arg("devices")   = 1,
+         py::arg("name")      = "",
+         py::arg("port")      = 0)
+    .def_readwrite("partition", &infra::CapacityRequest::partition)
+    .def_readwrite("devices", &infra::CapacityRequest::devices)
+    .def_readwrite("name", &infra::CapacityRequest::name)
+    .def_readwrite("port", &infra::CapacityRequest::port);
+
+  py::class_<infra::Grant>(m, "Grant", "Where a request landed.")
+    .def_readonly("replica", &infra::Grant::replica)
+    .def_readonly("node", &infra::Grant::node)
+    .def_readonly("devices", &infra::Grant::devices)
+    .def_readonly("port", &infra::Grant::port)
+    .def_readonly("instance", &infra::Grant::instance)
+    .def("__repr__", [](const infra::Grant &g) { return Repr("Grant").field("replica", g.replica).field("node", g.node).field("devices", g.devices).str(); });
+
+  py::class_<infra::CapacityProvider>(m, "CapacityProvider", "Somewhere capacity comes from.")
+    .def("acquire", &infra::CapacityProvider::acquire, py::arg("request"))
+    .def("release", &infra::CapacityProvider::release, py::arg("replica"))
+    .def("available", &infra::CapacityProvider::available, py::arg("request"))
+    .def_property_readonly("kind", &infra::CapacityProvider::kind);
+
+  py::class_<infra::LocalCapacity, infra::CapacityProvider>(m, "LocalCapacity", "Capacity on nodes the map already knows about.")
+    .def(py::init<const infra::StateMap &>(), py::arg("map"), py::keep_alive<1, 2>());
+
+  py::class_<infra::ReplicaLoad>(m, "ReplicaLoad", "What one replica is carrying, sampled now.")
+    .def(py::init([](std::string replica, int outstanding, int pendingTokens, int preemptions) {
+           return infra::ReplicaLoad{std::move(replica), outstanding, pendingTokens, preemptions};
+         }),
+         py::arg("replica"),
+         py::arg("outstanding")    = 0,
+         py::arg("pending_tokens") = 0,
+         py::arg("preemptions")    = 0)
+    .def_readwrite("replica", &infra::ReplicaLoad::replica)
+    .def_readwrite("outstanding", &infra::ReplicaLoad::outstanding)
+    .def_readwrite("pending_tokens", &infra::ReplicaLoad::pendingTokens)
+    .def_readwrite("preemptions", &infra::ReplicaLoad::preemptions);
+
+  py::class_<infra::LoadSnapshot>(m, "LoadSnapshot").def(py::init<>()).def_readwrite("replicas", &infra::LoadSnapshot::replicas);
+
+  py::class_<infra::ScalingConfig>(m, "ScalingConfig", "When to add or drain a replica. Serving's decision, not the control plane's.")
+    .def(py::init<>())
+    .def_readwrite("scale_up_above", &infra::ScalingConfig::scaleUpAbove)
+    .def_readwrite("scale_down_below", &infra::ScalingConfig::scaleDownBelow)
+    .def_readwrite("min_replicas", &infra::ScalingConfig::minReplicas)
+    .def_readwrite("max_replicas", &infra::ScalingConfig::maxReplicas)
+    .def_readwrite("preemptions_above", &infra::ScalingConfig::preemptionsAbove)
+    .def_readwrite("devices_per_replica", &infra::ScalingConfig::devicesPerReplica)
+    .def("validate", &infra::ScalingConfig::validate);
+
+  py::enum_<infra::ScalingAction>(m, "ScalingAction").value("SCALE_UP", infra::ScalingAction::ScaleUp).value("SCALE_DOWN", infra::ScalingAction::ScaleDown);
+
+  py::class_<infra::ScalingDecision>(m, "ScalingDecision")
+    .def_readonly("partition", &infra::ScalingDecision::partition)
+    .def_readonly("action", &infra::ScalingDecision::action)
+    .def_readonly("replica", &infra::ScalingDecision::replica)
+    .def_readonly("reason", &infra::ScalingDecision::reason);
+
+  py::class_<infra::ScalingOutcome>(m, "ScalingOutcome")
+    .def_readonly("decision", &infra::ScalingOutcome::decision)
+    .def_readonly("applied", &infra::ScalingOutcome::applied)
+    .def_readonly("replica", &infra::ScalingOutcome::replica)
+    .def_readonly("declined", &infra::ScalingOutcome::declined);
+
+  m.def("decide_scaling", &infra::decideScaling, py::arg("map"), py::arg("load"), py::arg("config"), "What the policy thinks, per partition. Reads only.");
+  m.def("apply_scaling", &infra::applyScaling, py::arg("map"), py::arg("provider"), py::arg("decisions"), py::arg("config"));
+  m.def("scaling_action_name", &infra::scalingActionName, py::arg("action"));
+
+  m.def("write_document", &infra::writeDocument, py::arg("map"), "The map as the deployment document.");
+  m.def("read_document", &infra::readDocument, py::arg("text"), py::arg("source") = "<document>", "Parse one. Strict: an unknown key is an error.");
+  m.def("load_document", [](const std::string &path) { return infra::loadDocument(path); }, py::arg("path"));
+  m.def(
+    "save_document",
+    [](const infra::StateMap &map, const std::string &path) { infra::saveDocument(map, path); },
+    py::arg("map"),
+    py::arg("path"),
+    "Write it where a reader only ever sees it whole: a sibling temporary, renamed over the target.");
 
   m.def("validate", &infra::validate, py::arg("map"), "Everything wrong with the deployment, one message per problem. Empty means coherent.");
   m.def("reconcile", &infra::reconcile, py::arg("map"), "The actions that would bring every replica to the phase it is wanted in.");
