@@ -4,6 +4,8 @@ servingTestArgs = ['-DSERVING_TEST_FIXTURE_DIR="' + meson.current_source_dir() /
 
 servingTestSources = files(
   'infra/test_state.cpp',
+  'infra/test_capacity.cpp',
+  'infra/test_scaling.cpp',
   'memory/test_kv_cache.cpp',
   'sched/test_scheduler.cpp',
   'engine/test_detokenizer.cpp',
