@@ -37,6 +37,8 @@ servingDependencies = [dependency('threads')]
 ####### Library sources
 
 servingSources = files(
+  'source/infra/state.cpp',
+  'source/infra/discovery.cpp',
   'source/memory/kv_cache.cpp',
   'source/sched/scheduler.cpp',
   'source/engine/detokenizer.cpp',
@@ -49,6 +51,7 @@ servingSources = files(
   'source/coordinator/module.cpp',
   'source/coordinator/rule_message.cpp',
   'source/coordinator/config_file.cpp',
+  'source/coordinator/map_routing.cpp',
   'source/router/proxy.cpp',
   'source/router/router_server.cpp',
 )
@@ -175,6 +178,7 @@ if havePythonBindings
     'serving-bindings',
     files(
       'source/bindings/bindings.cpp',
+      'source/bindings/infra_bindings.cpp',
       'source/bindings/config_bindings.cpp',
       'source/bindings/template_bindings.cpp',
       'source/bindings/kv_cache_bindings.cpp',

@@ -42,6 +42,12 @@ class ServingOptions:
     host: str = "0.0.0.0"
     port: int = 8000
     pypto_build_dir: str = "build_output/bridge"
+    #: Identity in the infrastructure state map. A node cannot name itself --
+    #: inside a container the hostname is the container's id -- so a deployment
+    #: that wants to be on the map says who it is.
+    node_name: str = ""
+    replica_name: str = ""
+    partition: int = 0
 
     def __post_init__(self) -> None:
         if not self.served_model_name:
@@ -138,6 +144,25 @@ class Runtime:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
             self.stop()
+
+    def placement(self, phase: "cpp.Phase | None" = None) -> "cpp.Replica":
+        """This process as an entry for the infrastructure state map.
+
+        The device is the physical card the broker granted, not the logical 0
+        the process sees: the map records what the node owns, and that is what
+        another replica would collide with.
+        """
+        from pypto_serving.cpp.infra import describe_replica  # noqa: PLC0415
+
+        o = self.options
+        return describe_replica(
+            o.replica_name or o.served_model_name,
+            node=o.node_name,
+            port=self.server.bound_port if self.server is not None else o.port,
+            partition=o.partition,
+            device=o.device,
+            phase=cpp.Phase.ACTIVE if phase is None else phase,
+        )
 
     def stop(self) -> None:
         # Engine first: its stop() closes every request stream, so the HTTP
