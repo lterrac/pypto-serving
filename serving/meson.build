@@ -41,6 +41,8 @@ servingSources = files(
   'source/infra/discovery.cpp',
   'source/infra/capacity.cpp',
   'source/infra/scaling.cpp',
+  'source/infra/launcher.cpp',
+  'source/infra/process_starter.cpp',
   'source/memory/kv_cache.cpp',
   'source/sched/scheduler.cpp',
   'source/engine/detokenizer.cpp',
