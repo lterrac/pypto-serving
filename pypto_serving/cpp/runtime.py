@@ -45,6 +45,9 @@ class ServingOptions:
     #: Identity in the infrastructure state map. A node cannot name itself --
     #: inside a container the hostname is the container's id -- so a deployment
     #: that wants to be on the map says who it is.
+    #: Hold routing rules published by a coordinator and forward the sessions
+    #: they name, instead of serving them here. Option B from the deck.
+    forwarding: bool = False
     node_name: str = ""
     replica_name: str = ""
     partition: int = 0
@@ -105,6 +108,7 @@ class Runtime:
         self.executor = executor or PyptoModelExecutor(options)
         self.engine = cpp.Engine(engine_config(options), self.tokenizer, self.executor)
         self.server: cpp.HttpServer | None = None
+        self.rules: cpp.RuleTable | None = None
 
     def start(self) -> float:
         """Load the model and start the engine; returns the seconds it took."""
@@ -132,7 +136,9 @@ class Runtime:
     def serve(self) -> None:
         """Serve HTTP until SIGINT or SIGTERM."""
         config = cpp.ServerConfig(host=self.options.host, port=self.options.port, model_id=self.options.served_model_name)
-        self.server = cpp.HttpServer(config, self.engine, self.tokenizer, self.chat_template)
+        # The table is kept alive by the runtime: the server only borrows it.
+        self.rules = cpp.RuleTable() if self.options.forwarding else None
+        self.server = cpp.HttpServer(config, self.engine, self.tokenizer, self.chat_template, self.rules)
         self.server.start()
         logger.info("listening on %s:%d", self.options.host, self.server.bound_port)
 

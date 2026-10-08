@@ -58,6 +58,7 @@ servingSources = files(
   'source/coordinator/rule_message.cpp',
   'source/coordinator/config_file.cpp',
   'source/coordinator/map_routing.cpp',
+  'source/replica/rule_table.cpp',
   'source/router/proxy.cpp',
   'source/router/router_server.cpp',
 )

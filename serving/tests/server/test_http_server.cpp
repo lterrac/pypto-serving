@@ -40,12 +40,14 @@ struct Fixture
   CharTokenizer                                 tokenizer;
   ScriptedExecutor                              executor;
   std::unique_ptr<serving::model::ChatTemplate> chatTemplate;
+  std::unique_ptr<serving::replica::RuleTable>  rules;
   std::unique_ptr<Engine>                       engine;
   std::unique_ptr<HttpServer>                   server;
 
-  explicit Fixture(std::string script = "hi!", int promptLength = 4, const std::string &chatTemplateSource = "")
+  explicit Fixture(std::string script = "hi!", int promptLength = 4, const std::string &chatTemplateSource = "", bool withRules = false)
     : executor(ScriptedExecutor::fromText(script))
   {
+    if (withRules) { rules = std::make_unique<serving::replica::RuleTable>(); }
     executor.promptLength = promptLength;
     if (!chatTemplateSource.empty()) { chatTemplate = std::make_unique<serving::model::ChatTemplate>(chatTemplateSource, "", "<|im_end|>"); }
 
@@ -61,7 +63,7 @@ struct Fixture
     serverConfig.host    = "127.0.0.1";
     serverConfig.port    = 0; // ephemeral
     serverConfig.modelId = "test-model";
-    server               = std::make_unique<HttpServer>(serverConfig, *engine, tokenizer, chatTemplate.get());
+    server               = std::make_unique<HttpServer>(serverConfig, *engine, tokenizer, chatTemplate.get(), rules.get());
     server->start();
   }
 
@@ -346,4 +348,116 @@ TEST(HttpServerTest, ChatCompletionsNeedATemplate)
   // No template was supplied to this server, so the request is refused rather
   // than served with an un-templated prompt.
   EXPECT_EQ(response->status, 400);
+}
+
+// ---------------------------------------------------------------------------
+// Option B on the replica: told where a session goes, it goes there
+// ---------------------------------------------------------------------------
+
+TEST(HttpServerTest, WithoutATableThereAreNoControlRoutes)
+{
+  Fixture fixture;
+  auto    client = fixture.client();
+
+  // A replica that was never given a table must behave exactly as before,
+  // rather than growing an endpoint that silently does nothing.
+  const auto response = client.Get("/control/rules?session=x");
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, 404);
+}
+
+TEST(HttpServerTest, HoldsARuleAndReportsIt)
+{
+  Fixture fixture("hi!", 4, "", /*withRules=*/true);
+  auto    client = fixture.client();
+
+  const auto published =
+    client.Post("/control/rules", json{{"session_id", "chat-1"}, {"next_hop", "p1a"}, {"next_hop_url", "127.0.0.1:9"}, {"generation", 7}}.dump(), "application/json");
+  ASSERT_NE(published, nullptr);
+  ASSERT_EQ(published->status, 200);
+  EXPECT_NE(published->body.find("applied"), std::string::npos);
+
+  const auto held = client.Get("/control/rules?session=chat-1");
+  ASSERT_NE(held, nullptr);
+  const auto parsed = json::parse(held->body);
+  EXPECT_EQ(parsed.at("next_hop"), "p1a");
+  EXPECT_EQ(parsed.at("generation"), 7);
+
+  // And a session nobody published is reported as unknown rather than guessed.
+  const auto absent = json::parse(client.Get("/control/rules?session=nobody")->body);
+  EXPECT_TRUE(absent.at("next_hop").is_null());
+}
+
+TEST(HttpServerTest, ALateRuleIsRejectedAsStale)
+{
+  Fixture fixture("hi!", 4, "", true);
+  auto    client = fixture.client();
+
+  client.Post("/control/rules", json{{"session_id", "c"}, {"next_hop", "p1b"}, {"generation", 11}}.dump(), "application/json");
+  const auto late = client.Post("/control/rules", json{{"session_id", "c"}, {"next_hop", "p1a"}, {"generation", 10}}.dump(), "application/json");
+
+  // The coordinator is told its rule did not take, rather than believing it did.
+  ASSERT_NE(late, nullptr);
+  EXPECT_NE(late->body.find("stale"), std::string::npos) << late->body;
+  EXPECT_EQ(json::parse(client.Get("/control/rules?session=c")->body).at("next_hop"), "p1b");
+}
+
+TEST(HttpServerTest, ForwardsASessionItWasToldToForward)
+{
+  // The next hop: an ordinary replica with no table of its own.
+  Fixture next("ZZ", 4);
+  Fixture first("hi!", 4, "", true);
+  auto    client = first.client();
+
+  const std::string url = "127.0.0.1:" + std::to_string(next.server->boundPort());
+  ASSERT_EQ(client.Post("/control/rules", json{{"session_id", "chat-1"}, {"next_hop", "p1a"}, {"next_hop_url", url}, {"generation", 1}}.dump(), "application/json")->status, 200);
+
+  const auto response = client.Post("/v1/completions", json{{"prompt", "Say:"}, {"session_id", "chat-1"}, {"max_tokens", 2}, {"ignore_eos", true}}.dump(), "application/json");
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, 200) << response->body;
+
+  // Answered by the next hop, not here: no round trip to a coordinator.
+  EXPECT_EQ(first.server->forwarded(), 1);
+  EXPECT_EQ(next.executor.steps.load() > 0, true);
+  EXPECT_EQ(response->get_header_value("x-forwarded-by"), "test-model");
+
+  // A session with no rule is still served locally.
+  const auto local = client.Post("/v1/completions", json{{"prompt", "Say:"}, {"session_id", "other"}, {"max_tokens", 2}, {"ignore_eos", true}}.dump(), "application/json");
+  ASSERT_NE(local, nullptr);
+  EXPECT_EQ(local->status, 200);
+  EXPECT_EQ(first.server->forwarded(), 1);
+}
+
+TEST(HttpServerTest, ARevokedSessionIsServedHereAgain)
+{
+  Fixture next("ZZ", 4);
+  Fixture first("hi!", 4, "", true);
+  auto    client = first.client();
+
+  const std::string url = "127.0.0.1:" + std::to_string(next.server->boundPort());
+  client.Post("/control/rules", json{{"session_id", "c"}, {"next_hop", "p1a"}, {"next_hop_url", url}, {"generation", 3}}.dump(), "application/json");
+  client.Post("/v1/completions", json{{"prompt", "Say:"}, {"session_id", "c"}, {"max_tokens", 1}, {"ignore_eos", true}}.dump(), "application/json");
+  ASSERT_EQ(first.server->forwarded(), 1);
+
+  const auto revoked = client.Post("/control/rules/revoke", json{{"session_id", "c"}, {"generation", 3}}.dump(), "application/json");
+  ASSERT_NE(revoked, nullptr);
+  EXPECT_NE(revoked->body.find("revoked"), std::string::npos);
+
+  client.Post("/v1/completions", json{{"prompt", "Say:"}, {"session_id", "c"}, {"max_tokens", 1}, {"ignore_eos", true}}.dump(), "application/json");
+  // The path was replanned; this replica stops forwarding and serves again.
+  EXPECT_EQ(first.server->forwarded(), 1);
+}
+
+TEST(HttpServerTest, AnUnreachableNextHopIsAnErrorNotASilentLocalAnswer)
+{
+  Fixture fixture("hi!", 4, "", true);
+  auto    client = fixture.client();
+
+  // Port 1 refuses. Serving it here would answer from the wrong stage of the
+  // pipeline, which is worse than failing.
+  client.Post("/control/rules", json{{"session_id", "c"}, {"next_hop", "gone"}, {"next_hop_url", "127.0.0.1:1"}, {"generation", 1}}.dump(), "application/json");
+
+  const auto response = client.Post("/v1/completions", json{{"prompt", "Say:"}, {"session_id", "c"}, {"max_tokens", 1}}.dump(), "application/json");
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, 502) << response->body;
 }
