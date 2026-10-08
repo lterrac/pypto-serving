@@ -38,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--pypto-build-dir", default="build_output/bridge")
+    parser.add_argument(
+        "--forwarding",
+        action="store_true",
+        help="hold routing rules published to /control/rules and forward the sessions they name",
+    )
     parser.add_argument("--prompt", action="append", default=[], help="generate for this prompt and exit; repeatable")
     parser.add_argument("--generate-config", default="", help='JSON, e.g. \'{"max_new_tokens": 8}\'')
     return parser

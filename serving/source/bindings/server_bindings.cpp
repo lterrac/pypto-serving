@@ -8,6 +8,7 @@
 #include <serving/engine/engine.hpp>
 #include <serving/model/chat_template.hpp>
 #include <serving/model/tokenizer.hpp>
+#include <serving/replica/rule_table.hpp>
 #include <serving/server/http_server.hpp>
 
 namespace py = pybind11;
@@ -33,14 +34,17 @@ void bindServer(py::module_ &m)
     .def_readwrite("model_id", &server::ServerConfig::modelId);
 
   py::class_<server::HttpServer, std::unique_ptr<server::HttpServer, GilReleasingDelete>>(m, "HttpServer", "OpenAI-compatible HTTP front end over an Engine, on its own threads.")
-    .def(py::init<server::ServerConfig, engine::Engine &, const model::TokenizerAdapter &, const model::ChatTemplate *>(),
+    .def(py::init<server::ServerConfig, engine::Engine &, const model::TokenizerAdapter &, const model::ChatTemplate *, replica::RuleTable *>(),
          py::arg("config"),
          py::arg("engine"),
          py::arg("tokenizer"),
          py::arg("chat_template") = nullptr,
+         py::arg("rules")         = nullptr,
          py::keep_alive<1, 3>(),
          py::keep_alive<1, 4>(),
-         py::keep_alive<1, 5>())
+         py::keep_alive<1, 5>(),
+         py::keep_alive<1, 6>())
+    .def_property_readonly("forwarded", &server::HttpServer::forwarded, "Requests relayed to a next hop rather than served here.")
     .def("start", &server::HttpServer::start, py::call_guard<py::gil_scoped_release>())
     .def("stop", &server::HttpServer::stop, py::call_guard<py::gil_scoped_release>())
     .def_property_readonly("bound_port", &server::HttpServer::boundPort);

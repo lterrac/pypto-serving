@@ -20,6 +20,8 @@ servingTestSources = files(
   'coordinator/test_rule_message.cpp',
   'coordinator/test_config_file.cpp',
   'coordinator/test_map_routing.cpp',
+  'replica/test_rule_table.cpp',
+  'replica/test_pipeline.cpp',
   'router/test_router_server.cpp',
   'model/test_chat_template.cpp',
 )

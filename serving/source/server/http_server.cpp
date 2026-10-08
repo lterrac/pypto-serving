@@ -1,5 +1,7 @@
 #include <serving/server/http_server.hpp>
 
+#include <serving/router/proxy.hpp>
+
 #include <chrono>
 #include <map>
 #include <stdexcept>
@@ -98,11 +100,12 @@ std::string mapFinishReason(const std::string &reason)
   return it == mapping.end() ? "stop" : it->second;
 }
 
-HttpServer::HttpServer(ServerConfig config, engine::Engine &engine, const model::TokenizerAdapter &tokenizer, const model::ChatTemplate *chatTemplate)
+HttpServer::HttpServer(ServerConfig config, engine::Engine &engine, const model::TokenizerAdapter &tokenizer, const model::ChatTemplate *chatTemplate, replica::RuleTable *rules)
   : _config(std::move(config)),
     _engine(engine),
     _tokenizer(tokenizer),
     _chatTemplate(chatTemplate),
+    _rules(rules),
     _server(std::make_unique<httplib::Server>())
 {
   registerRoutes();
@@ -138,6 +141,123 @@ void HttpServer::stop()
   if (_thread.joinable()) { _thread.join(); }
 }
 
+/// The coordinator's half of Option B, over HTTP: it publishes where a session
+/// goes next and withdraws it when the path is replanned. A deployment with a
+/// control plane puts the same messages on a channel; the table is the same
+/// either way.
+void HttpServer::registerControlRoutes()
+{
+  _server->Post("/control/rules", [this](const httplib::Request &request, httplib::Response &response) {
+    json body;
+    try
+    {
+      body = json::parse(request.body);
+    }
+    catch (const std::exception &)
+    {
+      sendError(response, "request body is not valid JSON", 400);
+      return;
+    }
+    if (!body.contains("session_id") || !body.at("session_id").is_string() || !body.contains("next_hop") || !body.at("next_hop").is_string())
+    {
+      sendError(response, "a rule needs 'session_id' and 'next_hop'", 400);
+      return;
+    }
+
+    coordinator::RulePublish rule;
+    rule.sessionId       = body.at("session_id").get<std::string>();
+    rule.nextHopName     = body.at("next_hop").get<std::string>();
+    rule.nextHopInstance = body.value("next_hop_instance", 0ULL);
+    rule.generation      = body.value("generation", 0ULL);
+    const auto endpoint  = body.value("next_hop_url", std::string{});
+
+    const replica::RuleOutcome outcome = _rules->apply(rule, endpoint);
+    // Reported rather than swallowed: a coordinator whose rule was ignored as
+    // stale needs to know it did not take.
+    sendJson(response, json{{"outcome", replica::ruleOutcomeName(outcome)}, {"session_id", rule.sessionId}});
+  });
+
+  _server->Post("/control/rules/revoke", [this](const httplib::Request &request, httplib::Response &response) {
+    json body;
+    try
+    {
+      body = json::parse(request.body);
+    }
+    catch (const std::exception &)
+    {
+      sendError(response, "request body is not valid JSON", 400);
+      return;
+    }
+    coordinator::RuleRevoke revoke;
+    revoke.sessionId  = body.value("session_id", std::string{});
+    revoke.generation = body.value("generation", 0ULL);
+
+    const replica::RuleOutcome outcome = _rules->revoke(revoke);
+    sendJson(response, json{{"outcome", replica::ruleOutcomeName(outcome)}, {"session_id", revoke.sessionId}});
+  });
+
+  // What this replica believes: a forwarding decision nobody can inspect is
+  // one nobody can debug.
+  _server->Get("/control/rules", [this](const httplib::Request &request, httplib::Response &response) {
+    const std::string               session = request.get_param_value("session");
+    const std::optional<replica::NextHop> hop = _rules->peek(session);
+    if (!hop.has_value())
+    {
+      sendJson(response, json{{"session_id", session}, {"next_hop", nullptr}});
+      return;
+    }
+    sendJson(response,
+             json{{"session_id", session}, {"next_hop", hop->name}, {"next_hop_url", hop->endpoint}, {"next_hop_instance", hop->instance}, {"generation", hop->generation}});
+  });
+}
+
+bool HttpServer::forwardTo(const replica::NextHop &hop, const httplib::Request &request, httplib::Response &response, const std::string &path, const std::string &sessionId)
+{
+  // Addressed by instance with no HTTP endpoint: a control plane would route
+  // this and this replica cannot. Serving it here is the honest fallback.
+  if (hop.endpoint.empty()) { return false; }
+
+  std::string host = hop.endpoint;
+  int         port = 80;
+  if (const auto scheme = host.find("://"); scheme != std::string::npos) { host = host.substr(scheme + 3); }
+  if (const auto colon = host.rfind(':'); colon != std::string::npos)
+  {
+    try
+    {
+      port = std::stoi(host.substr(colon + 1));
+      host = host.substr(0, colon);
+    }
+    catch (const std::exception &)
+    {
+      return false;
+    }
+  }
+
+  httplib::Client client(host, port);
+  client.set_connection_timeout(5, 0);
+  client.set_read_timeout(300, 0);
+
+  httplib::Headers headers;
+  headers.emplace(std::string(router::SESSION_HEADER), sessionId);
+  const auto upstream = client.Post(path, headers, request.body, "application/json");
+  if (upstream == nullptr)
+  {
+    // Falling back to serving locally would answer from the wrong stage of the
+    // pipeline, so the caller has to see this.
+    sendError(response, "next hop " + hop.name + " is unreachable", 502);
+    return true;
+  }
+
+  _forwarded.fetch_add(1);
+  response.status = upstream->status;
+  response.set_header(std::string(router::SESSION_HEADER).c_str(), sessionId.c_str());
+  response.set_header("x-forwarded-by", _config.modelId.c_str());
+  std::string contentType = "application/json";
+  if (upstream->has_header("Content-Type")) { contentType = upstream->get_header_value("Content-Type"); }
+  response.set_content(upstream->body, contentType);
+  return true;
+}
+
 void HttpServer::registerRoutes()
 {
   _server->Get("/health", [this](const httplib::Request &, httplib::Response &response) {
@@ -164,6 +284,16 @@ void HttpServer::registerRoutes()
     {
       sendError(response, "request body is not valid JSON", 400);
       return;
+    }
+
+    // Option B: if a coordinator has said where this session goes next, it
+    // goes there. No round trip to the coordinator -- that is the whole point
+    // of publishing the rule ahead of the request.
+    if (_rules != nullptr)
+    {
+      const std::string               sessionId = router::resolveSessionId(request, request.body);
+      const std::optional<replica::NextHop> hop = _rules->lookup(sessionId);
+      if (hop.has_value() && forwardTo(*hop, request, response, chat ? "/v1/chat/completions" : "/v1/completions", sessionId)) { return; }
     }
 
     // Templating and tokenization happen here, on the handler thread, so they
@@ -362,6 +492,8 @@ void HttpServer::registerRoutes()
 
   _server->Post("/v1/completions", [completions](const httplib::Request &request, httplib::Response &response) { completions(request, response, false); });
   _server->Post("/v1/chat/completions", [completions](const httplib::Request &request, httplib::Response &response) { completions(request, response, true); });
+
+  if (_rules != nullptr) { registerControlRoutes(); }
 }
 
 } // namespace serving::server
