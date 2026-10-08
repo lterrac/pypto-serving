@@ -9,6 +9,7 @@
  * serving's cancellation path.
  */
 
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -45,22 +46,52 @@ inline constexpr const char *SESSION_HEADER = "x-session-id";
  */
 [[nodiscard]] std::string resolveSessionId(const httplib::Request &request, const std::string &body);
 
-/// Routes one request to a replica and relays the response back.
+/**
+ * Routes one request to a replica and relays the response back.
+ *
+ * A replica that dies before answering is retried on another replica of the
+ * same partition -- the deck's "re-send its in-flight requests". The retry is
+ * only ever attempted while **nothing has reached the client**: once the
+ * upstream status is known the relay has begun, and a second attempt would put
+ * two answers on one connection. That line is not a heuristic, it is the whole
+ * of the correctness argument.
+ *
+ * A replica that dies *during* the answer cannot be retried. The stream is
+ * aborted rather than ended cleanly, because a truncated answer that looks
+ * like a complete one is worse than a visible failure -- which is the deck's
+ * complaint about the Python stack, in the router rather than the engine.
+ */
 class ReplicaProxy
 {
   public:
 
   /// `registryMutex` guards `registry` against the health-monitor thread.
-  ReplicaProxy(ReplicaRegistry &registry, std::mutex &registryMutex, double connectTimeoutSeconds, double requestTimeoutSeconds);
+  /// `maxAttempts` counts the first try, so 1 disables retrying.
+  ReplicaProxy(ReplicaRegistry &registry, std::mutex &registryMutex, double connectTimeoutSeconds, double requestTimeoutSeconds, int maxAttempts = 3);
 
   void forward(const httplib::Request &request, httplib::Response &response, const std::string &path);
 
+  /// Requests that reached a second replica because the first was unreachable.
+  [[nodiscard]] int resends() const { return _resends.load(); }
+  /// Answers cut short by a replica dying mid-stream. These cannot be retried.
+  [[nodiscard]] int truncated() const { return _truncated.load(); }
+
   private:
+
+  struct Attempt;
+
+  /// One attempt against one replica, returning once its status is known or
+  /// the attempt has provably failed without one.
+  [[nodiscard]] Attempt send(const ReplicaSpec &replica, const httplib::Request &request, const std::string &body, const std::string &path);
 
   ReplicaRegistry &_registry;
   std::mutex      &_registryMutex;
   double           _connectTimeoutSeconds;
   double           _requestTimeoutSeconds;
+  int              _maxAttempts;
+
+  std::atomic<int> _resends{0};
+  std::atomic<int> _truncated{0};
 };
 
 } // namespace serving::router

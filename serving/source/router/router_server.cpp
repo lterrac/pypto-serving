@@ -18,7 +18,7 @@ RouterServer::RouterServer(RouterServerConfig config, const std::vector<ReplicaS
   : _config(std::move(config)),
     _sessions(_config.sessionTtlSeconds),
     _registry(RoutingConfig{_config.sessionTtlSeconds, _config.affinitySlack}, _sessions, replicas),
-    _proxy(_registry, _registryMutex, _config.connectTimeoutSeconds, _config.requestTimeoutSeconds),
+    _proxy(_registry, _registryMutex, _config.connectTimeoutSeconds, _config.requestTimeoutSeconds, _config.maxAttempts),
     _server(std::make_unique<httplib::Server>())
 {
   registerRoutes();

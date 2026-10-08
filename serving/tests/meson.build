@@ -7,6 +7,7 @@ servingTestSources = files(
   'infra/test_capacity.cpp',
   'infra/test_scaling.cpp',
   'infra/test_launcher.cpp',
+  'infra/test_monitor.cpp',
   'memory/test_kv_cache.cpp',
   'sched/test_scheduler.cpp',
   'engine/test_detokenizer.cpp',

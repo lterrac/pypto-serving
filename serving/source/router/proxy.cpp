@@ -12,11 +12,15 @@
 #include <set>
 #include <thread>
 
+#include <cstdio>
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 namespace serving::router
 {
+
+using ChunkQueue = util::BlockingQueue<std::string>;
 
 namespace
 {
@@ -24,7 +28,6 @@ namespace
 /// Chunks in flight from the replica to the client. Bounded, so a slow client
 /// stops the upstream rather than growing without limit.
 constexpr size_t MAX_CHUNKS_IN_FLIGHT = 256;
-using ChunkQueue                      = util::BlockingQueue<std::string>;
 
 using Json = nlohmann::json;
 
@@ -90,63 +93,58 @@ std::string resolveSessionId(const httplib::Request &request, const std::string 
   return newSessionId();
 }
 
-ReplicaProxy::ReplicaProxy(ReplicaRegistry &registry, std::mutex &registryMutex, double connectTimeoutSeconds, double requestTimeoutSeconds)
+ReplicaProxy::ReplicaProxy(ReplicaRegistry &registry, std::mutex &registryMutex, double connectTimeoutSeconds, double requestTimeoutSeconds, int maxAttempts)
   : _registry(registry),
     _registryMutex(registryMutex),
     _connectTimeoutSeconds(connectTimeoutSeconds),
-    _requestTimeoutSeconds(requestTimeoutSeconds)
+    _requestTimeoutSeconds(requestTimeoutSeconds),
+    _maxAttempts(std::max(1, maxAttempts))
 {}
 
-void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &response, const std::string &path)
+/// One attempt against one replica, up to the point where the answer starts.
+struct ReplicaProxy::Attempt
 {
-  const std::string body      = request.body;
-  const std::string sessionId = resolveSessionId(request, body);
+  std::shared_ptr<ChunkQueue>       queue;
+  std::shared_ptr<int>              status;
+  std::shared_ptr<httplib::Headers> headers;
+  std::shared_ptr<bool>             transportFailed;
 
-  ReplicaSpec replica;
+  /// Nothing reached the client and nothing will: safe to try elsewhere.
+  [[nodiscard]] bool unreachable() const { return *transportFailed && *status == 0; }
+};
+
+/// Fires the request at one replica and returns once its status is known --
+/// or once the attempt has provably failed without one. The body keeps
+/// arriving on `queue` after this returns.
+ReplicaProxy::Attempt ReplicaProxy::send(const ReplicaSpec &replica, const httplib::Request &request, const std::string &body, const std::string &path)
+{
+  httplib::Headers requestHeaders;
+  for (const auto &[key, value] : request.headers)
   {
-    const std::lock_guard<std::mutex> lock(_registryMutex);
-    try
-    {
-      replica = _registry.select(sessionId).replica;
-    }
-    catch (const NoReplicaAvailable &)
-    {
-      sendError(response, 503, "no serving replica is currently routable", sessionId);
-      return;
-    }
-    _registry.acquire(replica.name);
+    if (!dropFromRequest(key)) { requestHeaders.emplace(key, value); }
   }
 
-  // Released exactly once, however the relay ends.
-  auto released    = std::make_shared<std::once_flag>();
-  auto releaseOnce = [this, replica, released] {
-    std::call_once(*released, [this, &replica] {
-      const std::lock_guard<std::mutex> lock(_registryMutex);
-      _registry.release(replica.name);
-    });
-  };
-
-  auto queue = std::make_shared<ChunkQueue>(MAX_CHUNKS_IN_FLIGHT);
+  Attempt attempt;
+  attempt.queue           = std::make_shared<ChunkQueue>(MAX_CHUNKS_IN_FLIGHT);
+  attempt.status          = std::make_shared<int>(0);
+  attempt.headers         = std::make_shared<httplib::Headers>();
+  attempt.transportFailed = std::make_shared<bool>(false);
 
   // The upstream status and headers must be known before the body is relayed,
   // so the thread signals once the response handler has fired.
-  auto headersReady    = std::make_shared<std::promise<void>>();
-  auto headersFuture   = headersReady->get_future();
-  auto upstreamStatus  = std::make_shared<int>(0);
-  auto upstreamHeaders = std::make_shared<httplib::Headers>();
-  auto transportFailed = std::make_shared<bool>(false);
-  auto signalled       = std::make_shared<std::once_flag>();
+  auto headersReady  = std::make_shared<std::promise<void>>();
+  auto headersFuture = headersReady->get_future();
+  auto signalled     = std::make_shared<std::once_flag>();
 
   const std::string host           = replica.host;
   const int         port           = replica.port;
   const double      connectTimeout = _connectTimeoutSeconds;
   const double      requestTimeout = _requestTimeoutSeconds;
 
-  httplib::Headers upstreamRequestHeaders;
-  for (const auto &[key, value] : request.headers)
-  {
-    if (!dropFromRequest(key)) { upstreamRequestHeaders.emplace(key, value); }
-  }
+  auto queue           = attempt.queue;
+  auto upstreamStatus  = attempt.status;
+  auto upstreamHeaders = attempt.headers;
+  auto transportFailed = attempt.transportFailed;
 
   std::thread upstream([=] {
     httplib::Client client(host, port);
@@ -158,7 +156,7 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
     upstreamRequest.method  = "POST";
     upstreamRequest.path    = path;
     upstreamRequest.body    = body;
-    upstreamRequest.headers = upstreamRequestHeaders;
+    upstreamRequest.headers = requestHeaders;
     upstreamRequest.set_header("Content-Type", "application/json");
 
     upstreamRequest.response_handler = [=](const httplib::Response &upstreamResponse) {
@@ -185,17 +183,73 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
   upstream.detach();
 
   headersFuture.wait();
+  return attempt;
+}
 
-  if (*transportFailed && *upstreamStatus == 0)
+void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &response, const std::string &path)
+{
+  const std::string body      = request.body;
+  const std::string sessionId = resolveSessionId(request, body);
+
+  ReplicaSpec           replica;
+  Attempt               attempt;
+  std::function<void()> releaseOnce;
+
+  for (int tries = 0; tries < _maxAttempts; ++tries)
   {
-    // Any transport failure means a dead replica: take it out of rotation so the
-    // next request does not repeat the wait.
+    {
+      const std::lock_guard<std::mutex> lock(_registryMutex);
+      try
+      {
+        replica = _registry.select(sessionId).replica;
+      }
+      catch (const NoReplicaAvailable &)
+      {
+        // 503 only when there was never anywhere to go. Once we have actually
+        // tried a replica the failure is an upstream one, and 502 says so --
+        // the two are different enough to be worth telling apart in a log.
+        if (tries == 0) { sendError(response, 503, "no serving replica is currently routable", sessionId); }
+        else { sendError(response, 502, "no replica of this partition could be reached", sessionId); }
+        return;
+      }
+      _registry.acquire(replica.name);
+    }
+
+    // Released exactly once, however the relay ends.
+    auto              released = std::make_shared<std::once_flag>();
+    const std::string held     = replica.name;
+    releaseOnce                = [this, held, released] {
+      std::call_once(*released, [this, &held] {
+        const std::lock_guard<std::mutex> lock(_registryMutex);
+        _registry.release(held);
+      });
+    };
+
+    attempt = send(replica, request, body, path);
+
+    if (!attempt.unreachable()) { break; }
+
+    // Nothing has reached the client, so another replica may still answer this
+    // request. Take this one out of rotation first: `select` then skips it, and
+    // the session's pin moves with it.
     releaseOnce();
     {
       const std::lock_guard<std::mutex> lock(_registryMutex);
       _registry.setReady(replica.name, false);
     }
-    queue->close();
+    attempt.queue->close();
+
+    if (tries + 1 < _maxAttempts) { _resends.fetch_add(1); }
+  }
+
+  auto queue           = attempt.queue;
+  auto upstreamStatus  = attempt.status;
+  auto upstreamHeaders = attempt.headers;
+  auto transportFailed = attempt.transportFailed;
+
+  if (attempt.unreachable())
+  {
+    // Every attempt was spent and none of them answered.
     sendError(response, 502, "replica " + replica.name + " is unreachable", sessionId);
     return;
   }
@@ -220,11 +274,28 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
     releaseOnce();
   });
 
-  response.set_chunked_content_provider(contentType, [queue, releaseOnce, closeOnDestroy](size_t, httplib::DataSink &sink) {
+  auto              truncated   = &_truncated;
+  const std::string replicaName = replica.name;
+  response.set_chunked_content_provider(contentType, [queue, releaseOnce, closeOnDestroy, transportFailed, truncated, replicaName](size_t, httplib::DataSink &sink) {
     auto chunk = queue->pop();
     if (!chunk.has_value())
     {
       releaseOnce();
+      if (*transportFailed)
+      {
+        // The replica died part-way through its answer. Terminating the
+        // chunked body here would hand the client a short answer that is
+        // framed as a complete one, which is worse than a visible failure --
+        // returning false drops the connection instead, so every client sees
+        // a truncated transfer whether or not it parses the payload.
+        truncated->fetch_add(1);
+        // Said out loud: a client may or may not notice a broken transfer --
+        // curl reports it, a urllib line-iterator does not -- and an operator
+        // who is never told is exactly the fault the deck names in the Python
+        // stack.
+        std::fprintf(stderr, "[router] answer cut short for %s: the replica stopped mid-stream\n", replicaName.c_str());
+        return false;
+      }
       sink.done();
       return true;
     }
