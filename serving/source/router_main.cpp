@@ -31,7 +31,8 @@ namespace
                "  --affinity-slack N         extra outstanding requests affinity tolerates (default: 8)\n"
                "  --health-interval N        seconds between health polls (default: 5)\n"
                "  --connect-timeout N        seconds to reach a replica (default: 2)\n"
-               "  --request-timeout N        seconds for one generation (default: 300)\n",
+               "  --request-timeout N        seconds for one generation (default: 300)\n"
+               "  --max-attempts N           replicas to try when one is unreachable (default: 3, 1 disables)\n",
                argv0);
   std::exit(code);
 }
@@ -79,6 +80,7 @@ int main(int argc, char **argv)
       else if (arg == "--health-interval") { config.healthIntervalSeconds = std::stod(next()); }
       else if (arg == "--connect-timeout") { config.connectTimeoutSeconds = std::stod(next()); }
       else if (arg == "--request-timeout") { config.requestTimeoutSeconds = std::stod(next()); }
+      else if (arg == "--max-attempts") { config.maxAttempts = std::stoi(next()); }
       else
       {
         std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());

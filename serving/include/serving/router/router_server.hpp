@@ -32,8 +32,12 @@ struct RouterServerConfig
   double healthIntervalSeconds = 5.0;
   double connectTimeoutSeconds = 2.0;
   double requestTimeoutSeconds = 300.0;
-  double sessionTtlSeconds     = 1800.0;
-  int    affinitySlack         = 8;
+  /// Replicas a request may be tried on when one is unreachable, counting the
+  /// first. 1 disables re-sending. Only ever applied before any of the answer
+  /// has reached the client.
+  int    maxAttempts       = 3;
+  double sessionTtlSeconds = 1800.0;
+  int    affinitySlack     = 8;
 
   /// Start the background health poller. A test that drives `probeOnce()`
   /// itself turns this off: two probers racing means an in-flight cycle can
@@ -63,6 +67,11 @@ class RouterServer
 
   [[nodiscard]] ReplicaRegistry &registry() { return _registry; }
   [[nodiscard]] std::mutex      &registryMutex() { return _registryMutex; }
+
+  /// Requests re-sent to another replica because the first was unreachable.
+  [[nodiscard]] int proxyResends() const { return _proxy.resends(); }
+  /// Answers cut short by a replica dying mid-stream; these cannot be retried.
+  [[nodiscard]] int proxyTruncated() const { return _proxy.truncated(); }
 
   private:
 

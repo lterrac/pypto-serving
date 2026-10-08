@@ -65,6 +65,10 @@ class StubReplica
       }
       auto sent = std::make_shared<int>(0);
       response.set_chunked_content_provider("text/event-stream", [this, sent](size_t, httplib::DataSink &sink) {
+        // Dies part-way through its own answer, the way a replica whose
+        // process is killed mid-generation does: headers already sent, some
+        // body already relayed, then nothing.
+        if (dieAfterChunks >= 0 && *sent >= dieAfterChunks) { return false; }
         if (*sent >= 3)
         {
           const std::string done = "data: [DONE]\n\n";
@@ -81,6 +85,9 @@ class StubReplica
   }
 
   ~StubReplica() { stop(); }
+
+  /// Abort the stream after this many chunks; -1 answers normally.
+  int dieAfterChunks = -1;
 
   void start()
   {
@@ -387,4 +394,117 @@ TEST(RouterServerTest, ReturnsBadGatewayWhenAReplicaIsUnreachable)
   const std::lock_guard<std::mutex> lock(fixture.router->registryMutex());
   const int                         ready = fixture.router->registry().readyCount();
   EXPECT_LT(ready, 2);
+}
+
+// ---------------------------------------------------------------------------
+// re-sending an in-flight request (M3)
+// ---------------------------------------------------------------------------
+
+TEST(RouterServerTest, ResendsToAnotherReplicaWhenTheFirstIsGone)
+{
+  Fixture fixture;
+  auto    client = fixture.client();
+
+  // One is gone but still in the table, which is the window a health poller
+  // cannot close: the request arrives between the death and the next probe.
+  fixture.a.stop();
+
+  // Whichever one is picked first, the answer comes from the survivor rather
+  // than as an error to the client.
+  for (int i = 0; i < 4; ++i)
+  {
+    const auto response = client.Post("/v1/completions", Json{{"prompt", "x"}, {"session_id", "s" + std::to_string(i)}}.dump(), "application/json");
+    ASSERT_NE(response, nullptr);
+    EXPECT_EQ(response->status, 200) << response->body;
+    EXPECT_NE(response->body.find("replica-b"), std::string::npos) << response->body;
+  }
+  EXPECT_GT(fixture.b.received.load(), 0);
+}
+
+TEST(RouterServerTest, TheDeadReplicaLeavesRotationRatherThanBeingRetriedForever)
+{
+  Fixture fixture;
+  auto    client = fixture.client();
+  fixture.a.stop();
+
+  const auto first = client.Post("/v1/completions", Json{{"prompt", "x"}}.dump(), "application/json");
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->status, 200);
+
+  // The resend is a recovery, not a routing policy: the replica that failed is
+  // out, so the next request does not pay the connect timeout again.
+  const std::lock_guard<std::mutex> lock(fixture.router->registryMutex());
+  EXPECT_EQ(fixture.router->registry().readyCount(), 1);
+}
+
+TEST(RouterServerTest, ARetryIsNotAttemptedOnceTheAnswerHasBegun)
+{
+  Fixture fixture;
+  auto    client = fixture.client();
+
+  // A streaming answer that the replica abandons part-way. Nothing can be
+  // retried here: the client already holds a status and some bytes, and a
+  // second attempt would put two answers on one connection.
+  const auto response = client.Post("/v1/completions", Json{{"prompt", "x"}, {"stream", true}}.dump(), "application/json");
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, 200);
+  // Exactly one replica saw it: no duplicate work was done.
+  EXPECT_EQ(fixture.a.received.load() + fixture.b.received.load(), 1);
+}
+
+TEST(RouterServerTest, MaxAttemptsOfOneDisablesResending)
+{
+  StubReplica a{"replica-a"};
+  StubReplica b{"replica-b"};
+  a.start();
+  b.start();
+
+  RouterServerConfig config;
+  config.host                  = "127.0.0.1";
+  config.port                  = 0;
+  config.startHealthPoller     = false;
+  config.healthIntervalSeconds = 3600.0;
+  config.connectTimeoutSeconds = 2.0;
+  config.maxAttempts           = 1;
+  RouterServer router(config, std::vector<ReplicaSpec>{a.spec(), b.spec()});
+  router.start();
+
+  a.stop();
+  httplib::Client client("127.0.0.1", router.boundPort());
+  client.set_read_timeout(10, 0);
+
+  // Four sessions, so both replicas are picked. With retrying off, the ones
+  // routed to the dead replica fail instead of being rescued.
+  int failures = 0;
+  for (int i = 0; i < 4; ++i)
+  {
+    const auto response = client.Post("/v1/completions", Json{{"prompt", "x"}, {"session_id", "n" + std::to_string(i)}}.dump(), "application/json");
+    if (response != nullptr && response->status == 502) { failures += 1; }
+  }
+  EXPECT_GT(failures, 0) << "with max_attempts 1 a dead replica should surface as an error";
+
+  router.stop();
+  b.stop();
+}
+
+TEST(RouterServerTest, AStreamCutShortIsNotFramedAsAComplete)
+{
+  Fixture fixture;
+  // Both die after one chunk, so whichever is picked cuts its answer short.
+  fixture.a.dieAfterChunks = 1;
+  fixture.b.dieAfterChunks = 1;
+  auto client              = fixture.client();
+
+  const auto response = client.Post("/v1/completions", Json{{"prompt", "x"}, {"stream", true}}.dump(), "application/json");
+
+  // Nothing can be retried -- the client already holds a status and some
+  // bytes. But terminating the chunked body here would hand back a short
+  // answer framed as a whole one, which is the exact fault the deck names in
+  // the Python stack, so the transfer is broken instead.
+  //
+  // Whether a client *notices* is the client's business: httplib reports the
+  // broken transfer, curl reports it, a urllib line-iterator silently stops.
+  // What is asserted here is the server's side of that contract.
+  if (response != nullptr) { ADD_FAILURE() << "a cut-short stream came back as a complete response, status " << response->status; }
+  EXPECT_GT(fixture.router->proxyTruncated(), 0) << "the truncation was not counted";
 }
