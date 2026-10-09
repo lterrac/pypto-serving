@@ -251,7 +251,8 @@ tokenizer tests that need a model directory.
 ## Gaps
 
 What the Python stack serves and this one does not, measured against `pypto_serving/` at
-`3f1dbd9`, the revision the port was made from. No request field is accepted and ignored:
+`3f1dbd9`, the revision the port was made from. Upstream has moved since; tool
+calling landed there and is a gap this list does not yet name individually. No request field is accepted and ignored:
 everything the HTTP layer parses reaches something that acts on it.
 
 Ported but unreachable — the code and its tests are here, nothing turns them on:

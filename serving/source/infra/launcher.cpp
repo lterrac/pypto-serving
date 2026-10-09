@@ -93,7 +93,9 @@ SupervisionReport Supervisor::service()
       const Readiness readiness = _probe.check(*replica);
       if (readiness == Readiness::Ready)
       {
-        _map.setPhase(action.replica, Phase::Active);
+        // To the phase the deployment asked for, not always Active: a spare is
+        // started so it can wait, and promoting it to serving would defeat it.
+        _map.setPhase(action.replica, replica->desiredPhase == Phase::Reserved ? Phase::Reserved : Phase::Active);
         _attempts.erase(action.replica);
         report.promoted.push_back(action.replica);
         continue;
@@ -123,6 +125,20 @@ SupervisionReport Supervisor::service()
         _attempts.erase(action.replica);
       }
       else { report.retrying.push_back(action.replica); }
+      continue;
+    }
+
+    // Already serving: a reserved spare being activated, which is the whole
+    // point of keeping one. No launch, no model load -- one phase change.
+    //
+    // The probe is the right question rather than asking the starter whether it
+    // has a pid: what matters is that the replica can answer, not who started
+    // it. A replica that was never started cannot, so this costs one probe.
+    if (_probe.check(*replica) == Readiness::Ready)
+    {
+      _map.setPhase(action.replica, replica->desiredPhase == Phase::Reserved ? Phase::Reserved : Phase::Active);
+      _attempts.erase(action.replica);
+      report.promoted.push_back(action.replica);
       continue;
     }
 

@@ -31,6 +31,7 @@ void bindInfra(py::module_ &m)
   py::enum_<infra::Phase>(m, "Phase", "Where a replica is in its life.")
     .value("PENDING", infra::Phase::Pending, "wanted by the deployment, not started")
     .value("ACTIVE", infra::Phase::Active)
+    .value("RESERVED", infra::Phase::Reserved, "up, loaded and healthy, deliberately not routed to: a warm spare")
     .value("DRAINING", infra::Phase::Draining, "finishing what it has; still holds its devices")
     .value("DEAD", infra::Phase::Dead, "lost rather than drained; its devices are free again");
 

@@ -258,3 +258,119 @@ TEST(RecoveryTest, CapacityLostToADeathCanBeRebuiltElsewhere)
   EXPECT_EQ(provider.available(serving::infra::CapacityRequest{0, 1, "", 0}), 8);
   EXPECT_TRUE(validate(map).empty());
 }
+
+// ---------------------------------------------------------------------------
+// warm capacity: a spare that is up, loaded, and deliberately not routed to
+// ---------------------------------------------------------------------------
+
+TEST(WarmSpareTest, AStartedSpareWaitsReservedRatherThanServing)
+{
+  StateMap map = fleet(1);
+  Replica  spare;
+  spare.name         = "spare";
+  spare.node         = "hg-atlas-01";
+  spare.devices      = {1};
+  spare.phase        = Phase::Pending;
+  spare.desiredPhase = Phase::Reserved;
+  map.addReplica(spare);
+
+  ScriptedProbe   probe;
+  CountingStarter starter;
+  Supervisor      supervisor(map, starter, probe);
+
+  // Not up yet, so it is launched like any other replica.
+  probe.answers["spare"] = Readiness::Loading;
+  EXPECT_EQ(supervisor.service().started, std::vector<std::string>{"spare"});
+  EXPECT_EQ(map.replica("spare")->phase, Phase::Pending);
+
+  // Now it answers. It is healthy, but the deployment asked for a spare, and
+  // promoting it to serving would defeat the point of keeping one.
+  probe.answers["spare"] = Readiness::Ready;
+  EXPECT_EQ(supervisor.service().promoted, std::vector<std::string>{"spare"});
+  EXPECT_EQ(map.replica("spare")->phase, Phase::Reserved);
+}
+
+TEST(WarmSpareTest, TheAlreadyUpShortcutTrustsTheProbe)
+{
+  StateMap map = fleet(1);
+  Replica  ghost;
+  ghost.name         = "ghost";
+  ghost.node         = "hg-atlas-01";
+  ghost.devices      = {1};
+  ghost.phase        = Phase::Pending;
+  ghost.desiredPhase = Phase::Active;
+  map.addReplica(ghost);
+
+  ScriptedProbe   probe; // says Ready for anything it was not told about
+  CountingStarter starter;
+  Supervisor      supervisor(map, starter, probe);
+
+  // A probe that claims a never-started replica is serving will have it
+  // adopted without a launch. That is the cost of asking "can it answer?"
+  // rather than "did I start it?", and it is why production pairs the health
+  // check with liveness: LiveAndReadyProbe reports Failed when no process is
+  // there, so this cannot happen behind it.
+  EXPECT_EQ(supervisor.service().promoted, std::vector<std::string>{"ghost"});
+  EXPECT_TRUE(starter.started.empty());
+}
+
+TEST(WarmSpareTest, ActivatingASpareCostsNoLaunch)
+{
+  StateMap map = fleet(1);
+  Replica  spare;
+  spare.name         = "spare";
+  spare.node         = "hg-atlas-01";
+  spare.devices      = {1};
+  spare.phase        = Phase::Reserved;
+  spare.desiredPhase = Phase::Reserved;
+  map.addReplica(spare);
+
+  ScriptedProbe   probe;
+  CountingStarter starter;
+  Supervisor      supervisor(map, starter, probe);
+  ASSERT_TRUE(supervisor.service().empty());
+
+  // The single message.
+  ASSERT_TRUE(map.setDesiredPhase("spare", Phase::Active));
+  EXPECT_EQ(supervisor.service().promoted, std::vector<std::string>{"spare"});
+  EXPECT_EQ(map.replica("spare")->phase, Phase::Active);
+
+  // Nothing was launched: the process was already there, which is the whole
+  // difference between a spare and a cold replica.
+  EXPECT_TRUE(starter.started.empty());
+}
+
+TEST(WarmSpareTest, ASpareHoldsItsCardWhileItWaits)
+{
+  StateMap map = fleet(1);
+  Replica  spare;
+  spare.name    = "spare";
+  spare.node    = "hg-atlas-01";
+  spare.devices = {1};
+  spare.phase   = Phase::Reserved;
+  map.addReplica(spare);
+
+  // It really is holding the card: a loaded model is resident on it.
+  EXPECT_EQ(map.devicesInUse("hg-atlas-01"), (std::vector<int>{0, 1}));
+  EXPECT_TRUE(validate(map).empty());
+}
+
+TEST(WarmSpareTest, ASpareThatDiesWhileWaitingIsNoticed)
+{
+  StateMap map = fleet(1);
+  Replica  spare;
+  spare.name    = "spare";
+  spare.node    = "hg-atlas-01";
+  spare.devices = {1};
+  spare.phase   = Phase::Reserved;
+  map.addReplica(spare);
+
+  ScriptedProbe probe;
+  HealthMonitor monitor(map, probe, MonitorConfig{1});
+  probe.answers["spare"] = Readiness::Failed;
+
+  // A spare that died while waiting is worse than no spare, because the
+  // deployment is counting on it being one message away.
+  EXPECT_EQ(monitor.service().lost, std::vector<std::string>{"spare"});
+  EXPECT_EQ(map.replica("spare")->phase, Phase::Dead);
+}

@@ -17,7 +17,9 @@ std::vector<const Replica *> contributing(const StateMap &map, PartitionId parti
   std::vector<const Replica *> members;
   for (const Replica *replica : map.replicasIn(partition))
   {
-    if (replica->phase == Phase::Active || replica->phase == Phase::Pending) { members.push_back(replica); }
+    // A reserved spare counts towards the partition: it is paid for and one
+    // message away, so ordering more capacity while one waits is waste.
+    if (replica->phase == Phase::Active || replica->phase == Phase::Pending || replica->phase == Phase::Reserved) { members.push_back(replica); }
   }
   return members;
 }
