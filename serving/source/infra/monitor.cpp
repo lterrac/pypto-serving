@@ -33,7 +33,9 @@ MonitorReport HealthMonitor::service()
   std::vector<std::string> serving;
   for (const Replica &replica : _map.replicas())
   {
-    if (replica.phase == Phase::Active) { serving.push_back(replica.name); }
+    // Reserved as well as active: a spare that died while waiting is worse
+    // than no spare, because the deployment is counting on it.
+    if (replica.phase == Phase::Active || replica.phase == Phase::Reserved) { serving.push_back(replica.name); }
   }
 
   for (const std::string &name : serving)
@@ -67,7 +69,7 @@ MonitorReport HealthMonitor::service()
   for (auto it = _failures.begin(); it != _failures.end();)
   {
     const Replica *replica = _map.replica(it->first);
-    if (replica == nullptr || replica->phase != Phase::Active) { it = _failures.erase(it); }
+    if (replica == nullptr || (replica->phase != Phase::Active && replica->phase != Phase::Reserved)) { it = _failures.erase(it); }
     else { ++it; }
   }
 

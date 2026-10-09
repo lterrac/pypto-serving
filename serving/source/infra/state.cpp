@@ -27,6 +27,7 @@ const char *phaseName(Phase phase)
   {
   case Phase::Pending: return "pending";
   case Phase::Active: return "active";
+  case Phase::Reserved: return "reserved";
   case Phase::Draining: return "draining";
   case Phase::Dead: return "dead";
   }
@@ -37,14 +38,16 @@ std::optional<Phase> parsePhase(const std::string &text)
 {
   if (text == "pending") { return Phase::Pending; }
   if (text == "active") { return Phase::Active; }
+  if (text == "reserved") { return Phase::Reserved; }
   if (text == "draining") { return Phase::Draining; }
   if (text == "dead") { return Phase::Dead; }
   return std::nullopt;
 }
 
-// A draining replica is still serving what it has, so its KV pages and its
-// devices are still taken; only pending and dead release them.
-bool holdsDevices(Phase phase) { return phase == Phase::Active || phase == Phase::Draining; }
+// A draining replica is still serving what it has and a reserved one is loaded
+// and waiting, so both are holding their devices; only pending and dead have
+// released them.
+bool holdsDevices(Phase phase) { return phase == Phase::Active || phase == Phase::Draining || phase == Phase::Reserved; }
 
 const char *actionName(Action action)
 {
@@ -269,9 +272,11 @@ std::vector<PendingAction> reconcile(const StateMap &map)
     if (r.phase == r.desiredPhase) { continue; }
     switch (r.desiredPhase)
     {
+    case Phase::Reserved:
     case Phase::Active:
-      // A dead replica is not restarted in place: the deployment asks for the
-      // capacity back and the launcher decides where it lands.
+      // Also the path from reserved to active: the supervisor finds the
+      // process already up and only has to change the phase, which is what
+      // makes activating a spare a message rather than a model load.
       actions.push_back({r.name, Action::Start});
       break;
     case Phase::Draining:

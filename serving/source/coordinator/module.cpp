@@ -119,7 +119,9 @@ SyncReport Coordinator::syncLocked()
     const router::ReplicaState *before      = registry->state(replica.name);
     const bool                  wasRoutable = before != nullptr && before->routable();
 
-    registry->setReady(replica.name, replica.phase != infra::Phase::Pending);
+    // Reserved is deliberately not routable: it is loaded and waiting, and
+    // routing to it would make it an ordinary replica rather than a spare.
+    registry->setReady(replica.name, replica.phase != infra::Phase::Pending && replica.phase != infra::Phase::Reserved);
     registry->setDraining(replica.name, replica.phase == infra::Phase::Draining);
 
     const router::ReplicaState *after = registry->state(replica.name);

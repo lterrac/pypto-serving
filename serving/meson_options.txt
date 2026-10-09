@@ -30,6 +30,6 @@ option('platform', type : 'feature', value : 'auto',
        description: 'Build the coordinator module against platform/ (HiCR + TaskR). Needs the platform submodules checked out'
 )
 
-option('cloudr', type : 'feature', value : 'auto',
-       description: 'Build the CloudR-backed capacity provider. Needs extern/CloudR checked out, plus MPI and hwloc'
+option('cloudr', type : 'feature', value : 'disabled',
+       description: 'Build the CloudR-backed capacity provider. Off by default: CloudR is an emulator for exercising the cloud path, not a deployment target, and enabling it drags MPI and hwloc into a build that otherwise needs neither'
 )

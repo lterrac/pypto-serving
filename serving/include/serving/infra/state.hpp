@@ -51,6 +51,17 @@ enum class Phase
 {
   Pending,
   Active,
+  /**
+   * Up, loaded and healthy, deliberately not routed to.
+   *
+   * The deck's warm capacity: *spare worker processes start at launch and sit
+   * idle; activating one is a single message*. The message is one edit to this
+   * phase -- the process is already there, so activation costs no model load,
+   * which is the entire reason the spare exists.
+   *
+   * It holds its devices while it waits, because it really is holding them.
+   */
+  Reserved,
   Draining,
   Dead,
 };

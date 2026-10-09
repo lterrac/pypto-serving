@@ -372,3 +372,19 @@ TEST(ScalingApplyTest, TheLocalNodeStaysSeparateFromTheGrantedOnes)
   EXPECT_EQ(map.devicesInUse("hg-atlas-01"), std::vector<int>{0});
   EXPECT_TRUE(validate(map).empty());
 }
+
+TEST(ScalingPolicyTest, ASpareCountsSoCapacityIsNotOrderedOnTopOfIt)
+{
+  StateMap map = atlas();
+  map.addReplica(replica("p0a", 0, {0}));
+  Replica spare = replica("spare", 0, {1});
+  spare.phase   = Phase::Reserved;
+  map.addReplica(spare);
+
+  ScalingConfig c = config();
+  c.maxReplicas   = 2;
+
+  // The spare is paid for and one message away, so ordering more while it
+  // waits is waste.
+  EXPECT_TRUE(decideScaling(map, busy({{"p0a", 99}}), c).empty());
+}
