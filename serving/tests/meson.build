@@ -4,11 +4,11 @@ servingTestArgs = ['-DSERVING_TEST_FIXTURE_DIR="' + meson.current_source_dir() /
 
 servingTestSources = files(
   'infra/test_state.cpp',
+  'infra/test_document.cpp',
   'infra/test_capacity.cpp',
   'infra/test_scaling.cpp',
   'infra/test_launcher.cpp',
   'infra/test_monitor.cpp',
-  'infra/test_document.cpp',
   'infra/test_deployment_server.cpp',
   'memory/test_kv_cache.cpp',
   'sched/test_scheduler.cpp',
@@ -24,6 +24,7 @@ servingTestSources = files(
   'replica/test_rule_table.cpp',
   'replica/test_pipeline.cpp',
   'router/test_router_server.cpp',
+  'deployer/test_deployment.cpp',
   'model/test_chat_template.cpp',
 )
 

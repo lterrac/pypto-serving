@@ -71,6 +71,20 @@ class ReplicaProxy
 
   void forward(const httplib::Request &request, httplib::Response &response, const std::string &path);
 
+  /**
+   * The same relay, but the first attempt goes to a replica somebody else
+   * chose -- the coordinator, which planned this session's path and wants the
+   * request to enter it at that hop rather than wherever affinity would land.
+   *
+   * Only the first attempt is pinned. A pinned replica that cannot be reached
+   * falls back to the registry, because a request that nothing has answered
+   * yet is still better served by a sibling than failed: the coordinator hears
+   * about the loss separately and replans.
+   *
+   * An empty or unroutable name is the unpinned relay.
+   */
+  void forwardPinned(const httplib::Request &request, httplib::Response &response, const std::string &path, const std::string &preferredReplica);
+
   /// Requests that reached a second replica because the first was unreachable.
   [[nodiscard]] int resends() const { return _resends.load(); }
   /// Answers cut short by a replica dying mid-stream. These cannot be retried.

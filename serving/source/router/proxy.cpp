@@ -3,6 +3,7 @@
 #include <serving/util/blocking_queue.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cctype>
 #include <deque>
@@ -104,13 +105,17 @@ ReplicaProxy::ReplicaProxy(ReplicaRegistry &registry, std::mutex &registryMutex,
 /// One attempt against one replica, up to the point where the answer starts.
 struct ReplicaProxy::Attempt
 {
-  std::shared_ptr<ChunkQueue>       queue;
-  std::shared_ptr<int>              status;
-  std::shared_ptr<httplib::Headers> headers;
-  std::shared_ptr<bool>             transportFailed;
+  std::shared_ptr<ChunkQueue> queue;
+  /// Atomic because the upstream thread keeps writing them after `send()` has
+  /// returned: a transfer that dies mid-body sets `transportFailed` long after
+  /// the caller has read it to decide whether to retry, and the chunked
+  /// provider reads it from a third thread again.
+  std::shared_ptr<std::atomic<int>>  status;
+  std::shared_ptr<httplib::Headers>  headers;
+  std::shared_ptr<std::atomic<bool>> transportFailed;
 
   /// Nothing reached the client and nothing will: safe to try elsewhere.
-  [[nodiscard]] bool unreachable() const { return *transportFailed && *status == 0; }
+  [[nodiscard]] bool unreachable() const { return transportFailed->load() && status->load() == 0; }
 };
 
 /// Fires the request at one replica and returns once its status is known --
@@ -126,9 +131,9 @@ ReplicaProxy::Attempt ReplicaProxy::send(const ReplicaSpec &replica, const httpl
 
   Attempt attempt;
   attempt.queue           = std::make_shared<ChunkQueue>(MAX_CHUNKS_IN_FLIGHT);
-  attempt.status          = std::make_shared<int>(0);
+  attempt.status          = std::make_shared<std::atomic<int>>(0);
   attempt.headers         = std::make_shared<httplib::Headers>();
-  attempt.transportFailed = std::make_shared<bool>(false);
+  attempt.transportFailed = std::make_shared<std::atomic<bool>>(false);
 
   // The upstream status and headers must be known before the body is relayed,
   // so the thread signals once the response handler has fired.
@@ -160,7 +165,7 @@ ReplicaProxy::Attempt ReplicaProxy::send(const ReplicaSpec &replica, const httpl
     upstreamRequest.set_header("Content-Type", "application/json");
 
     upstreamRequest.response_handler = [=](const httplib::Response &upstreamResponse) {
-      *upstreamStatus  = upstreamResponse.status;
+      upstreamStatus->store(upstreamResponse.status);
       *upstreamHeaders = upstreamResponse.headers;
       std::call_once(*signalled, [&] { headersReady->set_value(); });
       return true;
@@ -174,7 +179,7 @@ ReplicaProxy::Attempt ReplicaProxy::send(const ReplicaSpec &replica, const httpl
     httplib::Response upstreamResponse;
     httplib::Error    error = httplib::Error::Success;
     const bool        ok    = client.send(upstreamRequest, upstreamResponse, error);
-    if (!ok || error != httplib::Error::Success) { *transportFailed = true; }
+    if (!ok || error != httplib::Error::Success) { transportFailed->store(true); }
 
     // Unblock the caller even when the handler never fired.
     std::call_once(*signalled, [&] { headersReady->set_value(); });
@@ -186,7 +191,9 @@ ReplicaProxy::Attempt ReplicaProxy::send(const ReplicaSpec &replica, const httpl
   return attempt;
 }
 
-void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &response, const std::string &path)
+void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &response, const std::string &path) { forwardPinned(request, response, path, {}); }
+
+void ReplicaProxy::forwardPinned(const httplib::Request &request, httplib::Response &response, const std::string &path, const std::string &preferredReplica)
 {
   const std::string body      = request.body;
   const std::string sessionId = resolveSessionId(request, body);
@@ -199,9 +206,13 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
   {
     {
       const std::lock_guard<std::mutex> lock(_registryMutex);
+      // The pin applies to the first attempt only; a retry means the chosen hop
+      // did not answer, and the registry knows which sibling can.
+      const ReplicaState *pinned = tries == 0 && !preferredReplica.empty() ? _registry.state(preferredReplica) : nullptr;
       try
       {
-        replica = _registry.select(sessionId).replica;
+        if (pinned != nullptr && pinned->routable()) { replica = pinned->spec; }
+        else { replica = _registry.select(sessionId).replica; }
       }
       catch (const NoReplicaAvailable &)
       {
@@ -254,7 +265,7 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
     return;
   }
 
-  response.status         = *upstreamStatus;
+  response.status         = upstreamStatus->load();
   std::string contentType = "application/json";
   for (const auto &[key, value] : *upstreamHeaders)
   {
@@ -281,7 +292,7 @@ void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &r
     if (!chunk.has_value())
     {
       releaseOnce();
-      if (*transportFailed)
+      if (transportFailed->load())
       {
         // The replica died part-way through its answer. Terminating the
         // chunked body here would hand the client a short answer that is

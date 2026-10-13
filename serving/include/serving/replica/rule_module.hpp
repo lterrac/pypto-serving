@@ -36,10 +36,7 @@ class RuleModule final : public modules::Module
 
   /// Neither the channel nor the table is owned: the replica has one of each
   /// and both outlive this module.
-  RuleModule(system::channels::MessageTypeRegistry &registry,
-             system::channels::Input               &channel,
-             RuleTable                             &table,
-             const size_t                           intervalMs = DEFAULT_RULE_SERVICE_INTERVAL_MS)
+  RuleModule(system::channels::MessageTypeRegistry &registry, system::channels::Input &channel, RuleTable &table, const size_t intervalMs = DEFAULT_RULE_SERVICE_INTERVAL_MS)
     : modules::Module(intervalMs),
       _consumer(registry, channel, table)
   {}

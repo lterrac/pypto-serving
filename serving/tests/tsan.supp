@@ -12,3 +12,13 @@
 # initialisation.
 race:std::ctype<char>::narrow
 race:httplib::ClientImpl::read_response_line
+
+# `std::condition_variable::wait_for(lock, timeout, predicate)` is reported as a
+# double lock of the mutex the predicate loop re-acquires. Not this code: 23
+# lines of a plain cv with a timeout reproduce it on this toolchain (gcc 11 /
+# libstdc++, tsan from the same), and a genuine double lock of a std::mutex
+# would deadlock rather than pass. It appears here because the deployer is the
+# first test to run RouterServer's health poller -- the router's own tests drive
+# `probeOnce()` themselves and turn the poller off.
+mutex:__gthread_mutex_lock
+mutex:serving::router::RouterServer::stop
