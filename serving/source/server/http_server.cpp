@@ -270,6 +270,22 @@ void HttpServer::registerRoutes()
     sendJson(response, json{{"status", "ok"}});
   });
 
+  // What this replica is carrying, for whoever decides about scaling. Not
+  // /metrics: upstream serves Prometheus there, and this is three numbers for
+  // a control plane rather than an observability surface.
+  _server->Get("/control/load", [this](const httplib::Request &, httplib::Response &response) {
+    sendJson(response,
+             json{{"replica", _config.modelId},
+                  {"ready", _engine.isReady()},
+                  // Admitted and not yet generated: the queue a scaling
+                  // decision actually cares about.
+                  {"pending_tokens", _engine.pendingTokenLoad()},
+                  // Rising means the KV pool cannot hold what was admitted, so
+                  // this replica is already failing to serve what it took.
+                  {"preemptions", _engine.preemptions()},
+                  {"forwarded", _forwarded.load()}});
+  });
+
   _server->Get("/v1/models", [this](const httplib::Request &, httplib::Response &response) {
     sendJson(response, json{{"object", "list"}, {"data", json::array({json{{"id", _config.modelId}, {"object", "model"}, {"owned_by", "pypto"}}})}});
   });
