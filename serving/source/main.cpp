@@ -28,6 +28,7 @@
 #include <serving/engine/engine.hpp>
 #include <serving/model/chat_template.hpp>
 #include <serving/model/hf_tokenizer.hpp>
+#include <serving/replica/rule_table.hpp>
 #include <serving/server/http_server.hpp>
 #include <serving/util/signals.hpp>
 
@@ -54,6 +55,10 @@ struct Options
   std::vector<std::string> prompts;
   std::string              generateConfigJson;
   std::string              repoRoot;
+  /// Hold forwarding rules, so a coordinator can route this replica's sessions
+  /// on to the next partition. Off by default: without it the control routes do
+  /// not exist and this is an ordinary single-partition replica.
+  bool forwarding = false;
 };
 
 [[noreturn]] void usage(const char *argv0, int code)
@@ -76,7 +81,8 @@ struct Options
                "  --port N                     bind port (default: 8000)\n"
                "  --prompt TEXT                offline: generate for TEXT and exit (repeatable)\n"
                "  --generate-config JSON       {\"max_new_tokens\":..,\"temperature\":..}\n"
-               "  --repo-root DIR              prepended to sys.path for the Python bridge\n",
+               "  --repo-root DIR              prepended to sys.path for the Python bridge\n"
+               "  --forwarding                 accept routing rules and forward sessions on\n",
                argv0);
   std::exit(code);
 }
@@ -118,6 +124,7 @@ Options parseArgs(int argc, char **argv)
     else if (arg == "--prompt") { options.prompts.push_back(next("prompt")); }
     else if (arg == "--generate-config") { options.generateConfigJson = next("generate-config"); }
     else if (arg == "--repo-root") { options.repoRoot = next("repo-root"); }
+    else if (arg == "--forwarding") { options.forwarding = true; }
     else
     {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
@@ -260,9 +267,13 @@ int runServing(const Options &options)
   serverConfig.host    = options.host;
   serverConfig.port    = options.port;
   serverConfig.modelId = options.servedModelName;
-  serving::server::HttpServer server(serverConfig, engine, *tokenizer, chatTemplate.get());
+  // Outlives the server, which borrows it.
+  std::unique_ptr<serving::replica::RuleTable> rules;
+  if (options.forwarding) { rules = std::make_unique<serving::replica::RuleTable>(); }
+
+  serving::server::HttpServer server(serverConfig, engine, *tokenizer, chatTemplate.get(), rules.get());
   server.start();
-  std::printf("[serving] listening on %s:%d\n", options.host.c_str(), server.boundPort());
+  std::printf("[serving] listening on %s:%d%s\n", options.host.c_str(), server.boundPort(), options.forwarding ? " (accepting routing rules)" : "");
   std::fflush(stdout);
 
   // Not stdin: a server launched by a job runner usually has none, and reading

@@ -14,8 +14,9 @@ namespace
 using Json = nlohmann::json;
 }
 
-RouterServer::RouterServer(RouterServerConfig config, const std::vector<ReplicaSpec> &replicas)
+RouterServer::RouterServer(RouterServerConfig config, const std::vector<ReplicaSpec> &replicas, coordinator::Coordinator *coordinator)
   : _config(std::move(config)),
+    _coordinator(coordinator),
     _sessions(_config.sessionTtlSeconds),
     _registry(RoutingConfig{_config.sessionTtlSeconds, _config.affinitySlack}, _sessions, replicas),
     _proxy(_registry, _registryMutex, _config.connectTimeoutSeconds, _config.requestTimeoutSeconds, _config.maxAttempts),
@@ -190,10 +191,74 @@ void RouterServer::registerRoutes()
   });
 
   const auto proxyTo = [this](const std::string &path) {
-    return [this, path](const httplib::Request &request, httplib::Response &response) { _proxy.forward(request, response, path); };
+    return [this, path](const httplib::Request &request, httplib::Response &response) {
+      const std::string sessionId = resolveSessionId(request, request.body);
+      _proxy.forwardPinned(request, response, path, plannedHop(request, sessionId));
+    };
   };
   _server->Post("/v1/completions", proxyTo("/v1/completions"));
   _server->Post("/v1/chat/completions", proxyTo("/v1/chat/completions"));
+
+  // What the coordinator planned, without sending a request through it. The
+  // device tests read this, and so does anyone wondering why a session went
+  // where it did.
+  _server->Get("/routing", [this](const httplib::Request &request, httplib::Response &response) {
+    if (_coordinator == nullptr)
+    {
+      response.status = 404;
+      response.set_content(Json{{"error", "this router has no coordinator"}}.dump(), "application/json");
+      return;
+    }
+
+    const std::string session = request.get_param_value("session");
+
+    RoutingPath path;
+    try
+    {
+      path = _coordinator->routeFor(session);
+    }
+    catch (const std::exception &e)
+    {
+      // No path exists, which is a real answer: a partition with no routable
+      // replica cannot be reached, and saying so beats an empty hop list that
+      // reads like a deployment with one stage.
+      response.status = 503;
+      response.set_content(Json{{"session_id", session}, {"error", e.what()}}.dump(), "application/json");
+      return;
+    }
+
+    Json hops = Json::array();
+    for (const auto &hop : path.hops) { hops.push_back(Json{{"name", hop.name}, {"partition", hop.partition}, {"url", hop.baseUrl()}}); }
+
+    const auto stats = _coordinator->stats();
+    response.set_content(Json{{"session_id", session},
+                              {"mode", routingModeName(_coordinator->mode())},
+                              {"generation", path.generation},
+                              {"hops", hops},
+                              {"plans_computed", stats.plansComputed},
+                              {"rules_published", stats.rulesPublished},
+                              {"paths_invalidated", stats.pathsInvalidated}}
+                           .dump(),
+                         "application/json");
+  });
+}
+
+std::string RouterServer::plannedHop(const httplib::Request &, const std::string &sessionId)
+{
+  if (_coordinator == nullptr) { return {}; }
+
+  // A coordinator that cannot plan is not a reason to fail a request: the
+  // registry still knows which replicas are routable, and affinity is a
+  // reasonable answer when the plan is missing.
+  try
+  {
+    const auto path = _coordinator->routeFor(sessionId);
+    return path.hops.empty() ? std::string{} : path.hops.front().name;
+  }
+  catch (const std::exception &)
+  {
+    return {};
+  }
 }
 
 } // namespace serving::router

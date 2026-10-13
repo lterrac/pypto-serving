@@ -39,12 +39,12 @@ servingDependencies = [dependency('threads')]
 servingSources = files(
   'source/infra/state.cpp',
   'source/infra/discovery.cpp',
+  'source/infra/document.cpp',
   'source/infra/capacity.cpp',
   'source/infra/scaling.cpp',
   'source/infra/launcher.cpp',
   'source/infra/process_starter.cpp',
   'source/infra/monitor.cpp',
-  'source/infra/document.cpp',
   'source/infra/deployment_server.cpp',
   'source/memory/kv_cache.cpp',
   'source/sched/scheduler.cpp',
@@ -62,6 +62,8 @@ servingSources = files(
   'source/replica/rule_table.cpp',
   'source/router/proxy.cpp',
   'source/router/router_server.cpp',
+  'source/router/http_rule_transport.cpp',
+  'source/deployer/deployment.cpp',
 )
 
 ####### Optional: Python -- the bridge (embedded) and the bindings (extension)
@@ -280,6 +282,19 @@ endif
 routerBinary = executable(
   'pypto-serving-router-cpp',
   ['source/router_main.cpp'],
+  dependencies: [servingBuildDep],
+  install: true,
+)
+
+####### The deployer binary
+#
+# The control plane for one deployment: it launches the replicas, watches them,
+# runs the coordinator and serves the operator API. No Python and no tokenizer
+# either -- it coordinates serving processes, it does not serve.
+
+deployerBinary = executable(
+  'pypto-serving-deployer-cpp',
+  ['source/deployer_main.cpp'],
   dependencies: [servingBuildDep],
   install: true,
 )

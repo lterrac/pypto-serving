@@ -1,0 +1,13 @@
+{
+  "document": "document.json",
+  "launch": "bash /mounted_home/.cpp-port/run-replica.sh {name} {device} {port}",
+  "routing_mode": "rules",
+  "partition": 0,
+  "routing": { "session_ttl_seconds": 1800, "affinity_slack": 8 },
+  "ingress": { "host": "127.0.0.1", "port": 8100 },
+  "operator_api": { "host": "127.0.0.1", "port": 9100 },
+  "ready_timeout_seconds": 420,
+  "service_interval_seconds": 2,
+  "backoff": { "base_seconds": 5, "max_seconds": 60, "give_up_after": 3 },
+  "scaling": { "min_replicas": 1, "max_replicas": 4, "devices_per_replica": 1 }
+}
