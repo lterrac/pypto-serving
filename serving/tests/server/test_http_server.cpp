@@ -461,3 +461,20 @@ TEST(HttpServerTest, AnUnreachableNextHopIsAnErrorNotASilentLocalAnswer)
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, 502) << response->body;
 }
+
+TEST(HttpServerTest, PublishesTheLoadAScalingDecisionNeeds)
+{
+  Fixture fixture;
+  auto    client = fixture.client();
+
+  const auto response = client.Get("/control/load");
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, 200);
+
+  const auto body = json::parse(response->body);
+  EXPECT_EQ(body.at("replica"), "test-model");
+  EXPECT_TRUE(body.at("ready").get<bool>());
+  // Present even when idle: a reader cannot tell "no load" from "no field".
+  EXPECT_TRUE(body.contains("pending_tokens"));
+  EXPECT_TRUE(body.contains("preemptions"));
+}

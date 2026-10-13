@@ -45,6 +45,7 @@ servingSources = files(
   'source/infra/process_starter.cpp',
   'source/infra/monitor.cpp',
   'source/infra/document.cpp',
+  'source/infra/deployment_server.cpp',
   'source/memory/kv_cache.cpp',
   'source/sched/scheduler.cpp',
   'source/engine/detokenizer.cpp',
