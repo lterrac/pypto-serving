@@ -332,7 +332,11 @@ void Deployment::start()
   ingressConfig.maxAttempts           = _config.maxAttempts;
   ingressConfig.sessionTtlSeconds     = _config.routing.sessionTtlSeconds;
   ingressConfig.affinitySlack         = _config.routing.affinitySlack;
-  _ingress                            = std::make_unique<router::RouterServer>(ingressConfig, entry, _coordinator.get());
+  // One thing watching each replica. The deployer's monitor already probes
+  // them and writes the result to the map, and `refreshRouting` takes the
+  // ingress to that; a second poller racing it can only disagree.
+  ingressConfig.startHealthPoller = false;
+  _ingress                        = std::make_unique<router::RouterServer>(ingressConfig, entry, _coordinator.get());
 
   _operator->start();
   _ingress->start();
@@ -344,7 +348,13 @@ void Deployment::refreshRouting()
 {
   if (_ingress == nullptr) { return; }
 
-  std::vector<router::ReplicaSpec> live;
+  struct Live
+  {
+    router::ReplicaSpec spec;
+    infra::Phase        phase;
+  };
+
+  std::vector<Live> live;
   {
     const infra::StateMap &current = map();
     for (const infra::Replica &replica : current.replicas())
@@ -352,22 +362,32 @@ void Deployment::refreshRouting()
       if (replica.partition != _config.partition) { continue; }
       const infra::Node *node = current.node(replica.node);
       if (node == nullptr) { continue; }
-      live.push_back(router::ReplicaSpec{replica.name, replica.partition, node->host, replica.port, replica.scheme});
+      live.push_back({router::ReplicaSpec{replica.name, replica.partition, node->host, replica.port, replica.scheme}, replica.phase});
     }
   }
 
   const std::lock_guard<std::mutex> lock(_ingress->registryMutex());
   auto                             &registry = _ingress->registry();
-  for (const auto &spec : live)
+  for (const auto &entry : live)
   {
     // Added not ready: a replica this deployment just launched provably cannot
-    // serve for the minutes its model takes to load, and the health poller
-    // corrects that as soon as it can.
-    if (registry.state(spec.name) == nullptr) { registry.add(spec, false); }
+    // serve for the minutes its model takes to load.
+    if (registry.state(entry.spec.name) == nullptr) { registry.add(entry.spec, false); }
+
+    // Routability comes from the map, not from a second opinion. The ingress
+    // has its own poller for the deployments where nothing else is watching,
+    // but here the supervisor and the monitor are already probing these
+    // replicas and writing what they find to the map -- and a replica the map
+    // calls active while the ingress still calls it loading answers 503. The
+    // phases map the same way the coordinator's own registries map them:
+    // reserved is deliberately not routable, because routing to a spare makes
+    // it an ordinary replica.
+    registry.setReady(entry.spec.name, entry.phase == infra::Phase::Active);
+    registry.setDraining(entry.spec.name, entry.phase == infra::Phase::Draining);
   }
 
   std::set<std::string> present;
-  for (const auto &spec : live) { present.insert(spec.name); }
+  for (const auto &entry : live) { present.insert(entry.spec.name); }
   std::vector<std::string> gone;
   for (const auto &state : registry.states())
   {

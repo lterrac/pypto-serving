@@ -141,6 +141,26 @@ std::vector<ScalingDecision> decideScaling(const StateMap &map, const LoadSnapsh
   return decisions;
 }
 
+namespace
+{
+
+/// One past the highest port the deployment already uses.
+///
+/// `validate()` requires endpoints to be unique, so a new replica cannot reuse
+/// one. Taking the maximum rather than the first gap keeps a drained replica's
+/// port out of circulation while it is still finishing its work.
+int nextFreePort(const StateMap &map)
+{
+  int highest = 0;
+  for (const Replica &replica : map.replicas()) { highest = std::max(highest, replica.port); }
+  // Nothing in the map has one: a deployment of replicas on ephemeral ports,
+  // which a launcher cannot target anyway. Leave it at zero and let the
+  // supervisor's probe report it rather than inventing a number.
+  return highest == 0 ? 0 : highest + 1;
+}
+
+} // namespace
+
 std::vector<ScalingOutcome> applyScaling(StateMap &map, CapacityProvider &provider, const std::vector<ScalingDecision> &decisions, const ScalingConfig &config)
 {
   std::vector<ScalingOutcome> outcomes;
@@ -165,6 +185,11 @@ std::vector<ScalingOutcome> applyScaling(StateMap &map, CapacityProvider &provid
     CapacityRequest request;
     request.partition = decision.partition;
     request.devices   = config.devicesPerReplica;
+    // A provider hands out machines and cards; the port a replica listens on
+    // is a property of the deployment, and the map is where the deployment is
+    // written down. Without one the new replica lands on port 0, which cannot
+    // be launched, probed or routed to -- it would sit pending for ever.
+    request.port = nextFreePort(map);
 
     const auto grant = provider.acquire(request);
     if (!grant.has_value())

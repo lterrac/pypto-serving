@@ -677,10 +677,64 @@ targets. The replica is launched through Python and loads the
 `DeploymentTest.ServesTheOperatorApiFromTheSameMap` now asserts the load is not
 null, so the same stale build fails locally instead of on a card.
 
+### Scaling and recovery, on four cards
+
+The deployer driving its own components, with nothing holding the map by hand.
+hg-atlas-01, Qwen3-14B, four cards through `task-submit`.
+
+**Scaling.** The document asks for one replica; the operator asks for three
+more:
+
+```
+[   0.0s] starting qwen-0
+[  93.1s] qwen-0 is serving
+[  93.1s] three POSTs to /deployment/scale, back to back
+              -> p0-auto-0, p0-auto-1, p0-auto-2   (applied, versions 2..4)
+[ 192.2s] p0-auto-0 active card [4] port 8161
+          p0-auto-1 active card [5] port 8162
+          p0-auto-2 active card [6] port 8163
+          qwen-0    active card [3] port 8160
+[ 193.3s] 8 conversations landed on {qwen-0: 3, p0-auto-0: 3, p0-auto-1: 2}
+[ 193.3s] scale down -> qwen-0 draining, still holding its card
+```
+
+Three replicas loaded in **99s together**, because the supervisor starts every
+pending replica on one tick. The earlier harness scaled one at a time and took
+348s for the same four.
+
+**Recovery.** Three replicas, one killed outright:
+
+```
+[ 117.5s] killed qwen-1 (both its processes)
+[ 123.9s] qwen-1 marked dead after 6.3s; requests during the outage:
+              qwen-0: 3, qwen-2: 1, failed: 0
+[ 211.0s] qwen-1 active again, rebuilt 93s after it died, and serving
+```
+
+Against slide 3's complaint -- twenty minutes, truncated answers reported as
+complete, `/health` green -- this is **6.3s to notice, no failed request, and
+93s to rebuild**, with routing going round the hole in between.
+
+Two faults came out of these runs, both of which made the feature useless and
+neither of which the stub tests could see:
+
+- **A scaled-up replica had no port.** `applyScaling` built a `CapacityRequest`
+  without one, so the grant came back on port 0: nothing to launch, nothing to
+  probe, nothing to route to. A provider hands out machines and cards; the port
+  is a property of the deployment, so it now comes from the map -- one past the
+  highest in use, which keeps endpoints unique as `validate()` requires.
+- **The ingress ran its own health poller** and added replicas unready, so
+  between the map saying active and that poller's next cycle every request got
+  503 with three loaded replicas sitting idle. Routability now comes from the
+  map, like everything else; the deployer's monitor is already probing these
+  replicas, and a second opinion could only disagree with it.
+
+Both are pinned by tests that fail without the fix.
+
 ## Not yet
 
 | | |
 | --- | --- |
 | nothing executes a partitioned model | the path is a path of HTTP replicas; splitting the model is the model layer's problem |
-| Option B forwarding is unproven on a device | the deployer ran one partition on one card; a forward needs two |
+| Option B forwarding is unproven on a device | scaling and recovery now are, on four cards; a forward still needs two partitions |
 | the deployer RPC is not wired into the coordinator | `Coordinator::initialize()` still builds its map from a file; the deployer now owns the document, which is the precondition for handing copies out |

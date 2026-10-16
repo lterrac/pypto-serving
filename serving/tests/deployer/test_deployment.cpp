@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -329,8 +330,37 @@ TEST(DeploymentTest, ServesTheOperatorApiFromTheSameMap)
   // The load has to arrive, or the operator is deciding about scaling from a
   // blank. A replica that is genuinely silent reports null on purpose, so a
   // null here means the probe did not reach a replica that was answering.
-  for (const auto &replica : body["replicas"])
-  {
-    EXPECT_FALSE(replica["load"].is_null()) << replica.dump();
-  }
+  for (const auto &replica : body["replicas"]) { EXPECT_FALSE(replica["load"].is_null()) << replica.dump(); }
+}
+
+TEST(DeploymentTest, AReplicaTheMapCallsActiveIsRoutableOnTheVeryNextTick)
+{
+  // Found on four cards: the ingress ran its own health poller and added new
+  // replicas unready, so between the map saying active and the poller's next
+  // cycle every request got 503 -- with three loaded replicas sitting idle.
+  // Routability now comes from the map, like everything else.
+  Fixture fixture("ingress");
+
+  // A replica the deployment did not start with, exactly as a scale-up adds it.
+  StubReplica             late("p0-late");
+  serving::infra::Replica entry;
+  entry.name         = "p0-late";
+  entry.partition    = 0;
+  entry.node         = "local";
+  entry.port         = late.port();
+  entry.phase        = serving::infra::Phase::Pending;
+  entry.desiredPhase = serving::infra::Phase::Active;
+  fixture.deployment->map().addReplica(entry);
+
+  fixture.deployment->service();
+  // Pending is not routable, however healthy the endpoint looks.
+
+  fixture.deployment->map().setPhase("p0-late", serving::infra::Phase::Active);
+  fixture.deployment->service();
+
+  // One tick, not one health interval.
+  auto                  client = fixture.ingress();
+  std::set<std::string> answered;
+  for (int i = 0; i < 12; ++i) { answered.insert(ask(client, "chat-" + std::to_string(i)).value("model", "")); }
+  EXPECT_TRUE(answered.count("p0-late") == 1) << "the new replica never took a request";
 }

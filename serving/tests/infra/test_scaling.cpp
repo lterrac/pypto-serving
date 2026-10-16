@@ -16,6 +16,7 @@ using serving::infra::ReplicaLoad;
 using serving::infra::ScalingAction;
 using serving::infra::ScalingConfig;
 using serving::infra::StateMap;
+using serving::infra::validate;
 
 namespace
 {
@@ -387,4 +388,40 @@ TEST(ScalingPolicyTest, ASpareCountsSoCapacityIsNotOrderedOnTopOfIt)
   // The spare is paid for and one message away, so ordering more while it
   // waits is waste.
   EXPECT_TRUE(decideScaling(map, busy({{"p0a", 99}}), c).empty());
+}
+
+// ---------------------------------------------------------------------------
+// a scaled-up replica has to be reachable
+// ---------------------------------------------------------------------------
+
+TEST(ApplyScalingTest, GivesANewReplicaAPortSoItCanBeLaunchedAndProbed)
+{
+  // Port 0 is not a harmless default here: the launcher substitutes it into
+  // the command, the probe dials it and the router routes to it, so a replica
+  // granted without one sits pending for ever.
+  StateMap map;
+  map.addNode(Node{"hg-atlas-01", "10.0.0.1", {0, 1, 2}});
+  Replica first = replica("r0", 0, {0});
+  first.port    = 8000;
+  map.addReplica(first);
+
+  LocalCapacity provider(map);
+  ScalingConfig config;
+  config.minReplicas = 1;
+  config.maxReplicas = 4;
+
+  const auto outcomes = applyScaling(map, provider, {{0, ScalingAction::ScaleUp, "", "asked for"}}, config);
+  ASSERT_EQ(outcomes.size(), 1U);
+  ASSERT_TRUE(outcomes[0].applied) << outcomes[0].declined;
+
+  const Replica *added = map.replica(outcomes[0].replica);
+  ASSERT_NE(added, nullptr);
+  EXPECT_EQ(added->port, 8001) << "one past the highest the deployment already uses";
+  EXPECT_TRUE(validate(map).empty()) << "endpoints must stay unique";
+
+  // And again, so two scale-ups in a row do not collide.
+  const auto second = applyScaling(map, provider, {{0, ScalingAction::ScaleUp, "", "asked for"}}, config);
+  ASSERT_TRUE(second[0].applied) << second[0].declined;
+  EXPECT_EQ(map.replica(second[0].replica)->port, 8002);
+  EXPECT_TRUE(validate(map).empty());
 }
