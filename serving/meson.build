@@ -44,6 +44,7 @@ servingSources = files(
   'source/infra/scaling.cpp',
   'source/infra/launcher.cpp',
   'source/infra/process_starter.cpp',
+  'source/infra/remote_starter.cpp',
   'source/infra/monitor.cpp',
   'source/infra/deployment_server.cpp',
   'source/memory/kv_cache.cpp',

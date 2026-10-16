@@ -7,12 +7,17 @@
  * rule. What is stubbed is the model, not the control plane.
  */
 
+#include <chrono>
+#include <thread>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 #include <httplib.h>
@@ -368,4 +373,99 @@ TEST(DeploymentTest, AReplicaTheMapCallsActiveIsRoutableOnTheVeryNextTick)
   std::set<std::string> answered;
   for (int i = 0; i < 12; ++i) { answered.insert(ask(client, "chat-" + std::to_string(i)).value("model", "")); }
   EXPECT_TRUE(answered.count("p0-late") == 1) << "the new replica never took a request";
+}
+
+TEST(DeployerConfigTest, ReadsTheNodeItIsAndHowItReachesTheOthers)
+{
+  const auto config = parseDeployerConfig(R"({
+    "document": "d.json",
+    "launch": "run {name}",
+    "node": "hg-atlas-01",
+    "remote": { "reach": "ssh {host} {command}", "state_directory": "/var/run", "grace_seconds": 20 }
+  })");
+
+  EXPECT_EQ(config.node, "hg-atlas-01");
+  EXPECT_EQ(config.remote.reach, "ssh {host} {command}");
+  EXPECT_EQ(config.remote.stateDirectory, "/var/run");
+  EXPECT_EQ(config.remote.graceSeconds, 20);
+}
+
+TEST(DeployerConfigTest, AnUnnamedNodeKeepsTheDeploymentToOneMachine)
+{
+  // The single-node case has to stay exactly what it was: every replica
+  // started here, no reach command anywhere near it.
+  const auto config = parseDeployerConfig(R"({"document": "d.json", "launch": "run {name}"})");
+  EXPECT_TRUE(config.node.empty());
+}
+
+TEST(DeploymentTest, StoppingReachesAReplicaOnAnotherNode)
+{
+  // Found on two cards. run() cleared the flag stop() checks, so stop()
+  // returned having stopped nothing. A local replica survived that by luck --
+  // ~ProcessStarter kills what it spawned -- but a replica on another node is
+  // only reachable through RemoteStarter::stop(), so it was left running and
+  // holding its card with nothing left to clean it up.
+  const auto directory = std::filesystem::temp_directory_path() / ("deployer-stop-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(directory / "state");
+
+  serving::infra::StateMap map;
+  map.addNode(serving::infra::Node{"here", "127.0.0.1", {0}});
+  map.addNode(serving::infra::Node{"there", "127.0.0.1", {1}});
+  serving::infra::Replica entry;
+  entry.name         = "r0";
+  entry.node         = "there";
+  entry.devices      = {1};
+  entry.port         = 8999;
+  entry.phase        = serving::infra::Phase::Pending;
+  entry.desiredPhase = serving::infra::Phase::Active;
+  map.addReplica(entry);
+  serving::infra::saveDocument(map, directory / "document.json");
+
+  DeployerConfig config;
+  config.document               = directory / "document.json";
+  config.persist                = false;
+  config.node                   = "here";
+  config.launch                 = "sleep 120";
+  config.remote.reach           = "sh -c {command}";
+  config.remote.stateDirectory  = (directory / "state").string();
+  config.remote.graceSeconds    = 1;
+  config.ingressHost            = "127.0.0.1";
+  config.ingressPort            = 0;
+  config.operatorHost           = "127.0.0.1";
+  config.operatorPort           = 0;
+  config.serviceIntervalSeconds = 0.1;
+
+  const auto pidFile   = directory / "state" / "serving-r0.pgid";
+  int        remotePid = 0;
+  {
+    Deployment deployment(config);
+    deployment.start();
+    deployment.service();
+
+    for (int waited = 0; waited < 50 && remotePid == 0; ++waited)
+    {
+      if (std::filesystem::exists(pidFile))
+      {
+        std::ifstream file(pidFile);
+        file >> remotePid;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_GT(remotePid, 0) << "the reach never recorded what it started, so this proves nothing about stopping it";
+    ASSERT_EQ(::kill(remotePid, 0), 0) << "the replica never ran";
+
+    // Through run(), not stop(): the fault was in the order run() does things,
+    // and calling stop() directly steps over it.
+    deployment.run([] { std::this_thread::sleep_for(std::chrono::milliseconds(50)); });
+  }
+
+  bool reaped = false;
+  for (int waited = 0; waited < 80 && !reaped; ++waited)
+  {
+    reaped = ::kill(remotePid, 0) != 0;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  EXPECT_TRUE(reaped) << "the replica on the other node outlived the deployer, still holding its devices";
+
+  std::filesystem::remove_all(directory);
 }

@@ -131,10 +131,13 @@ SupervisionReport Supervisor::service()
     // Already serving: a reserved spare being activated, which is the whole
     // point of keeping one. No launch, no model load -- one phase change.
     //
-    // The probe is the right question rather than asking the starter whether it
-    // has a pid: what matters is that the replica can answer, not who started
-    // it. A replica that was never started cannot, so this costs one probe.
-    if (_probe.check(*replica) == Readiness::Ready)
+    // Only from reserved. The probe was once the only question asked here, on
+    // the reasoning that a replica which was never started cannot answer --
+    // and that is false. Something else listening on the port answers too: a
+    // run that leaked a replica left one holding a card, and the next
+    // deployment adopted it, reporting a replica as serving that it had never
+    // started and could not stop. A pending or dead replica gets launched.
+    if (replica->phase == Phase::Reserved && _probe.check(*replica) == Readiness::Ready)
     {
       _map.setPhase(action.replica, replica->desiredPhase == Phase::Reserved ? Phase::Reserved : Phase::Active);
       _attempts.erase(action.replica);

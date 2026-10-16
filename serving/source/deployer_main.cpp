@@ -17,6 +17,8 @@
 
 #include <serving/deployer/deployment.hpp>
 #include <serving/infra/document.hpp>
+#include <serving/infra/remote_starter.hpp>
+#include <serving/util/signals.hpp>
 
 namespace
 {
@@ -68,17 +70,28 @@ int main(int argc, char **argv)
         return 1;
       }
 
-      serving::infra::ProcessStarter starter(config.launch);
+      // Through the same starter the run would use, so what is printed is what
+      // would happen -- including the reach command for a replica on another
+      // node, which is the part worth seeing before it runs.
+      serving::infra::ProcessStarter local(config.launch);
+      serving::infra::RemoteStarter  remote(map, config.node, config.launch, config.remote);
       for (const auto &replica : map.replicas())
       {
+        const bool here = config.node.empty() || replica.node == config.node;
         std::printf("  %-10s partition %d on %-14s devices", replica.name.c_str(), replica.partition, replica.node.c_str());
         for (const int device : replica.devices) { std::printf(" %d", device); }
-        std::printf("  port %d\n", replica.port);
-        if (!config.launch.empty()) { std::printf("      %s\n", starter.commandFor(replica).c_str()); }
+        std::printf("  port %d%s\n", replica.port, here ? "" : "   (reached)");
+        if (!config.launch.empty()) { std::printf("      %s\n", (config.node.empty() ? local.commandFor(replica) : remote.commandFor(replica)).c_str()); }
       }
       if (config.launch.empty()) { std::printf("  no launch command: the replicas are expected to be running already\n"); }
       return 0;
     }
+
+    // Before anything starts a thread. `awaitShutdownSignal` uses sigwait,
+    // which needs the signals blocked in every thread; without this SIGTERM
+    // takes its default action and kills the process outright -- no shutdown,
+    // no replicas stopped, and on another node nothing left to stop them.
+    serving::util::blockShutdownSignals();
 
     serving::deployer::Deployment deployment(config);
     deployment.start();

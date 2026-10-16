@@ -444,3 +444,43 @@ TEST(ProcessStarterTest, StopReachesWhatTheWrapperSpawned)
   EXPECT_FALSE(std::filesystem::exists(marker)) << "the spawned grandchild outlived stop()";
   std::filesystem::remove(marker);
 }
+
+TEST(SupervisorTest, DoesNotAdoptSomethingElseListeningOnAPendingReplicasPort)
+{
+  // Found on two cards. A previous run leaked a replica, it was still serving
+  // on that port, and the supervisor promoted the new one without starting it
+  // -- so the deployment reported as healthy a process it had never started,
+  // could not stop, and did not account for. Only a reserved spare is already
+  // up; anything else gets launched.
+  StateMap map = atlas();
+  map.addReplica(wanted("r0", Phase::Pending));
+
+  FakeStarter starter;
+  FakeProbe   probe;
+  probe.healthy.insert("r0"); // something is listening on that port
+  Supervisor supervisor(map, starter, probe);
+
+  const auto report = supervisor.service();
+  EXPECT_EQ(starter.starts.size(), 1U) << "a pending replica must be launched, not adopted";
+  EXPECT_TRUE(report.promoted.empty());
+  EXPECT_EQ(map.replica("r0")->phase, Phase::Pending) << "it cannot be serving before it has started";
+}
+
+TEST(SupervisorTest, AReservedSpareIsStillActivatedWithoutALaunch)
+{
+  // The case the shortcut exists for, unchanged: the spare is already loaded,
+  // so activating it is a phase change rather than a model load.
+  StateMap map   = atlas();
+  Replica  spare = wanted("r0", Phase::Reserved);
+  map.addReplica(spare);
+
+  FakeStarter starter;
+  FakeProbe   probe;
+  probe.healthy.insert("r0");
+  Supervisor supervisor(map, starter, probe);
+
+  const auto report = supervisor.service();
+  EXPECT_TRUE(starter.starts.empty()) << "activating a spare must not cost a model load";
+  EXPECT_EQ(map.replica("r0")->phase, Phase::Active);
+  EXPECT_EQ(report.promoted.size(), 1U);
+}

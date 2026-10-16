@@ -24,7 +24,9 @@
  * policy on its own.
  */
 
+#include <atomic>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -35,6 +37,7 @@
 #include <serving/infra/launcher.hpp>
 #include <serving/infra/monitor.hpp>
 #include <serving/infra/process_starter.hpp>
+#include <serving/infra/remote_starter.hpp>
 #include <serving/infra/scaling.hpp>
 #include <serving/infra/state.hpp>
 #include <serving/router/http_rule_transport.hpp>
@@ -67,6 +70,16 @@ struct DeployerConfig
   /// `{node}` are substituted. Empty means the replicas are already running and
   /// this process only coordinates them.
   std::string launch;
+
+  /// Which node in the document this process is. Replicas on it are started
+  /// here; replicas anywhere else are reached. Empty keeps the deployment to
+  /// one machine -- every replica is started locally whatever node it claims,
+  /// which is what a single-node document means and all the launcher could
+  /// ever do before.
+  std::string node;
+
+  /// How another node is reached, when the document names more than one.
+  infra::RemoteLaunch remote;
 
   router::RoutingMode   mode = router::RoutingMode::CoordinatorIngress;
   router::RoutingConfig routing;
@@ -134,8 +147,14 @@ class Deployment
   /// One control tick. Called on a timer by `run()`, and directly by a test.
   TickReport service();
 
-  /// Tick until stopped by SIGINT/SIGTERM.
-  void run();
+  /// Tick until told to shut down, then tear the deployment down.
+  ///
+  /// `waitForShutdown` blocks until it is time to stop; the default waits for
+  /// SIGINT or SIGTERM. It is a parameter because the ordering between the
+  /// service loop and `stop()` is the part that goes wrong -- clearing the
+  /// wrong flag once left every replica running after the deployer exited --
+  /// and that ordering is only reachable through here.
+  void run(std::function<void()> waitForShutdown = {});
 
   void stop();
 
@@ -159,7 +178,10 @@ class Deployment
   std::unique_ptr<router::HttpRuleTransport> _transport;
   std::unique_ptr<coordinator::Coordinator>  _coordinator;
 
+  /// One of the two is built, never both: a single-node deployment pays
+  /// nothing for the reach machinery it does not use.
   std::unique_ptr<infra::ProcessStarter>   _starter;
+  std::unique_ptr<infra::RemoteStarter>    _remoteStarter;
   std::unique_ptr<infra::HttpHealthProbe>  _httpProbe;
   std::unique_ptr<infra::HealthProbe>      _probe;
   std::unique_ptr<infra::Supervisor>       _supervisor;
@@ -170,7 +192,13 @@ class Deployment
   std::unique_ptr<infra::DeploymentServer> _operator;
 
   uint64_t _persistedVersion = 0;
-  bool     _running          = false;
+  /// Started, and therefore with replicas to stop. Cleared by `stop()` alone.
+  bool _running = false;
+  /// The service loop's own flag, separate because `run()` has to stop ticking
+  /// before it tears the deployment down -- and clearing `_running` to do that
+  /// made `stop()` return without stopping anything, leaving every replica
+  /// running and holding its card.
+  std::atomic<bool> _ticking{false};
 };
 
 } // namespace serving::deployer

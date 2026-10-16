@@ -290,7 +290,7 @@ TEST(WarmSpareTest, AStartedSpareWaitsReservedRatherThanServing)
   EXPECT_EQ(map.replica("spare")->phase, Phase::Reserved);
 }
 
-TEST(WarmSpareTest, TheAlreadyUpShortcutTrustsTheProbe)
+TEST(WarmSpareTest, TheAlreadyUpShortcutDoesNotTrustThePortAlone)
 {
   StateMap map = fleet(1);
   Replica  ghost;
@@ -305,13 +305,19 @@ TEST(WarmSpareTest, TheAlreadyUpShortcutTrustsTheProbe)
   CountingStarter starter;
   Supervisor      supervisor(map, starter, probe);
 
-  // A probe that claims a never-started replica is serving will have it
-  // adopted without a launch. That is the cost of asking "can it answer?"
-  // rather than "did I start it?", and it is why production pairs the health
-  // check with liveness: LiveAndReadyProbe reports Failed when no process is
-  // there, so this cannot happen behind it.
-  EXPECT_EQ(supervisor.service().promoted, std::vector<std::string>{"ghost"});
-  EXPECT_TRUE(starter.started.empty());
+  // This used to adopt the replica on the probe's word alone, with
+  // LiveAndReadyProbe relied on to report Failed when no process was there.
+  // Two things broke that. A remote replica cannot be paired with liveness --
+  // the local pid belongs to the reach command, not the replica -- and a
+  // leaked replica from an earlier run really was listening on the port, so a
+  // deployment adopted a process it had never started and could not stop.
+  //
+  // The shortcut is now reserved for the case it was written for: a spare
+  // that this deployment is already holding. Anything pending gets launched.
+  const auto report = supervisor.service();
+  EXPECT_TRUE(report.promoted.empty()) << "a pending replica must not be adopted because its port answers";
+  EXPECT_EQ(starter.started, std::vector<std::string>{"ghost"});
+  EXPECT_EQ(map.replica("ghost")->phase, Phase::Pending);
 }
 
 TEST(WarmSpareTest, ActivatingASpareCostsNoLaunch)

@@ -758,6 +758,62 @@ defaulted the field. Nothing over HTTP reads it -- a forward there goes by URL
 a default is the kind of fault that surfaces much later. The transport now
 takes the name-to-instance map the deployer builds from the document.
 
+### Replicas on another node
+
+`ProcessStarter` spawns a command here, which is why the map's nodes had never
+meant anything to the launcher: every replica was started locally whatever node
+it claimed. `infra/remote_starter.hpp` acts on the claim -- replicas on this
+process's own node are started directly, everything else is reached through a
+command template. The default is ssh; a cluster with its own launcher
+substitutes it without touching the code. `--dry-run` prints what a node would
+actually receive:
+
+```
+there  partition 0 on node-b  devices 3  port 8161   (reached)
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new 192.168.150.12 \
+      'sh -c '\''echo $$ > /tmp/serving-there.pgid; exec bash run-replica.sh there 3 8161'\'''
+```
+
+A remote replica needs more bookkeeping than a local one. The local pid belongs
+to the reach, not the replica, so the far side records what it started and
+stopping signals it there before the reach is torn down -- the same thing
+`ProcessStarter` does with a process group, one machine further away.
+
+Measured on two cards, with the reach standing in for ssh so the remote
+bookkeeping runs for real against real Qwen replicas:
+
+```
+[   0.0s] starting here / starting there
+[  90.1s] here active, there active       one started locally, one reached
+[  90.1s] the far side recorded its own group, alive
+[  90.9s] both serve through the one ingress: {here: 3, there: 3}
+          shutting down -> group file removed by the remote stop
+```
+
+**Four faults came out of those runs**, every one of which leaked a Qwen
+replica onto a card off the broker's lock, and three of which no test here
+could have found:
+
+- **The deployer never stopped anything.** `run()` cleared the flag `stop()`
+  checks, so `stop()` returned having done nothing.
+- **SIGTERM killed it outright.** `awaitShutdownSignal` uses `sigwait`, which
+  needs the signals blocked first, and the deployer never called
+  `blockShutdownSignals()` -- the other two binaries do. So the shutdown path
+  above was never reached at all, which hid the first fault behind it.
+- **The reach was detached.** Wrapping the remote command in `setsid` returns
+  as soon as it has forked, so the reach exited at once, the supervisor read a
+  replica that was still loading as a failed launch, retried, and started a
+  second one on the same card.
+- **The supervisor adopted a stranger.** The "already serving" shortcut
+  trusted the probe alone, so a leaked replica still listening on the port had
+  the next deployment promote a replica it had never started and could not
+  stop. Only a reserved spare takes that path now.
+
+What is **not** proven is ssh itself. `hg-atlas-02` has NPUs and a broker but
+no serving tree, no model and no container of ours, and the container here has
+no key and cannot resolve it. The composition is proven and the bookkeeping is
+proven; the hop is not.
+
 ## Not yet
 
 | | |

@@ -120,6 +120,8 @@ DeployerConfig parseDeployerConfig(const std::string &text, const std::string &s
                      "document_out",
                      "persist_document",
                      "launch",
+                     "node",
+                     "remote",
                      "routing_mode",
                      "routing",
                      "partition",
@@ -144,6 +146,17 @@ DeployerConfig parseDeployerConfig(const std::string &text, const std::string &s
   config.persist     = booleanAt(document, "persist_document", ctx, true);
 
   config.launch = stringAt(document, "launch", ctx, "");
+  config.node   = stringAt(document, "node", ctx, "");
+
+  if (const auto it = document.find("remote"); it != document.end())
+  {
+    const auto remoteCtx = ctx.at("remote");
+    if (!it->is_object()) { throw remoteCtx.error("must be a JSON object"); }
+    rejectUnknownKeys(*it, {"reach", "state_directory", "grace_seconds"}, remoteCtx);
+    config.remote.reach          = stringAt(*it, "reach", remoteCtx, config.remote.reach);
+    config.remote.stateDirectory = stringAt(*it, "state_directory", remoteCtx, config.remote.stateDirectory);
+    config.remote.graceSeconds   = integerAt(*it, "grace_seconds", remoteCtx, config.remote.graceSeconds, 0);
+  }
 
   const std::string modeText = stringAt(document, "routing_mode", ctx, "ingress");
   try
@@ -292,13 +305,33 @@ void Deployment::start()
 
   if (!_config.launch.empty())
   {
-    _starter = std::make_unique<infra::ProcessStarter>(_config.launch);
     // The probe needs the map to turn a replica's node name into an address.
+    // That works across machines already: a replica's health is an HTTP
+    // request to wherever its node lives.
     _httpProbe = std::make_unique<infra::HttpHealthProbe>(&map(), _config.connectTimeoutSeconds);
-    // A replica whose process has gone is failed however its endpoint looks,
-    // which is the case a bare health check cannot tell from still loading.
-    _probe      = std::make_unique<infra::LiveAndReadyProbe>(*_starter, *_httpProbe);
-    _supervisor = std::make_unique<infra::Supervisor>(map(), *_starter, *_probe, _config.backoff);
+
+    infra::ReplicaStarter *starter = nullptr;
+    if (_config.node.empty())
+    {
+      _starter = std::make_unique<infra::ProcessStarter>(_config.launch);
+      starter  = _starter.get();
+      // A replica whose process has gone is failed however its endpoint looks,
+      // which is the case a bare health check cannot tell from still loading.
+      _probe = std::make_unique<infra::LiveAndReadyProbe>(*_starter, *_httpProbe);
+    }
+    else
+    {
+      _remoteStarter = std::make_unique<infra::RemoteStarter>(map(), _config.node, _config.launch, _config.remote);
+      starter        = _remoteStarter.get();
+      // No liveness pairing across the hop: for a remote replica the local pid
+      // belongs to the reach command, and a reach that has exited says the
+      // replica has too -- but a reach that is alive says only that ssh is.
+      // The endpoint is the honest signal, and it is the same one the monitor
+      // uses.
+      _probe = std::make_unique<infra::HttpHealthProbe>(&map(), _config.connectTimeoutSeconds);
+    }
+
+    _supervisor = std::make_unique<infra::Supervisor>(map(), *starter, *_probe, _config.backoff);
     _supervisor->setReadyTimeout(_config.readyTimeoutSeconds);
   }
   else
@@ -453,12 +486,13 @@ bool Deployment::settled() const
   return true;
 }
 
-void Deployment::run()
+void Deployment::run(std::function<void()> waitForShutdown)
 {
   const auto interval = std::chrono::duration<double>(_config.serviceIntervalSeconds);
 
+  _ticking = true;
   std::thread ticker([this, interval] {
-    while (_running)
+    while (_ticking.load())
     {
       const auto report = service();
       if (!report.empty())
@@ -473,11 +507,12 @@ void Deployment::run()
     }
   });
 
-  util::awaitShutdownSignal();
+  if (waitForShutdown) { waitForShutdown(); }
+  else { util::awaitShutdownSignal(); }
   std::printf("[deployer] shutting down\n");
   std::fflush(stdout);
 
-  _running = false;
+  _ticking = false;
   ticker.join();
   stop();
 }
@@ -492,9 +527,13 @@ void Deployment::stop()
 
   // The replicas this process started are its to stop; ones it merely
   // coordinates are not.
-  if (_starter != nullptr)
+  if (_starter != nullptr || _remoteStarter != nullptr)
   {
-    for (const infra::Replica &replica : _coordinator->stateMap().replicas()) { _starter->stop(replica); }
+    for (const infra::Replica &replica : _coordinator->stateMap().replicas())
+    {
+      if (_starter != nullptr) { _starter->stop(replica); }
+      else { _remoteStarter->stop(replica); }
+    }
   }
 
   if (_coordinator != nullptr) { _coordinator->finalize(); }
