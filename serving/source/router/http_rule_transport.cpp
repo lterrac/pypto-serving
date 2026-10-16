@@ -10,16 +10,17 @@ namespace serving::router
 
 using nlohmann::json;
 
-HttpRuleTransport::HttpRuleTransport(std::vector<ReplicaSpec> replicas, HttpRuleTransportConfig config)
+HttpRuleTransport::HttpRuleTransport(std::vector<ReplicaSpec> replicas, std::map<std::string, uint64_t> instances, HttpRuleTransportConfig config)
   : _config(config)
 {
-  setReplicas(std::move(replicas));
+  setReplicas(std::move(replicas), std::move(instances));
 }
 
-void HttpRuleTransport::setReplicas(std::vector<ReplicaSpec> replicas)
+void HttpRuleTransport::setReplicas(std::vector<ReplicaSpec> replicas, std::map<std::string, uint64_t> instances)
 {
   const std::lock_guard<std::mutex> lock(_mutex);
 
+  _instances = std::move(instances);
   _replicas.clear();
   for (auto &replica : replicas) { _replicas.emplace(replica.name, std::move(replica)); }
 
@@ -60,7 +61,13 @@ void HttpRuleTransport::publish(const ReplicaSpec &holder, const std::string &se
     if (_unreachable.count(holder.name) != 0) { return; }
   }
 
-  const json body{{"session_id", sessionId}, {"next_hop", nextHop.name}, {"next_hop_url", nextHop.baseUrl()}, {"generation", generation}};
+  uint64_t instance = 0;
+  {
+    const std::lock_guard<std::mutex> lock(_mutex);
+    if (const auto it = _instances.find(nextHop.name); it != _instances.end()) { instance = it->second; }
+  }
+
+  const json body{{"session_id", sessionId}, {"next_hop", nextHop.name}, {"next_hop_url", nextHop.baseUrl()}, {"next_hop_instance", instance}, {"generation", generation}};
 
   const bool                        delivered = post(holder, "/control/rules", body.dump());
   const std::lock_guard<std::mutex> lock(_mutex);

@@ -260,6 +260,7 @@ void Deployment::start()
   coordinatorConfig.routing   = _config.routing;
 
   std::vector<router::ReplicaSpec> specs;
+  std::map<std::string, uint64_t>  instances;
   for (const infra::Replica &replica : document.replicas())
   {
     const infra::Node *node = document.node(replica.node);
@@ -274,9 +275,10 @@ void Deployment::start()
     binding.instanceId     = replica.instance;
     coordinatorConfig.replicas.push_back(binding);
     specs.push_back(binding.spec);
+    instances.emplace(replica.name, replica.instance);
   }
 
-  _transport   = std::make_unique<router::HttpRuleTransport>(specs, router::HttpRuleTransportConfig{_config.connectTimeoutSeconds, _config.requestTimeoutSeconds});
+  _transport   = std::make_unique<router::HttpRuleTransport>(specs, instances, router::HttpRuleTransportConfig{_config.connectTimeoutSeconds, _config.requestTimeoutSeconds});
   _coordinator = std::make_unique<coordinator::Coordinator>(std::move(coordinatorConfig), _transport.get());
   _coordinator->initialize();
 

@@ -731,10 +731,36 @@ neither of which the stub tests could see:
 
 Both are pinned by tests that fail without the fix.
 
+### Option B, on two cards, planned by the coordinator
+
+The earlier Option B measurement published its rules from a Python script. The
+coordinator class had never done it. Through the deployer, on two cards, one
+replica per partition:
+
+```
+[  96.1s] coordinator plans: p0 (partition 0) -> p1 (partition 1)   generation 7697229578011410433
+[  96.3s] a request for chat-1 enters at p0
+          answered by p1   x-forwarded-by=p0   ' Paris. What is the capital'
+          p0 holds: next_hop p1 @ 127.0.0.1:8161, instance 20, same generation
+          p1 holds: nothing -- it is the last hop
+[  96.7s] plans=2  rules_published=2  invalidated=0
+```
+
+The request entered the pipeline at the hop the coordinator chose, and the
+replica forwarded it on **without asking anyone** -- which is the whole of
+slides 9 and 10. One plan and one rule per session, not per request.
+
+That run also found a silent zero: a rule published over HTTP carried
+`next_hop_instance: 0` while the document said 20. `ReplicaSpec` has no
+instance, so the transport had nothing to send and the replica's handler
+defaulted the field. Nothing over HTTP reads it -- a forward there goes by URL
+-- but it is what a channel deployment routes on, and a real value replaced by
+a default is the kind of fault that surfaces much later. The transport now
+takes the name-to-instance map the deployer builds from the document.
+
 ## Not yet
 
 | | |
 | --- | --- |
 | nothing executes a partitioned model | the path is a path of HTTP replicas; splitting the model is the model layer's problem |
-| Option B forwarding is unproven on a device | scaling and recovery now are, on four cards; a forward still needs two partitions |
 | the deployer RPC is not wired into the coordinator | `Coordinator::initialize()` still builds its map from a file; the deployer now owns the document, which is the precondition for handing copies out |

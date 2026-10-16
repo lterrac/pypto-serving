@@ -47,7 +47,13 @@ class HttpRuleTransport final : public RuleTransport
   /// `replicas` is every replica in the pipeline: a revoke names no holder, so
   /// it goes to all of them -- which replicas were on the path is exactly what
   /// the coordinator no longer wants to depend on.
-  HttpRuleTransport(std::vector<ReplicaSpec> replicas, HttpRuleTransportConfig config = {});
+  ///
+  /// `instances` maps a routing name to the HiCR instance behind it. A rule
+  /// addresses its next hop by instance -- that is what a control plane routes
+  /// on -- and `ReplicaSpec` does not carry one, so it is supplied here.
+  /// Without it every rule published goes out naming instance 0, which is a
+  /// silent zero where the map holds a real value.
+  HttpRuleTransport(std::vector<ReplicaSpec> replicas, std::map<std::string, uint64_t> instances = {}, HttpRuleTransportConfig config = {});
 
   void publish(const ReplicaSpec &holder, const std::string &sessionId, const ReplicaSpec &nextHop, uint64_t generation) override;
 
@@ -61,7 +67,7 @@ class HttpRuleTransport final : public RuleTransport
 
   /// Replicas this transport will address, refreshed when the deployment
   /// changes shape. Anything no longer listed is also no longer unreachable.
-  void setReplicas(std::vector<ReplicaSpec> replicas);
+  void setReplicas(std::vector<ReplicaSpec> replicas, std::map<std::string, uint64_t> instances = {});
 
   [[nodiscard]] int published() const;
   [[nodiscard]] int revoked() const;
@@ -78,6 +84,7 @@ class HttpRuleTransport final : public RuleTransport
 
   mutable std::mutex                 _mutex;
   std::map<std::string, ReplicaSpec> _replicas;
+  std::map<std::string, uint64_t>    _instances;
   std::set<std::string>              _unreachable;
   int                                _published = 0;
   int                                _revoked   = 0;

@@ -233,6 +233,11 @@ TEST(DeploymentTest, PublishesRulesThatTheNextHopThenActsOn)
   const auto held = fixture.p0->rules.peek("chat-1");
   ASSERT_TRUE(held.has_value());
   EXPECT_EQ(held->name, "p1");
+  // The instance comes from the document. Published over HTTP it was silently
+  // zero for a while, which is a real value replaced by a default -- the kind
+  // of thing nothing notices until a channel deployment routes on it.
+  EXPECT_EQ(held->instance, 11U) << "the rule must name the instance the map holds";
+  EXPECT_EQ(held->endpoint, "http://127.0.0.1:" + std::to_string(fixture.p1->port()));
 
   // p1 is the last hop, so it holds nothing: there is nothing after it.
   EXPECT_FALSE(fixture.p1->rules.peek("chat-1").has_value());
