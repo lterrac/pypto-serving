@@ -226,6 +226,12 @@ int runServing(const Options &options)
 {
   std::printf("[serving] model=%s device=%d platform=%s\n", options.modelDir.c_str(), options.device, options.platform.c_str());
 
+  // First, and before anything slow. Both paths below share it, and a typo in
+  // the flag is now an error rather than a silently ignored key -- which is
+  // only useful if it is reported in milliseconds rather than after a tokenizer
+  // load, a kernel compile and weight staging.
+  const auto generate = parseGenerateConfig(options.generateConfigJson);
+
   const auto tokenizer    = serving::model::HfTokenizer::fromModelDir(options.modelDir);
   const auto chatTemplate = loadChatTemplate(options.modelDir);
 
@@ -261,8 +267,7 @@ int runServing(const Options &options)
 
   if (!options.prompts.empty())
   {
-    const auto generate = parseGenerateConfig(options.generateConfigJson);
-    int        status   = 0;
+    int status = 0;
     for (size_t i = 0; i < options.prompts.size(); ++i)
     {
       const auto promptIds = tokenizer->encode(options.prompts[i]);

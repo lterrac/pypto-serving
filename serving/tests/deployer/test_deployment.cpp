@@ -170,11 +170,11 @@ Json ask(httplib::Client &client, const std::string &session)
 // configuration
 // ---------------------------------------------------------------------------
 
-TEST(DeployerConfigTest, RefusesAConfigurationWithoutADocument) { EXPECT_THROW(parseDeployerConfig(R"({"routing_mode": "rules"})"), ConfigError); }
+TEST(DeployerConfigTest, RefusesAConfigurationWithoutADocument) { EXPECT_THROW((void)parseDeployerConfig(R"({"routing_mode": "rules"})"), ConfigError); }
 
-TEST(DeployerConfigTest, RefusesAnUnknownKey) { EXPECT_THROW(parseDeployerConfig(R"({"document": "d.json", "routing_modes": "rules"})"), ConfigError); }
+TEST(DeployerConfigTest, RefusesAnUnknownKey) { EXPECT_THROW((void)parseDeployerConfig(R"({"document": "d.json", "routing_modes": "rules"})"), ConfigError); }
 
-TEST(DeployerConfigTest, RefusesARoutingModeThatIsNotOne) { EXPECT_THROW(parseDeployerConfig(R"({"document": "d.json", "routing_mode": "whatever"})"), ConfigError); }
+TEST(DeployerConfigTest, RefusesARoutingModeThatIsNotOne) { EXPECT_THROW((void)parseDeployerConfig(R"({"document": "d.json", "routing_mode": "whatever"})"), ConfigError); }
 
 TEST(DeployerConfigTest, ReadsEverythingAConfigurationCanSay)
 {
@@ -201,7 +201,7 @@ TEST(DeployerConfigTest, ReadsEverythingAConfigurationCanSay)
 
 TEST(DeployerConfigTest, RefusesAScalingPolicyThatWouldFlap)
 {
-  EXPECT_THROW(parseDeployerConfig(R"({"document": "d.json", "scaling": {"scale_up_above": 1, "scale_down_below": 5}})"), ConfigError);
+  EXPECT_THROW((void)parseDeployerConfig(R"({"document": "d.json", "scaling": {"scale_up_above": 1, "scale_down_below": 5}})"), ConfigError);
 }
 
 // ---------------------------------------------------------------------------

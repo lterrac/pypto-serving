@@ -137,15 +137,19 @@ class RoutingStrategy
   virtual void onReplicaLost(const std::string &replicaName) = 0;
 
   /**
-   * The path this session already has, without planning one.
+   * The path this session would take, worked out without committing to it.
    *
-   * For inspection. `onRequest` is not a query: it plans, bumps the
-   * generation, publishes a rule to every hop and evicts another session's
+   * For inspection. `onRequest` is not a query: it bumps the generation,
+   * publishes a rule to every hop, and evicts and revokes another session's
    * path to make room. An endpoint that exists to report what was decided must
-   * not decide anything, so it asks this instead. Nullopt means nothing has
-   * been decided for this session yet.
+   * not publish, revoke or evict, so it asks this instead -- which still
+   * answers for a session that has no standing path yet, because reporting
+   * only on sessions that already exist would make the endpoint useless.
+   *
+   * Nullopt means this strategy cannot answer without committing, and the
+   * caller should fall back to `onRequest`.
    */
-  [[nodiscard]] virtual std::optional<RoutingPath> peek(const std::string & /*sessionId*/) const { return std::nullopt; }
+  [[nodiscard]] virtual std::optional<RoutingPath> peek(const std::string & /*sessionId*/) { return std::nullopt; }
 
   [[nodiscard]] virtual RoutingMode  mode() const  = 0;
   [[nodiscard]] virtual RoutingStats stats() const = 0;
@@ -193,7 +197,7 @@ class DistributedRuleStrategy : public RoutingStrategy
   [[nodiscard]] RoutingMode  mode() const override { return RoutingMode::DistributedRules; }
   [[nodiscard]] RoutingStats stats() const override { return _stats; }
 
-  [[nodiscard]] std::optional<RoutingPath> peek(const std::string &sessionId) const override;
+  [[nodiscard]] std::optional<RoutingPath> peek(const std::string &sessionId) override;
 
   /// Sessions with a standing path.
   [[nodiscard]] size_t activePaths() const { return _paths.size(); }

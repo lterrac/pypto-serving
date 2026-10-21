@@ -227,20 +227,16 @@ void RouterServer::registerRoutes()
       return;
     }
 
-    // Peek, never plan. This endpoint reports what was decided; deciding here
-    // would mean an operator looking at the routing table changed it.
-    if (const auto standing = _coordinator->peekRoute(session); standing.has_value())
-    {
-      Json hops = Json::array();
-      for (const auto &hop : standing->hops) { hops.push_back(Json{{"name", hop.name}, {"partition", hop.partition}, {"url", hop.baseUrl()}}); }
-      response.set_content(Json{{"session_id", session}, {"planned", false}, {"hops", hops}}.dump(), "application/json");
-      return;
-    }
-
+    // Reports, never commits. peekRoute answers for a session that has no
+    // standing path too, so the endpoint stays useful for a fresh id -- it just
+    // publishes nothing, revokes nothing and evicts nothing on the way. A
+    // strategy that cannot answer without committing returns nullopt, and only
+    // then does this fall back to the real routing call.
     RoutingPath path;
     try
     {
-      path = _coordinator->routeFor(session);
+      if (const auto preview = _coordinator->peekRoute(session); preview.has_value()) { path = *preview; }
+      else { path = _coordinator->routeFor(session); }
     }
     catch (const std::exception &e)
     {

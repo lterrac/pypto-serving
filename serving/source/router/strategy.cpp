@@ -164,13 +164,21 @@ void DistributedRuleStrategy::forget(const std::string &sessionId)
   _paths.erase(it);
 }
 
-std::optional<RoutingPath> DistributedRuleStrategy::peek(const std::string &sessionId) const
+std::optional<RoutingPath> DistributedRuleStrategy::peek(const std::string &sessionId)
 {
   const auto it = _paths.find(sessionId);
-  // Deliberately does not touch the LRU order either: looking at a session must
-  // not make another session the next one evicted.
-  if (it == _paths.end()) { return std::nullopt; }
-  return it->second.path;
+  // A standing path is reported as it stands, and the LRU order is deliberately
+  // left alone: looking at one session must not make another the next evicted.
+  if (it != _paths.end()) { return it->second.path; }
+
+  // No standing path, so work out what this session would get -- but commit to
+  // none of it. onRequest would bump the generation, publish a rule to every
+  // hop and evict a standing path to make room; an inspection call that did
+  // that would change the routing it was asked to report. The generation stays
+  // zero because nothing was published under it.
+  RoutingPath path = _planner.plan(sessionId);
+  path.generation  = 0;
+  return path;
 }
 
 void DistributedRuleStrategy::publish(const RoutingPath &path)

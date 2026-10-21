@@ -119,9 +119,9 @@ class Coordinator
    */
   [[nodiscard]] std::mutex &stateMapMutex() const { return _routingMutex; }
 
-  /// The path a session already has, without planning or publishing one. For
-  /// inspection endpoints; see RoutingStrategy::peek.
-  [[nodiscard]] std::optional<router::RoutingPath> peekRoute(const std::string &sessionId) const;
+  /// The path a session would take, without publishing, revoking or evicting
+  /// anything. For inspection endpoints; see RoutingStrategy::peek.
+  [[nodiscard]] std::optional<router::RoutingPath> peekRoute(const std::string &sessionId);
 
   /// Bring routing to the map, now, and say what changed. `service()` calls
   /// this; a test calls it directly.

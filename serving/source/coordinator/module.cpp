@@ -156,7 +156,7 @@ SyncReport Coordinator::syncLocked()
   return report;
 }
 
-std::optional<router::RoutingPath> Coordinator::peekRoute(const std::string &sessionId) const
+std::optional<router::RoutingPath> Coordinator::peekRoute(const std::string &sessionId)
 {
   const std::lock_guard<std::mutex> lock(_routingMutex);
   if (_strategy == nullptr) { return std::nullopt; }
