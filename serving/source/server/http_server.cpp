@@ -1,9 +1,13 @@
 #include <serving/server/http_server.hpp>
 
 #include <serving/router/proxy.hpp>
+#include <serving/util/blocking_queue.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <future>
+#include <thread>
 #include <map>
 #include <stdexcept>
 
@@ -21,6 +25,11 @@ using nlohmann::json;
 /// Hops a request may be forwarded through before the chain is called a cycle.
 /// A pipeline is a handful of stages deep; anything past that is a loop.
 constexpr int MAX_FORWARD_DEPTH = 8;
+/// Chunks held between the hop and the client before the reader is made to
+/// wait. Bounded so a client slower than the hop cannot grow the queue without
+/// limit; the same bound the router's proxy uses.
+constexpr size_t MAX_CHUNKS_IN_FLIGHT = 256;
+using ChunkQueue                      = serving::util::BlockingQueue<std::string>;
 /// Carries the count above between replicas.
 constexpr const char *FORWARD_DEPTH_HEADER = "x-serving-forward-depth";
 
@@ -276,29 +285,101 @@ bool HttpServer::forwardTo(const replica::NextHop &hop, const httplib::Request &
     }
   }
 
-  httplib::Client client(host, port);
-  client.set_connection_timeout(5, 0);
-  client.set_read_timeout(300, 0);
+  // Relayed as it arrives, not buffered. The forward decision is taken before
+  // the stream flag is ever read, so a `"stream": true` request whose session
+  // has a rule came through here: httplib's plain Post accumulates the whole
+  // SSE body and replays it in one write, which turns time-to-first-token into
+  // time-to-last-token, and the read timeout is wall-clock over the whole body
+  // so a long generation returned 502 with the answer already discarded.
+  auto queue           = std::make_shared<ChunkQueue>(MAX_CHUNKS_IN_FLIGHT);
+  auto upstreamStatus  = std::make_shared<std::atomic<int>>(0);
+  auto upstreamType    = std::make_shared<std::string>("application/json");
+  auto transportFailed = std::make_shared<std::atomic<bool>>(false);
+  auto headersReady    = std::make_shared<std::promise<void>>();
+  auto headersFuture   = headersReady->get_future();
+  auto signalled       = std::make_shared<std::once_flag>();
 
   httplib::Headers headers;
   headers.emplace(std::string(router::SESSION_HEADER), sessionId);
   headers.emplace(std::string(FORWARD_DEPTH_HEADER), std::to_string(depth + 1));
-  const auto upstream = client.Post(path, headers, request.body, "application/json");
-  if (upstream == nullptr)
+  const std::string body = request.body;
+
+  std::thread upstream([=] {
+    httplib::Client client(host, port);
+    client.set_connection_timeout(5, 0);
+    // Between chunks, not over the whole answer: a generation longer than this
+    // is normal, a silence this long is not.
+    client.set_read_timeout(300, 0);
+
+    httplib::Request upstreamRequest;
+    upstreamRequest.method  = "POST";
+    upstreamRequest.path    = path;
+    upstreamRequest.body    = body;
+    upstreamRequest.headers = headers;
+    upstreamRequest.set_header("Content-Type", "application/json");
+
+    upstreamRequest.response_handler = [=](const httplib::Response &fromHop) {
+      upstreamStatus->store(fromHop.status);
+      if (fromHop.has_header("Content-Type")) { *upstreamType = fromHop.get_header_value("Content-Type"); }
+      std::call_once(*signalled, [&] { headersReady->set_value(); });
+      return true;
+    };
+    upstreamRequest.content_receiver = [=](const char *data, size_t length, uint64_t, uint64_t) {
+      // A client that has gone closes the queue, which stops the upstream read
+      // and so closes the connection to the next hop -- the only cancellation
+      // this path has.
+      if (queue->closed()) { return false; }
+      queue->push(std::string(data, length));
+      return true;
+    };
+
+    httplib::Response ignored;
+    httplib::Error    error = httplib::Error::Success;
+    if (!client.send(upstreamRequest, ignored, error)) { transportFailed->store(true); }
+    std::call_once(*signalled, [&] { headersReady->set_value(); });
+    queue->close();
+  });
+  upstream.detach();
+
+  headersFuture.wait();
+
+  if (upstreamStatus->load() == 0)
   {
-    // Falling back to serving locally would answer from the wrong stage of the
-    // pipeline, so the caller has to see this.
+    // Nothing answered. Falling back to serving locally would answer from the
+    // wrong stage of the pipeline, so the caller has to see this.
+    queue->close();
     sendError(response, "next hop " + hop.name + " is unreachable", 502);
     return true;
   }
 
   _forwarded.fetch_add(1);
-  response.status = upstream->status;
+  response.status = upstreamStatus->load();
   response.set_header(std::string(router::SESSION_HEADER).c_str(), sessionId.c_str());
   response.set_header("x-forwarded-by", _config.modelId.c_str());
-  std::string contentType = "application/json";
-  if (upstream->has_header("Content-Type")) { contentType = upstream->get_header_value("Content-Type"); }
-  response.set_content(upstream->body, contentType);
+
+  // Destroying the provider closes the queue however the relay ends, so a
+  // client that disappears between chunks cannot leave the upstream thread
+  // blocked on a full queue for ever.
+  std::shared_ptr<void> closeOnDestroy(nullptr, [queue](void *) { queue->close(); });
+
+  response.set_chunked_content_provider(*upstreamType, [queue, transportFailed, closeOnDestroy](size_t, httplib::DataSink &sink) {
+    auto chunk = queue->pop();
+    if (!chunk.has_value())
+    {
+      // The hop died part-way through its answer. Ending the chunked body here
+      // would frame a short answer as a complete one, so the connection is
+      // dropped instead and every client sees a truncated transfer.
+      if (transportFailed->load()) { return false; }
+      sink.done();
+      return true;
+    }
+    if (!sink.write(chunk->data(), chunk->size()))
+    {
+      queue->close();
+      return false;
+    }
+    return true;
+  });
   return true;
 }
 

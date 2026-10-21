@@ -481,3 +481,69 @@ TEST(HttpServerTest, PublishesTheLoadAScalingDecisionNeeds)
   EXPECT_TRUE(body.contains("pending_tokens"));
   EXPECT_TRUE(body.contains("preemptions"));
 }
+
+TEST(HttpServerTest, AForwardedAnswerArrivesAsItIsProducedRatherThanAllAtOnce)
+{
+  // A next hop that answers in three chunks with real gaps between them, the
+  // shape of SSE during a generation.
+  static constexpr int GAP_MS = 150;
+  httplib::Server      hop;
+  hop.Post("/v1/completions", [&](const httplib::Request &, httplib::Response &response) {
+    response.set_chunked_content_provider("text/event-stream", [](size_t offset, httplib::DataSink &sink) {
+      if (offset > 0) { std::this_thread::sleep_for(std::chrono::milliseconds(GAP_MS)); }
+      static const char *chunks[] = {"data: one\n\n", "data: two\n\n", "data: [DONE]\n\n"};
+      const size_t       index    = offset / 11;
+      if (index >= 3)
+      {
+        sink.done();
+        return true;
+      }
+      const std::string payload = chunks[index];
+      sink.write(payload.data(), payload.size());
+      return true;
+    });
+  });
+
+  const int hopPort = hop.bind_to_any_port("127.0.0.1");
+  ASSERT_GT(hopPort, 0);
+  std::thread hopThread([&] { hop.listen_after_bind(); });
+  hop.wait_until_ready();
+
+  Fixture first("hi!", 4, "", true);
+  auto    client = first.client();
+  client.set_read_timeout(10, 0);
+
+  const std::string url = "127.0.0.1:" + std::to_string(hopPort);
+  ASSERT_EQ(client.Post("/control/rules", json{{"session_id", "s"}, {"next_hop", "p1a"}, {"next_hop_url", url}, {"generation", 1}}.dump(), "application/json")->status, 200);
+
+  const auto             began = std::chrono::steady_clock::now();
+  std::vector<long long> arrivalMs;
+
+  httplib::Request streamed;
+  streamed.method = "POST";
+  streamed.path   = "/v1/completions";
+  streamed.body   = json{{"prompt", "Say:"}, {"session_id", "s"}, {"stream", true}}.dump();
+  streamed.set_header("Content-Type", "application/json");
+  streamed.content_receiver = [&](const char *, size_t, uint64_t, uint64_t) {
+    arrivalMs.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began).count());
+    return true;
+  };
+
+  httplib::Response response;
+  httplib::Error    error = httplib::Error::Success;
+  const bool        sent  = client.send(streamed, response, error);
+
+  hop.stop();
+  hopThread.join();
+
+  ASSERT_TRUE(sent) << "the forwarded request did not complete";
+  ASSERT_GE(arrivalMs.size(), 2u) << "the answer arrived as a single blob";
+
+  // The point of the test: the first chunk reaches the client long before the
+  // last one is produced. Buffering the whole body -- which httplib's plain
+  // Post does -- made every chunk land together at the end, turning
+  // time-to-first-token into time-to-last-token for every forwarded session.
+  const long long spread = arrivalMs.back() - arrivalMs.front();
+  EXPECT_GE(spread, GAP_MS) << "every chunk arrived at once, so the relay buffered instead of streaming";
+  EXPECT_LT(arrivalMs.front(), 2 * GAP_MS) << "the first chunk waited for later ones";
+}
