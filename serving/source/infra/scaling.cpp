@@ -187,9 +187,18 @@ std::vector<ScalingOutcome> applyScaling(StateMap &map, CapacityProvider &provid
 
     if (decision.action == ScalingAction::ScaleDown)
     {
-      // Draining, not stopping: it keeps serving what it already has, and
-      // routing stops sending it anything new.
-      outcome.applied = map.setDesiredPhase(decision.replica, Phase::Draining) && map.setPhase(decision.replica, Phase::Draining);
+      // Observed draining, wanted dead. It keeps serving what it already has
+      // and routing stops sending it anything new, but the deployment wants the
+      // card back in the end -- so the two phases differ and reconcile keeps
+      // returning an action until they agree.
+      //
+      // Setting both to draining, as this did, made the drain its own
+      // destination: reconcile skips a replica already in its desired phase,
+      // the supervisor ignores Drain and the monitor stops watching, so nothing
+      // ever stopped it. The process held its card until the deployer exited,
+      // and a restart read the persisted "draining" back with no process behind
+      // it and withheld the card indefinitely.
+      outcome.applied = map.setDesiredPhase(decision.replica, Phase::Dead) && map.setPhase(decision.replica, Phase::Draining);
       outcome.replica = decision.replica;
       if (!outcome.applied) { outcome.declined = "no replica '" + decision.replica + "' to drain"; }
       outcomes.push_back(std::move(outcome));

@@ -140,6 +140,12 @@ class Supervisor
   /// counts as failed. Longer than a model load, or every launch gives up.
   void setReadyTimeout(double seconds) { _readyTimeout = seconds; }
 
+  /// How long a draining replica is given to finish what it is holding before
+  /// it is stopped. Routing has already stopped sending it anything new, so
+  /// this bounds the wait rather than measuring it: a drain with no deadline
+  /// never converges, and the card never comes back.
+  void setDrainTimeout(double seconds) { _drainTimeout = seconds; }
+
   SupervisionReport service();
 
   /// Failed attempts recorded for a replica, for a caller that wants to report
@@ -162,8 +168,12 @@ class Supervisor
   Backoff         _backoff;
   Clock           _clock;
   double          _readyTimeout = 600.0;
+  double          _drainTimeout = 120.0;
 
   std::map<std::string, Attempt> _attempts;
+  /// When each replica was first seen draining, so the deadline is measured
+  /// from the drain rather than from the deployer's start.
+  std::map<std::string, double> _drainingSince;
 };
 
 } // namespace serving::infra

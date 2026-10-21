@@ -15,6 +15,7 @@ using serving::infra::Phase;
 using serving::infra::Replica;
 using serving::infra::ReplicaStarter;
 using serving::infra::StateMap;
+using serving::infra::reconcile;
 using serving::infra::Supervisor;
 
 namespace
@@ -364,6 +365,48 @@ TEST(ProcessStarterTest, StopKillsIt)
   EXPECT_FALSE(starter.running("qwen-0"));
   // Stopping something that was never started is a no-op, not a crash.
   starter.stop(replica);
+}
+
+TEST(SupervisorTest, ADrainEndsInAStopSoTheCardComesBack)
+{
+  StateMap map = atlas();
+  Replica  r   = wanted("qwen-0", Phase::Active);
+  // What a scale-down leaves behind: still serving what it has, but wanted
+  // gone. The two phases differ, which is what keeps reconcile returning an
+  // action until the replica is actually stopped.
+  r.phase        = Phase::Draining;
+  r.desiredPhase = Phase::Dead;
+  map.addReplica(r);
+
+  FakeStarter starter;
+  FakeProbe   probe;
+  TestClock   clock;
+  Supervisor  supervisor(map, starter, probe, Backoff{}, [&clock] { return clock(); });
+  supervisor.setDrainTimeout(30.0);
+
+  // Inside the deadline it is left alone: it is still finishing what it took,
+  // and routing has already stopped sending it anything new.
+  clock.now = 0.0;
+  supervisor.service();
+  clock.now = 29.0;
+  supervisor.service();
+  EXPECT_TRUE(starter.stops.empty()) << "a draining replica was stopped before its deadline";
+  EXPECT_EQ(map.replica("qwen-0")->phase, Phase::Draining);
+  // It still holds its card while it is draining.
+  EXPECT_EQ(map.devicesInUse("hg-atlas-01"), (std::vector<int>{0}));
+
+  // Past it, the drain ends rather than running for ever. Without a deadline
+  // the replica sat in draining until the deployer exited and the card was
+  // never returned to the pool.
+  clock.now = 31.0;
+  const auto report = supervisor.service();
+  EXPECT_EQ(starter.stops, (std::vector<std::string>{"qwen-0"}));
+  EXPECT_EQ(report.stopped, (std::vector<std::string>{"qwen-0"}));
+  EXPECT_EQ(map.replica("qwen-0")->phase, Phase::Dead);
+  EXPECT_TRUE(map.devicesInUse("hg-atlas-01").empty()) << "the card did not come back";
+
+  // And it settles: nothing is left to do once the phases agree.
+  EXPECT_TRUE(reconcile(map).empty());
 }
 
 TEST(ProcessStarterTest, StopReachesAChildThatLeftTheProcessGroup)

@@ -78,9 +78,26 @@ SupervisionReport Supervisor::service()
 
     if (action.action == Action::Stop)
     {
+      // A draining replica is still serving what it took, so it is given a
+      // bounded while to finish before it is stopped. Routing stopped sending
+      // it anything new when it entered the phase, so this is a deadline, not
+      // a measurement -- and a deadline is what makes the drain terminate.
+      // Without one the replica sat in draining until the deployer exited and
+      // its card never came back.
+      if (replica.phase == Phase::Draining)
+      {
+        const auto [since, inserted] = _drainingSince.try_emplace(action.replica, now);
+        if (now - since->second < _drainTimeout)
+        {
+          report.waiting += 1;
+          continue;
+        }
+      }
+
       _starter.stop(replica);
       _map.setPhase(action.replica, Phase::Dead);
       _attempts.erase(action.replica);
+      _drainingSince.erase(action.replica);
       report.stopped.push_back(action.replica);
       continue;
     }
