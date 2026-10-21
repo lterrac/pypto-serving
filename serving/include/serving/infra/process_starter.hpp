@@ -65,6 +65,10 @@ class ProcessStarter final : public ReplicaStarter
   {
     int  leader = 0;
     bool reaped = false;
+    /// Whether the leader is a session leader, so its session id is its pid and
+    /// sweeping that session reaches only this replica. False means the sweep
+    /// must not run: the session id would be the deployer's own.
+    bool ownSession = false;
   };
 
   /// Collect the leader if it has exited. True once there is nothing left to

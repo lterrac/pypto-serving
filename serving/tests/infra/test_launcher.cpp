@@ -291,6 +291,8 @@ TEST(SupervisorTest, StartsSeveralPartitionsInOneTick)
 
 #include <filesystem>
 #include <fstream>
+#include <csignal>
+#include <unistd.h>
 
 #include <serving/infra/process_starter.hpp>
 
@@ -362,6 +364,49 @@ TEST(ProcessStarterTest, StopKillsIt)
   EXPECT_FALSE(starter.running("qwen-0"));
   // Stopping something that was never started is a no-op, not a crash.
   starter.stop(replica);
+}
+
+TEST(ProcessStarterTest, StopReachesAChildThatLeftTheProcessGroup)
+{
+  // What simpler's per-chip workers do as they fork: os.setpgid(0, 0), which
+  // makes each its own group leader (simpler/worker.py:8127). Measured on
+  // hardware, the chip worker's pgid is its own pid while the wrapper's group
+  // is the shell's -- so `kill(-pgid)` reaches the wrapper and the python and
+  // misses the process holding the card. setpgid moves a process between
+  // groups within its session and cannot leave it, so the session still holds
+  // it; this is the sweep that finds it.
+  //
+  // The worker writes a marker while it lives and removes it on the way out, so
+  // the assertion is about the process actually being gone rather than about
+  // what was signalled.
+  const auto marker = std::filesystem::temp_directory_path() / "serving-regrouped-child.pid";
+  std::filesystem::remove(marker);
+
+  // Regroup, record, then outlive any plausible test. A `sleep` in its own
+  // group is exactly the shape that escaped the old stop().
+  ProcessStarter starter("sh -c 'python3 -c \"import os,time;os.setpgid(0,0);open(\\\"" + marker.string() +
+                         "\\\",\\\"w\\\").write(str(os.getpid()));time.sleep(120)\" & sleep 120'");
+  Replica        replica = wanted("qwen-0");
+
+  ASSERT_TRUE(starter.start(replica));
+
+  // Wait for the regrouped child to exist before stopping anything.
+  for (int waited = 0; waited < 100 && !std::filesystem::exists(marker); ++waited) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+  ASSERT_TRUE(std::filesystem::exists(marker)) << "the regrouped child never started; the test proves nothing";
+
+  std::ifstream read(marker);
+  pid_t         child = 0;
+  read >> child;
+  ASSERT_GT(child, 0);
+  // It really did leave the group it was started in.
+  EXPECT_NE(::getpgid(child), ::getpgid(0));
+
+  starter.stop(replica);
+
+  // Gone, not merely signalled.
+  EXPECT_NE(::kill(child, 0), 0) << "a worker that regrouped itself survived stop()";
+  EXPECT_FALSE(starter.running("qwen-0"));
+  std::filesystem::remove(marker);
 }
 
 TEST(SupervisorTest, AProcessThatDiesIsAFailedAttemptNotAnEndlessWait)
