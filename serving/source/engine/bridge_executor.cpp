@@ -58,6 +58,28 @@ BridgeExecutor::BridgeExecutor(BridgeConfig config)
 {
   if (Py_IsInitialized() == 0)
   {
+    // Pre-initialised the way the `python3` binary does, not with a bare
+    // Py_Initialize.
+    //
+    // `python3` applies PEP 538/540 during startup: under a C or POSIX locale
+    // it turns UTF-8 mode on, so `open()` reads UTF-8 whatever the environment
+    // says. Embedding skips that, and the interpreter is left using the
+    // locale's encoding -- ASCII under the task broker, which sets no LANG. A
+    // model is then loaded by reading files that are UTF-8 by definition:
+    // Qwen3-14B's tokenizer.json has a non-ASCII byte 7483 in, and the load
+    // died there with "'ascii' codec can't decode byte 0xc2", nowhere near
+    // anything that looked like an encoding problem.
+    //
+    // Asked for explicitly rather than inferred, because the right answer does
+    // not depend on the locale: every file this reads is UTF-8.
+    PyPreConfig preConfig;
+    PyPreConfig_InitPythonConfig(&preConfig);
+    preConfig.utf8_mode = 1;
+    if (const PyStatus status = Py_PreInitialize(&preConfig); PyStatus_Exception(status))
+    {
+      throw std::runtime_error(std::string("could not pre-initialize the embedded interpreter: ") + (status.err_msg != nullptr ? status.err_msg : "unknown"));
+    }
+
     Py_Initialize();
     _impl->initialized = true;
   }
