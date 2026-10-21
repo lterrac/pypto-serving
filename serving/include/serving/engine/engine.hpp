@@ -138,6 +138,9 @@ class Engine
   [[nodiscard]] StepCommand buildStepCommand(const sched::SchedulerOutput &output) const;
   void                      deliver(const std::vector<sched::RequestOutput> &outputs);
   void                      failRequest(const std::string &requestId, const std::string &reason);
+  /// Remember that a request has ended, so the next step tells the executor to
+  /// release whatever it was holding for it.
+  void noteFinished(const std::string &requestId);
 
   EngineConfig                   _config;
   const model::TokenizerAdapter &_tokenizer;
@@ -148,6 +151,9 @@ class Engine
 
   mutable std::mutex                              _mutex;
   std::unordered_map<std::string, RequestContext> _contexts;
+  /// Ended since the last step was built, and not yet reported to the executor.
+  /// Guarded by `_mutex`, because a request can end on a caller's thread.
+  std::vector<std::string> _finishedSinceStep;
 
   std::thread _thread;
   /// Signalled by the engine thread once its loop is actually running, so

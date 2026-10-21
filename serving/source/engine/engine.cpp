@@ -167,6 +167,9 @@ void Engine::abortRequest(const std::string &requestId)
     stream = it->second.stream;
     _scheduler->abortRequest(requestId);
     _contexts.erase(it);
+    // Aborted is ended: the executor is still holding this request's sampler
+    // state, and nothing else will tell it otherwise.
+    _finishedSinceStep.push_back(requestId);
   }
   stream->close();
 }
@@ -221,7 +224,14 @@ void Engine::runOneStep()
     return;
   }
 
-  const StepCommand command = buildStepCommand(output);
+  StepCommand command = buildStepCommand(output);
+  {
+    // Carried on the next step rather than sent on their own: there is no such
+    // thing as a step with no work, and a request that ended can wait one tick
+    // to be reported.
+    const std::lock_guard<std::mutex> lock(_mutex);
+    command.finished.swap(_finishedSinceStep);
+  }
   // Marked before the call and cleared after it, so the window measured is
   // exactly the one that can hang: the executor, which is where a wedged
   // kernel or a collective that never returns leaves the loop thread blocked.
@@ -377,12 +387,19 @@ void Engine::deliver(const std::vector<sched::RequestOutput> &outputs)
         // its blocks and its slot have to be released explicitly.
         if (!out.finished && _scheduler != nullptr) { _scheduler->finishRequest(out.requestId, sched::RequestStatus::FinishedStop); }
         _contexts.erase(it);
+        _finishedSinceStep.push_back(out.requestId);
       }
     }
 
     stream->push(std::move(update));
     if (finished) { stream->close(); }
   }
+}
+
+void Engine::noteFinished(const std::string &requestId)
+{
+  const std::lock_guard<std::mutex> lock(_mutex);
+  _finishedSinceStep.push_back(requestId);
 }
 
 void Engine::failRequest(const std::string &requestId, const std::string &reason)
@@ -397,6 +414,7 @@ void Engine::failRequest(const std::string &requestId, const std::string &reason
     // its blocks never freed, failing whatever is batched with it.
     _scheduler->abortRequest(requestId);
     _contexts.erase(it);
+    _finishedSinceStep.push_back(requestId);
   }
   TokenOutput update;
   update.requestId    = requestId;

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -463,5 +464,41 @@ TEST(EngineTest, AStepThatNeverReturnsIsUnhealthyWhileStillBeingReady)
   EXPECT_TRUE(recovered) << "the engine never reported healthy again after the steps resumed";
 
   engine.abortRequest("r");
+  engine.stop();
+}
+
+TEST(EngineTest, TellsTheExecutorWhichRequestsHaveEnded)
+{
+  const CharTokenizer tokenizer;
+  ScriptedExecutor    executor({'a', 'b', 'c', 'd'});
+  executor.promptLength = 2;
+
+  Engine engine(makeConfig(), tokenizer, executor);
+  engine.start();
+
+  serving::config::GenerateConfig generate;
+  generate.maxNewTokens = 1; // finishes by length on the first sampled token
+
+  const auto stream = engine.addRequest("r", {'h', 'i'}, generate);
+  while (const auto update = stream->pop())
+  {
+    if (update->finished) { break; }
+  }
+
+  // The engine frees its own KV blocks, but the executor keeps per-request
+  // state nothing else can reach -- a seeded request owns a generator in the
+  // sampler. Without this channel the command said only what to run, never
+  // what had ended, so that state was kept for the life of the process.
+  bool reported = false;
+  for (int waited = 0; waited < 200 && !reported; ++waited)
+  {
+    // Carried on the next step rather than sent on its own, so give the loop
+    // one more step to run.
+    (void)engine.addRequest("keepgoing" + std::to_string(waited), {'h', 'i'}, generate);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    reported = std::find(executor.released.begin(), executor.released.end(), "r") != executor.released.end();
+  }
+  EXPECT_TRUE(reported) << "a finished request was never reported to the executor";
+
   engine.stop();
 }

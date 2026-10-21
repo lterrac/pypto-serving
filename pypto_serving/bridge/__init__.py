@@ -153,10 +153,18 @@ def step(command_json: str) -> str:
 
 
 def _run_step(command: dict[str, Any]) -> dict[str, list[int]]:
-    return run_step(command.get("prefill") or [], command.get("decode") or [])
+    return run_step(
+        command.get("prefill") or [],
+        command.get("decode") or [],
+        command.get("finished") or [],
+    )
 
 
-def run_step(prefill: list[dict[str, Any]], decode: list[dict[str, Any]]) -> dict[str, list[int]]:
+def run_step(
+    prefill: list[dict[str, Any]],
+    decode: list[dict[str, Any]],
+    finished: list[str] | None = None,
+) -> dict[str, list[int]]:
     """One step given prefill and decode items; see the module docstring."""
     state = _require_state()
     tokens: dict[str, list[int]] = {}
@@ -164,7 +172,38 @@ def run_step(prefill: list[dict[str, Any]], decode: list[dict[str, Any]]) -> dic
         tokens.update(_run_prefill(state, prefill))
     if decode:
         tokens.update(_run_decode(state, decode))
+    # After the work, so a request that ended on the previous step does not have
+    # its state dropped while this one is still reading it.
+    if finished:
+        _release_finished(state, finished)
     return tokens
+
+
+def _release_finished(state: _BridgeState, request_ids: list[str]) -> None:
+    """Drop whatever the sampler and the executor were keeping per request.
+
+    Mirrors ``WorkerProcess._release_finished_request_state``. A seeded request
+    owns a ``torch.Generator`` in the sampler, and the DeepSeek executors hold
+    device state per request; nothing else tells either of them a request has
+    ended, so without this they are kept for the life of the process.
+
+    Best effort on purpose: an executor that keeps nothing per request does not
+    implement the hook, and failing a step because a cleanup hook is missing
+    would turn a leak into an outage.
+    """
+    release_sampler = getattr(state.sampler, "release_requests", None)
+    if callable(release_sampler):
+        try:
+            release_sampler(list(request_ids))
+        except Exception:  # noqa: BLE001 -- cleanup must not fail the step
+            logger.exception("releasing sampler state failed for %s", request_ids)
+
+    release_executor = getattr(state.executor, "release_finished_requests", None)
+    if callable(release_executor):
+        try:
+            release_executor(list(request_ids))
+        except Exception:  # noqa: BLE001 -- cleanup must not fail the step
+            logger.exception("releasing executor state failed for %s", request_ids)
 
 
 def _run_prefill(state: _BridgeState, items: list[dict[str, Any]]) -> dict[str, list[int]]:

@@ -72,6 +72,10 @@ class ScriptedExecutor : public engine::ModelExecutor
   engine::StepResult executeStep(const engine::StepCommand &command) override
   {
     steps += 1;
+    {
+      const std::lock_guard<std::mutex> lock(_decodedMutex);
+      for (const std::string &id : command.finished) { released.push_back(id); }
+    }
     // Stands in for a wedged kernel: the loop thread is blocked inside the
     // executor, which is where a real hang leaves it.
     if (const int block = blockMilliseconds.load(); block > 0) { std::this_thread::sleep_for(std::chrono::milliseconds(block)); }
@@ -112,6 +116,9 @@ class ScriptedExecutor : public engine::ModelExecutor
   std::map<std::string, int> promptLengths;
   int                        promptLength = 0;
   std::string                failWith;
+  /// Requests the engine reported as finished, in the order it reported them.
+  /// A real executor drops its sampler and device state for these.
+  std::vector<std::string> released;
   /// How long each step blocks inside the executor. 0 returns at once.
   std::atomic<int> blockMilliseconds{0};
   std::atomic<int> steps{0};

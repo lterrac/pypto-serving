@@ -66,6 +66,23 @@ struct StepCommand
   std::vector<PrefillItem> prefill;
   std::vector<DecodeItem>  decode;
 
+  /**
+   * Requests that have finished since the last step, so the executor can drop
+   * whatever it was keeping for them.
+   *
+   * The engine frees its own KV blocks, but the executor keeps per-request
+   * state of its own that nothing else can reach: a seeded request owns a
+   * torch.Generator in the sampler, and the DeepSeek executors hold device
+   * state per request. Without a channel for this the command said only what
+   * to run, never what had ended, so that state accumulated for the life of
+   * the process -- one generator and one dict entry per seeded request, for
+   * ever.
+   *
+   * Reported once, on the first step after the request ended. An executor that
+   * keeps nothing per request can ignore it.
+   */
+  std::vector<std::string> finished;
+
   [[nodiscard]] bool empty() const { return prefill.empty() && decode.empty(); }
 };
 

@@ -160,6 +160,10 @@ StepResult BridgeExecutor::executeStep(const StepCommand &command)
     payload["decode"].push_back(
       Json{{"request_id", item.requestId}, {"last_token", item.lastToken}, {"seq_len", item.seqLen}, {"block_ids", item.blockIds}, {"sampling", samplingJson(item.sampling)}});
   }
+  // Reported once, on the first step after the request ended, so the executor
+  // can drop the sampler generator and any device state it was keeping.
+  payload["finished"] = command.finished;
+
   const std::string request = payload.dump();
 
   // Take the GIL only around the call itself.
