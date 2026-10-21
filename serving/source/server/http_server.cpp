@@ -492,13 +492,16 @@ void HttpServer::registerRoutes()
       prompt = body.at("prompt").get<std::string>();
     }
 
-    auto generate = parseGenerateConfig(body, _config.defaults);
-    // The completions endpoint runs to max_tokens rather than stopping at EOS.
-    // Historic, and deliberate: the Python does the same, and a port that
-    // quietly dropped it answered a documented request with a shorter
-    // generation. The chat endpoint takes the server-wide setting instead,
-    // because the OpenAI chat schema has no ignore_eos field.
-    if (!chat) { generate.ignoreEos = true; }
+    // Both endpoints honour EOS unless the caller or the operator says
+    // otherwise. The Python forces ignore_eos on /v1/completions
+    // (server.py:312) and calls it a historic override in its own comment; it
+    // is not reproduced here. Ignoring the model's end-of-sequence token pads
+    // every completion out to max_tokens and reports finish_reason "length"
+    // where "stop" is the truth, which is wrong for an OpenAI-compatible
+    // endpoint whatever its history. A caller who wants the old behaviour asks
+    // for it with ignore_eos, and an operator can set it for the whole server
+    // through --generate-config.
+    const auto generate = parseGenerateConfig(body, _config.defaults);
     if (generate.topK.has_value() && *generate.topK <= 0)
     {
       sendError(response, "top_k must be positive", 400);
