@@ -82,8 +82,18 @@ class ReplicaProxy
    * about the loss separately and replans.
    *
    * An empty or unroutable name is the unpinned relay.
+   *
+   * `sessionId` is resolved once by the caller and passed in. It must not be
+   * re-derived here: resolveSessionId mints a fresh random id when the client
+   * supplied none, so a second call returns a different session from the one
+   * the coordinator planned and published for -- the client would be handed an
+   * id no rule matches, and every request would leak a standing path.
    */
-  void forwardPinned(const httplib::Request &request, httplib::Response &response, const std::string &path, const std::string &preferredReplica);
+  void forwardPinned(const httplib::Request &request,
+                     httplib::Response      &response,
+                     const std::string      &path,
+                     const std::string      &preferredReplica,
+                     const std::string      &sessionId);
 
   /// Requests that reached a second replica because the first was unreachable.
   [[nodiscard]] int resends() const { return _resends.load(); }
@@ -96,7 +106,8 @@ class ReplicaProxy
 
   /// One attempt against one replica, returning once its status is known or
   /// the attempt has provably failed without one.
-  [[nodiscard]] Attempt send(const ReplicaSpec &replica, const httplib::Request &request, const std::string &body, const std::string &path);
+  [[nodiscard]] Attempt
+  send(const ReplicaSpec &replica, const httplib::Request &request, const std::string &body, const std::string &path, const std::string &sessionId);
 
   ReplicaRegistry &_registry;
   std::mutex      &_registryMutex;

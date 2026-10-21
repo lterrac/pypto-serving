@@ -164,6 +164,15 @@ void DistributedRuleStrategy::forget(const std::string &sessionId)
   _paths.erase(it);
 }
 
+std::optional<RoutingPath> DistributedRuleStrategy::peek(const std::string &sessionId) const
+{
+  const auto it = _paths.find(sessionId);
+  // Deliberately does not touch the LRU order either: looking at a session must
+  // not make another session the next one evicted.
+  if (it == _paths.end()) { return std::nullopt; }
+  return it->second.path;
+}
+
 void DistributedRuleStrategy::publish(const RoutingPath &path)
 {
   // Each hop is told where to forward next; the last hop has nowhere to go.

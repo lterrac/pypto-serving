@@ -192,8 +192,12 @@ void RouterServer::registerRoutes()
 
   const auto proxyTo = [this](const std::string &path) {
     return [this, path](const httplib::Request &request, httplib::Response &response) {
+      // Resolved once, here, and carried through both the plan and the relay.
+      // resolveSessionId mints a new random id when the client supplied none,
+      // so resolving it a second time inside the proxy would plan for one
+      // session and answer with another.
       const std::string sessionId = resolveSessionId(request, request.body);
-      _proxy.forwardPinned(request, response, path, plannedHop(request, sessionId));
+      _proxy.forwardPinned(request, response, path, plannedHop(request, sessionId), sessionId);
     };
   };
   _server->Post("/v1/completions", proxyTo("/v1/completions"));
@@ -211,6 +215,27 @@ void RouterServer::registerRoutes()
     }
 
     const std::string session = request.get_param_value("session");
+    // An id no request could ever carry cannot have a path, and planning one
+    // for it would publish rules to every replica that nothing can match. A
+    // bare GET /routing used to do exactly that, evicting a real session each
+    // time it was curled.
+    if (!isUsableSessionId(session))
+    {
+      response.status = 400;
+      response.set_content(Json{{"error", "a 'session' query parameter is required, and must be 1-128 characters of letters, digits, '.', '_', ':' or '-'"}}.dump(),
+                           "application/json");
+      return;
+    }
+
+    // Peek, never plan. This endpoint reports what was decided; deciding here
+    // would mean an operator looking at the routing table changed it.
+    if (const auto standing = _coordinator->peekRoute(session); standing.has_value())
+    {
+      Json hops = Json::array();
+      for (const auto &hop : standing->hops) { hops.push_back(Json{{"name", hop.name}, {"partition", hop.partition}, {"url", hop.baseUrl()}}); }
+      response.set_content(Json{{"session_id", session}, {"planned", false}, {"hops", hops}}.dump(), "application/json");
+      return;
+    }
 
     RoutingPath path;
     try

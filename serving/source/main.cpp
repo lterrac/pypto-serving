@@ -19,6 +19,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -145,11 +146,40 @@ serving::config::GenerateConfig parseGenerateConfig(const std::string &text)
   serving::config::GenerateConfig generate;
   if (text.empty()) { return generate; }
   const Json body = Json::parse(text);
+  if (!body.is_object()) { throw std::runtime_error("--generate-config must be a JSON object"); }
+
+  // Every field GenerateConfig has, and nothing else accepted. A key this
+  // parser did not know used to be ignored in silence, so `{"max_tokens": 8}`
+  // -- the HTTP spelling -- generated 256 tokens and said nothing, and `seed`
+  // and `stop` were dropped outright. The Python entry point for this same
+  // flag rejects unknown keys, and the two have to agree.
+  static const std::set<std::string> known{"max_new_tokens", "temperature", "top_p", "top_k", "seed", "stop", "stream", "ignore_eos"};
+  std::string                        unknown;
+  for (const auto &entry : body.items())
+  {
+    if (known.count(entry.key()) == 0) { unknown += (unknown.empty() ? "" : ", ") + entry.key(); }
+  }
+  if (!unknown.empty()) { throw std::runtime_error("--generate-config: unknown keys " + unknown); }
+
   if (body.contains("max_new_tokens")) { generate.maxNewTokens = body.at("max_new_tokens").get<int>(); }
   if (body.contains("temperature")) { generate.temperature = body.at("temperature").get<double>(); }
   if (body.contains("top_p")) { generate.topP = body.at("top_p").get<double>(); }
   if (body.contains("top_k")) { generate.topK = body.at("top_k").get<int>(); }
+  if (body.contains("seed")) { generate.seed = body.at("seed").get<uint64_t>(); }
+  if (body.contains("stream")) { generate.stream = body.at("stream").get<bool>(); }
   if (body.contains("ignore_eos")) { generate.ignoreEos = body.at("ignore_eos").get<bool>(); }
+  if (body.contains("stop"))
+  {
+    const auto &stop = body.at("stop");
+    if (stop.is_string()) { generate.stop.push_back(stop.get<std::string>()); }
+    else if (stop.is_array())
+    {
+      for (const auto &entry : stop)
+      {
+        if (entry.is_string()) { generate.stop.push_back(entry.get<std::string>()); }
+      }
+    }
+  }
   return generate;
 }
 
@@ -242,11 +272,17 @@ int runServing(const Options &options)
       std::string      text;
       std::vector<int> tokens;
       std::string      finishReason;
+      std::string      error;
       while (auto update = stream->pop())
       {
         text = update->text;
         if (update->tokenId.has_value()) { tokens.push_back(*update->tokenId); }
         if (update->finished) { finishReason = update->finishReason; }
+        // The bridge returns the Python exception and its traceback, and the
+        // HTTP path reports them. This is the path device verification runs on,
+        // so dropping them left the one failure that matters printing nothing
+        // but FINISHED_ERROR.
+        if (!update->error.empty()) { error = update->error; }
       }
       const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
 
@@ -256,8 +292,9 @@ int runServing(const Options &options)
       for (size_t t = 0; t < tokens.size(); ++t) { std::printf("%s%d", t ? ", " : "", tokens[t]); }
       std::printf("]\n");
       std::printf("finish_reason: %s\n", finishReason.c_str());
+      if (!error.empty()) { std::fprintf(stderr, "error: %s\n", error.c_str()); }
       std::printf("[generate] %zu tokens in %.2fs (%.1f tok/s)\n", tokens.size(), elapsed, tokens.empty() ? 0.0 : static_cast<double>(tokens.size()) / elapsed);
-      if (tokens.empty()) { status = 1; }
+      if (tokens.empty() || !error.empty()) { status = 1; }
     }
     engine.stop();
     return status;
@@ -267,6 +304,9 @@ int runServing(const Options &options)
   serverConfig.host    = options.host;
   serverConfig.port    = options.port;
   serverConfig.modelId = options.servedModelName;
+  // The same --generate-config the offline path uses, so one deployment
+  // answers the same way however it is asked.
+  serverConfig.defaults = generate;
   // Outlives the server, which borrows it.
   std::unique_ptr<serving::replica::RuleTable> rules;
   if (options.forwarding) { rules = std::make_unique<serving::replica::RuleTable>(); }

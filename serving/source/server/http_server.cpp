@@ -3,6 +3,7 @@
 #include <serving/router/proxy.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 
@@ -17,12 +18,19 @@ namespace
 
 using nlohmann::json;
 
+/// Hops a request may be forwarded through before the chain is called a cycle.
+/// A pipeline is a handful of stages deep; anything past that is a loop.
+constexpr int MAX_FORWARD_DEPTH = 8;
+/// Carries the count above between replicas.
+constexpr const char *FORWARD_DEPTH_HEADER = "x-serving-forward-depth";
+
 long nowSeconds() { return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 
-/// Pull a GenerateConfig out of a request body, falling back to the defaults.
-config::GenerateConfig parseGenerateConfig(const json &body)
+/// Pull a GenerateConfig out of a request body, falling back to the server's
+/// own defaults for every field the request did not set.
+config::GenerateConfig parseGenerateConfig(const json &body, const config::GenerateConfig &defaults)
 {
-  config::GenerateConfig generate;
+  config::GenerateConfig generate = defaults;
   if (body.contains("max_tokens") && body.at("max_tokens").is_number()) { generate.maxNewTokens = body.at("max_tokens").get<int>(); }
   if (body.contains("temperature") && body.at("temperature").is_number()) { generate.temperature = body.at("temperature").get<double>(); }
   if (body.contains("top_p") && body.at("top_p").is_number()) { generate.topP = body.at("top_p").get<double>(); }
@@ -71,8 +79,18 @@ std::string buildChatTemplateContext(const json &body, nlohmann::ordered_json &c
     const auto &effort = body.at("reasoning_effort");
     if (!effort.is_string()) { return "reasoning_effort must be a string"; }
     const auto value = effort.get<std::string>();
-    // setdefault: an explicit enable_thinking in chat_template_kwargs wins.
-    if (!context.contains("enable_thinking")) { context["enable_thinking"] = value != "none"; }
+    if (value == "none")
+    {
+      // A hard override, not a default. Asking for no reasoning and getting a
+      // <think> block because chat_template_kwargs also mentioned thinking is
+      // the opposite of what was asked for. `thinking` is the second key the
+      // DeepSeek template reads, and it has to be written too.
+      context["enable_thinking"] = false;
+      context["thinking"]        = false;
+    }
+    // setdefault otherwise: an explicit enable_thinking in chat_template_kwargs
+    // wins over an effort level that merely implies one.
+    else if (!context.contains("enable_thinking")) { context["enable_thinking"] = true; }
     context["reasoning_effort"] = value;
   }
 
@@ -217,9 +235,34 @@ bool HttpServer::forwardTo(const replica::NextHop &hop, const httplib::Request &
   // this and this replica cannot. Serving it here is the honest fallback.
   if (hop.endpoint.empty()) { return false; }
 
-  std::string host = hop.endpoint;
-  int         port = 80;
-  if (const auto scheme = host.find("://"); scheme != std::string::npos) { host = host.substr(scheme + 3); }
+  // A rule naming this replica, or a cycle through a sibling, would otherwise
+  // recurse over HTTP until the thread and socket pools are gone. Revokes are
+  // best-effort, so a replica that missed one can point back at a replica whose
+  // replanned rule points here -- reachable without anyone meaning it.
+  const int depth = request.has_header(FORWARD_DEPTH_HEADER) ? std::atoi(request.get_header_value(FORWARD_DEPTH_HEADER).c_str()) : 0;
+  if (depth >= MAX_FORWARD_DEPTH)
+  {
+    sendError(response, "forwarding for this session exceeded " + std::to_string(MAX_FORWARD_DEPTH) + " hops; the routing rules form a cycle", 508);
+    return true;
+  }
+
+  std::string host   = hop.endpoint;
+  std::string scheme = "http";
+  int         port   = 80;
+  if (const auto mark = host.find("://"); mark != std::string::npos)
+  {
+    scheme = host.substr(0, mark);
+    host   = host.substr(mark + 3);
+  }
+  // Refused rather than downgraded. This build links no TLS, so dialling an
+  // https next hop over a plain client would put prompts and generated text on
+  // the wire in clear -- the exact thing ReplicaSpec::scheme exists to prevent.
+  // Saying so beats doing it quietly.
+  if (scheme != "http")
+  {
+    sendError(response, "next hop " + hop.name + " is published as '" + scheme + "', which this build cannot dial; it speaks http only", 502);
+    return true;
+  }
   if (const auto colon = host.rfind(':'); colon != std::string::npos)
   {
     try
@@ -239,6 +282,7 @@ bool HttpServer::forwardTo(const replica::NextHop &hop, const httplib::Request &
 
   httplib::Headers headers;
   headers.emplace(std::string(router::SESSION_HEADER), sessionId);
+  headers.emplace(std::string(FORWARD_DEPTH_HEADER), std::to_string(depth + 1));
   const auto upstream = client.Post(path, headers, request.body, "application/json");
   if (upstream == nullptr)
   {
@@ -279,6 +323,10 @@ void HttpServer::registerRoutes()
                   {"ready", _engine.isReady()},
                   // Admitted and not yet generated: the queue a scaling
                   // decision actually cares about.
+                  // Requests in flight: what the scaling thresholds are
+                  // expressed in. Without it the control plane reads every
+                  // replica as idle.
+                  {"outstanding", _engine.outstandingRequests()},
                   {"pending_tokens", _engine.pendingTokenLoad()},
                   // Rising means the KV pool cannot hold what was admitted, so
                   // this replica is already failing to serve what it took.
@@ -353,7 +401,13 @@ void HttpServer::registerRoutes()
       prompt = body.at("prompt").get<std::string>();
     }
 
-    const auto generate = parseGenerateConfig(body);
+    auto generate = parseGenerateConfig(body, _config.defaults);
+    // The completions endpoint runs to max_tokens rather than stopping at EOS.
+    // Historic, and deliberate: the Python does the same, and a port that
+    // quietly dropped it answered a documented request with a shorter
+    // generation. The chat endpoint takes the server-wide setting instead,
+    // because the OpenAI chat schema has no ignore_eos field.
+    if (!chat) { generate.ignoreEos = true; }
     if (generate.topK.has_value() && *generate.topK <= 0)
     {
       sendError(response, "top_k must be positive", 400);

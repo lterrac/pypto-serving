@@ -121,13 +121,24 @@ struct ReplicaProxy::Attempt
 /// Fires the request at one replica and returns once its status is known --
 /// or once the attempt has provably failed without one. The body keeps
 /// arriving on `queue` after this returns.
-ReplicaProxy::Attempt ReplicaProxy::send(const ReplicaSpec &replica, const httplib::Request &request, const std::string &body, const std::string &path)
+ReplicaProxy::Attempt
+ReplicaProxy::send(const ReplicaSpec &replica, const httplib::Request &request, const std::string &body, const std::string &path, const std::string &sessionId)
 {
   httplib::Headers requestHeaders;
   for (const auto &[key, value] : request.headers)
   {
-    if (!dropFromRequest(key)) { requestHeaders.emplace(key, value); }
+    // Content-Type is set below, and the session header is replaced rather than
+    // added to: httplib's headers are a multimap and set_header appends, so
+    // copying the client's through would leave two field lines. Two
+    // Content-Types make the message malformed for any standards-respecting
+    // intermediary, and two session ids let the client echo back the wrong one.
+    if (dropFromRequest(key)) { continue; }
+    if (lower(key) == "content-type" || lower(key) == lower(std::string(SESSION_HEADER))) { continue; }
+    requestHeaders.emplace(key, value);
   }
+  // The id this hop resolved, so the next one does not resolve its own and miss
+  // the rule that was published for this session.
+  requestHeaders.emplace(std::string(SESSION_HEADER), sessionId);
 
   Attempt attempt;
   attempt.queue           = std::make_shared<ChunkQueue>(MAX_CHUNKS_IN_FLIGHT);
@@ -191,12 +202,18 @@ ReplicaProxy::Attempt ReplicaProxy::send(const ReplicaSpec &replica, const httpl
   return attempt;
 }
 
-void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &response, const std::string &path) { forwardPinned(request, response, path, {}); }
-
-void ReplicaProxy::forwardPinned(const httplib::Request &request, httplib::Response &response, const std::string &path, const std::string &preferredReplica)
+void ReplicaProxy::forward(const httplib::Request &request, httplib::Response &response, const std::string &path)
 {
-  const std::string body      = request.body;
-  const std::string sessionId = resolveSessionId(request, body);
+  forwardPinned(request, response, path, {}, resolveSessionId(request, request.body));
+}
+
+void ReplicaProxy::forwardPinned(const httplib::Request &request,
+                                 httplib::Response      &response,
+                                 const std::string      &path,
+                                 const std::string      &preferredReplica,
+                                 const std::string      &sessionId)
+{
+  const std::string body = request.body;
 
   ReplicaSpec           replica;
   Attempt               attempt;
@@ -236,7 +253,7 @@ void ReplicaProxy::forwardPinned(const httplib::Request &request, httplib::Respo
       });
     };
 
-    attempt = send(replica, request, body, path);
+    attempt = send(replica, request, body, path, sessionId);
 
     if (!attempt.unreachable()) { break; }
 
@@ -270,7 +287,12 @@ void ReplicaProxy::forwardPinned(const httplib::Request &request, httplib::Respo
   for (const auto &[key, value] : *upstreamHeaders)
   {
     if (lower(key) == "content-type") { contentType = value; }
-    if (!dropFromResponse(key) && lower(key) != "content-type") { response.set_header(key.c_str(), value.c_str()); }
+    // The session header is set once, below. An upstream that set its own
+    // would otherwise reach the client as a second, different value.
+    if (!dropFromResponse(key) && lower(key) != "content-type" && lower(key) != lower(std::string(SESSION_HEADER)))
+    {
+      response.set_header(key.c_str(), value.c_str());
+    }
   }
   // Headers precede the body, so this is the only mechanism that returns the
   // session id on a streaming response without rewriting SSE.

@@ -311,12 +311,15 @@ TEST(HttpServerTest, ForwardsChatTemplateKwargs)
   none["reasoning_effort"] = "none";
   EXPECT_EQ(renderedLength(client, none), 22);
 
-  // "user:hi|e=none" -- an explicit enable_thinking wins over the one
-  // reasoning_effort would have supplied, matching the Python's setdefault.
+  // "user:hi|nothink|e=none" -- asking for no reasoning overrides an
+  // enable_thinking that says otherwise, rather than deferring to it. A caller
+  // who asked for none and got a think block got the opposite of the request;
+  // the Python hard-sets both keys for "none" and only falls back to setdefault
+  // for the other effort levels.
   Json both                    = base;
   both["chat_template_kwargs"] = json{{"enable_thinking", true}};
   both["reasoning_effort"]     = "none";
-  EXPECT_EQ(renderedLength(client, both), 14);
+  EXPECT_EQ(renderedLength(client, both), 22);
 }
 
 TEST(HttpServerTest, RejectsMalformedChatTemplateKwargs)

@@ -41,6 +41,12 @@ struct ServerConfig
   /// 0 binds an ephemeral port; read it back with `boundPort()`.
   int         port    = 8000;
   std::string modelId = "model";
+
+  /// What a request gets for every field it does not set itself -- the
+  /// operator's `--generate-config`. Without this the flag configured the
+  /// one-shot `--prompt` path and nothing served over HTTP, so the same
+  /// deployment answered differently depending on how it was asked.
+  config::GenerateConfig defaults;
 };
 
 /// Map a scheduler finish reason onto the OpenAI vocabulary.

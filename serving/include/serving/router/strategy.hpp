@@ -20,6 +20,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -135,6 +136,17 @@ class RoutingStrategy
   /// A replica died: take it out and drop whatever depended on it.
   virtual void onReplicaLost(const std::string &replicaName) = 0;
 
+  /**
+   * The path this session already has, without planning one.
+   *
+   * For inspection. `onRequest` is not a query: it plans, bumps the
+   * generation, publishes a rule to every hop and evicts another session's
+   * path to make room. An endpoint that exists to report what was decided must
+   * not decide anything, so it asks this instead. Nullopt means nothing has
+   * been decided for this session yet.
+   */
+  [[nodiscard]] virtual std::optional<RoutingPath> peek(const std::string & /*sessionId*/) const { return std::nullopt; }
+
   [[nodiscard]] virtual RoutingMode  mode() const  = 0;
   [[nodiscard]] virtual RoutingStats stats() const = 0;
 };
@@ -180,6 +192,8 @@ class DistributedRuleStrategy : public RoutingStrategy
 
   [[nodiscard]] RoutingMode  mode() const override { return RoutingMode::DistributedRules; }
   [[nodiscard]] RoutingStats stats() const override { return _stats; }
+
+  [[nodiscard]] std::optional<RoutingPath> peek(const std::string &sessionId) const override;
 
   /// Sessions with a standing path.
   [[nodiscard]] size_t activePaths() const { return _paths.size(); }
