@@ -102,9 +102,18 @@ std::string optionalString(const Json &object, const char *key, const std::strin
 template <typename Json, typename Ctx>
 long long integerIn(const Json &value, const char *key, long long lo, long long hi, const Ctx &ctx)
 {
-  if (!value.is_number_integer()) { throw ctx.error(std::string("'") + key + "' must be an integer"); }
+  // Booleans and floats are numbers to JSON but never what a count or a port
+  // means, so they are refused rather than coerced. The offending value is
+  // quoted back: "must be in 1..65535" without it leaves the reader hunting.
+  if (!value.is_number_integer())
+  {
+    throw ctx.error(std::string("'") + key + "' must be an integer in " + std::to_string(lo) + ".." + std::to_string(hi) + ", got " + value.dump());
+  }
   const auto number = value.template get<long long>();
-  if (number < lo || number > hi) { throw ctx.error(std::string("'") + key + "' must be between " + std::to_string(lo) + " and " + std::to_string(hi)); }
+  if (number < lo || number > hi)
+  {
+    throw ctx.error(std::string("'") + key + "' must be in " + std::to_string(lo) + ".." + std::to_string(hi) + ", got " + std::to_string(number));
+  }
   return number;
 }
 

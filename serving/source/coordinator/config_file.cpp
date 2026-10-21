@@ -7,6 +7,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <serving/util/json_config.hpp>
+
 namespace serving::coordinator
 {
 
@@ -15,61 +17,16 @@ namespace
 
 using nlohmann::json;
 
-/// Error messages of the form "<source>: <where>: <what>".
-class Context
-{
-  public:
+/// The shared strict reader, with this file's error type and json flavour.
+/// Three readers each grew their own copy of these and drifted on the fields
+/// they share -- `port` ended up with three different accepted ranges -- so
+/// the parsing lives in one place now and only the error type varies.
+using Context = util::Context<ConfigError>;
 
-  Context(const std::string &source, std::string where)
-    : _source(source),
-      _where(std::move(where))
-  {}
-
-  [[nodiscard]] ConfigError error(const std::string &what) const { return ConfigError(_source + ": " + (_where.empty() ? "" : _where + ": ") + what); }
-
-  [[nodiscard]] Context at(const std::string &where) const { return Context(_source, _where.empty() ? where : _where + "." + where); }
-
-  private:
-
-  const std::string &_source;
-  std::string        _where;
-};
-
-/// Unknown keys are errors, so a typo cannot pass as a setting.
-void rejectUnknownKeys(const json &object, const std::set<std::string> &allowed, const Context &ctx)
-{
-  for (const auto &[key, value] : object.items())
-  {
-    if (allowed.count(key) == 0) { throw ctx.error("unknown key '" + key + "'"); }
-  }
-}
-
-const json &require(const json &object, const char *key, const Context &ctx)
-{
-  const auto it = object.find(key);
-  if (it == object.end()) { throw ctx.error(std::string("'") + key + "' is required"); }
-  return *it;
-}
-
-std::string requireString(const json &object, const char *key, const Context &ctx)
-{
-  const json &value = require(object, key, ctx);
-  if (!value.is_string()) { throw ctx.error(std::string("'") + key + "' must be a string"); }
-  return value.get<std::string>();
-}
-
-/// An integer in [lo, hi]. Booleans and floats are numbers to JSON but never
-/// what a count or a port means, so they are refused rather than coerced.
-long long integerIn(const json &value, const char *key, long long lo, long long hi, const Context &ctx)
-{
-  if (!value.is_number_integer())
-  {
-    throw ctx.error(std::string("'") + key + "' must be an integer in " + std::to_string(lo) + ".." + std::to_string(hi) + ", got " + value.dump());
-  }
-  const auto n = value.get<long long>();
-  if (n < lo || n > hi) { throw ctx.error(std::string("'") + key + "' must be in " + std::to_string(lo) + ".." + std::to_string(hi) + ", got " + std::to_string(n)); }
-  return n;
-}
+using util::integerIn;
+using util::rejectUnknownKeys;
+using util::require;
+using util::requireString;
 
 ReplicaBinding parseReplica(const json &entry, size_t index, const Context &parent)
 {

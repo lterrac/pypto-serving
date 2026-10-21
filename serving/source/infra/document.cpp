@@ -7,6 +7,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <serving/util/json_config.hpp>
+
 namespace serving::infra
 {
 
@@ -15,36 +17,17 @@ namespace
 
 using json = nlohmann::ordered_json;
 
-/// Where in the document we are, so a message names its subject.
-struct Context
-{
-  std::string where;
+/// The shared strict reader, with this file's error type and ordered json.
+/// Three readers each grew their own copy of these and drifted on the fields
+/// they share; the parsing is one implementation now.
+using Context = util::Context<DocumentError>;
 
-  [[nodiscard]] Context       in(const std::string &child) const { return Context{where + ": " + child}; }
-  [[nodiscard]] DocumentError error(const std::string &what) const { return DocumentError(where + ": " + what); }
-};
-
-void rejectUnknownKeys(const json &object, const std::set<std::string> &allowed, const Context &ctx)
-{
-  for (const auto &[key, value] : object.items())
-  {
-    if (allowed.count(key) == 0) { throw ctx.error("unknown key '" + key + "'"); }
-  }
-}
-
-const json &require(const json &object, const char *key, const Context &ctx)
-{
-  const auto it = object.find(key);
-  if (it == object.end()) { throw ctx.error(std::string("'") + key + "' is required"); }
-  return *it;
-}
-
-std::string requireString(const json &object, const char *key, const Context &ctx)
-{
-  const json &value = require(object, key, ctx);
-  if (!value.is_string()) { throw ctx.error(std::string("'") + key + "' must be a string"); }
-  return value.get<std::string>();
-}
+using util::integerIn;
+using util::optionalInteger;
+using util::optionalString;
+using util::rejectUnknownKeys;
+using util::require;
+using util::requireString;
 
 /// A name that will be interpolated into shell commands, paths and routing
 /// keys. Rejected here rather than carried into the map: `isUsableName` states

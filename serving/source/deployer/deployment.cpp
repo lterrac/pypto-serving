@@ -12,6 +12,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <serving/util/json_config.hpp>
+
 #include <serving/infra/document.hpp>
 #include <serving/util/signals.hpp>
 
@@ -23,71 +25,36 @@ namespace
 
 using json = nlohmann::json;
 
-/// Where in the file a message is about. Mirrors the coordinator's config
-/// reader: a configuration that is silently half-read is how a deployment ends
-/// up launching something nobody intended.
-class Context
-{
-  public:
+/// The shared strict reader, with this file's error type. Three readers each
+/// grew their own copy of these helpers and drifted on the fields they share;
+/// the parsing is one implementation now and only the error type varies.
+///
+/// The local names and argument order are kept so the call sites below read
+/// unchanged. Each is a thin adapter: the checking happens once, in
+/// util/json_config.hpp.
+using Context = util::Context<ConfigError>;
 
-  Context(std::string source, std::string where)
-    : _source(std::move(source)),
-      _where(std::move(where))
-  {}
-
-  [[nodiscard]] Context at(const std::string &where) const { return Context(_source, _where.empty() ? where : _where + "." + where); }
-
-  [[nodiscard]] ConfigError error(const std::string &message) const { return ConfigError(_source + (_where.empty() ? "" : ": " + _where) + ": " + message); }
-
-  private:
-
-  std::string _source;
-  std::string _where;
-};
-
-void rejectUnknownKeys(const json &object, const std::set<std::string> &allowed, const Context &ctx)
-{
-  for (const auto &entry : object.items())
-  {
-    if (allowed.count(entry.key()) == 0) { throw ctx.error("unknown key '" + entry.key() + "'"); }
-  }
-}
+using util::rejectUnknownKeys;
 
 std::string stringAt(const json &object, const char *key, const Context &ctx, const std::string &fallback)
 {
-  const auto it = object.find(key);
-  if (it == object.end()) { return fallback; }
-  if (!it->is_string()) { throw ctx.error(std::string("'") + key + "' must be a string"); }
-  return it->get<std::string>();
+  return util::optionalString(object, key, fallback, ctx);
 }
 
 double numberAt(const json &object, const char *key, const Context &ctx, double fallback, double low)
 {
-  const auto it = object.find(key);
-  if (it == object.end()) { return fallback; }
-  if (!it->is_number()) { throw ctx.error(std::string("'") + key + "' must be a number"); }
-  const double value = it->get<double>();
-  if (value < low) { throw ctx.error(std::string("'") + key + "' must be at least " + std::to_string(low)); }
-  return value;
+  return util::optionalNumber(object, key, fallback, low, std::numeric_limits<double>::max(), ctx);
 }
 
 int integerAt(const json &object, const char *key, const Context &ctx, int fallback, int low)
 {
-  const auto it = object.find(key);
-  if (it == object.end()) { return fallback; }
-  if (!it->is_number_integer()) { throw ctx.error(std::string("'") + key + "' must be an integer"); }
-  const int value = it->get<int>();
-  if (value < low) { throw ctx.error(std::string("'") + key + "' must be at least " + std::to_string(low)); }
-  return value;
+  // An upper bound where there was none. Unbounded, this accepted a port of
+  // 999999 that two other readers of the same field reject, and the only
+  // symptom was a generic failure later at bind.
+  return static_cast<int>(util::optionalInteger(object, key, fallback, low, std::numeric_limits<int>::max(), ctx));
 }
 
-bool booleanAt(const json &object, const char *key, const Context &ctx, bool fallback)
-{
-  const auto it = object.find(key);
-  if (it == object.end()) { return fallback; }
-  if (!it->is_boolean()) { throw ctx.error(std::string("'") + key + "' must be true or false"); }
-  return it->get<bool>();
-}
+bool booleanAt(const json &object, const char *key, const Context &ctx, bool fallback) { return util::optionalBoolean(object, key, fallback, ctx); }
 
 /// `{ "host": ..., "port": ... }`, used by both servers.
 void parseEndpoint(const json &object, const Context &ctx, std::string &host, int &port)
@@ -95,7 +62,8 @@ void parseEndpoint(const json &object, const Context &ctx, std::string &host, in
   if (!object.is_object()) { throw ctx.error("must be a JSON object"); }
   rejectUnknownKeys(object, {"host", "port"}, ctx);
   host = stringAt(object, "host", ctx, host);
-  port = integerAt(object, "port", ctx, port, 0);
+  // The same range the other two readers use, from one definition.
+  port = static_cast<int>(util::optionalInteger(object, "port", port, util::PORT_MIN, util::PORT_MAX, ctx));
 }
 
 } // namespace

@@ -469,3 +469,32 @@ TEST(DeploymentTest, StoppingReachesAReplicaOnAnotherNode)
 
   std::filesystem::remove_all(directory);
 }
+
+TEST(DeployerConfigTest, RefusesAPortNoSocketCouldEverTake)
+{
+  // The three config readers each had their own copy of this check and had
+  // drifted: 1..65535 in the coordinator's, 0..65535 in the document's, and no
+  // upper bound at all here. The same object was accepted by one surface and
+  // rejected by the next, and an impossible port got as far as bind before
+  // anything complained -- with a generic message that named neither the field
+  // nor the file.
+  for (const char *port : {"65536", "999999", "-1"})
+  {
+    const std::string body = std::string(R"({"document": "d.json", "ingress": {"host": "h", "port": )") + port + "}}";
+    try
+    {
+      (void)parseDeployerConfig(body);
+      ADD_FAILURE() << "port " << port << " was accepted";
+    }
+    catch (const ConfigError &error)
+    {
+      const std::string message = error.what();
+      EXPECT_NE(message.find("'port'"), std::string::npos) << message;
+      EXPECT_NE(message.find("65535"), std::string::npos) << "the message should say what the range is: " << message;
+    }
+  }
+
+  // Zero still means "ask the kernel for one", which the ephemeral-port tests
+  // and an unplaced replica both rely on.
+  EXPECT_NO_THROW((void)parseDeployerConfig(R"({"document": "d.json", "ingress": {"host": "h", "port": 0}})"));
+}
