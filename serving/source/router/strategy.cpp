@@ -131,9 +131,24 @@ RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
   {
     // The standing path is reused without consulting the planner. Routing
     // happens once per session -- that is what keeps the decision off the
-    // critical path.
-    _order.splice(_order.end(), _order, existing->second.position);
-    return existing->second.path;
+    // critical path -- but "reuse it" cannot mean "never look at it again":
+    // only the Dead phase runs onReplicaLost, so a replica put into draining
+    // stayed in every established session's path and kept taking new turns for
+    // the whole life of the LRU entry. A drain issued before a rolling restart
+    // then never converged, because the thing being drained was still being
+    // sent work.
+    if (std::all_of(existing->second.path.hops.begin(), existing->second.path.hops.end(), [&](const ReplicaSpec &hop) { return _planner.routable(hop); }))
+    {
+      _order.splice(_order.end(), _order, existing->second.position);
+      return existing->second.path;
+    }
+
+    // A hop has gone. Withdraw the rules published for it before planning
+    // again, or the replicas holding them keep forwarding along a path this
+    // coordinator has replaced.
+    _transport.revoke(sessionId, existing->second.path.generation);
+    forget(sessionId);
+    _stats.pathsInvalidated += 1;
   }
 
   _stats.plansComputed += 1;
@@ -154,6 +169,15 @@ RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
   const auto position = _order.insert(_order.end(), sessionId);
   _paths.emplace(sessionId, Standing{path, position});
   return path;
+}
+
+bool RoutingPlanner::routable(const ReplicaSpec &replica)
+{
+  ReplicaRegistry *registry = this->registry(replica.partition);
+  if (registry == nullptr) { return false; }
+  const ReplicaState *state = registry->state(replica.name);
+  // Gone from the registry is gone: a name with no state cannot be sent to.
+  return state != nullptr && state->routable();
 }
 
 void DistributedRuleStrategy::forget(const std::string &sessionId)

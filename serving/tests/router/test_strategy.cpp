@@ -407,3 +407,37 @@ TEST(DistributedRulesTest, ARestartIssuesGenerationsAboveTheOnesReplicasHold)
   // Within one epoch they still increase.
   EXPECT_GT(after.onRequest("fresh2").generation, first);
 }
+
+TEST(DistributedRulesTest, AHopThatStartsDrainingIsReplannedRatherThanKeptInThePath)
+{
+  SessionDirectory        sessions(600.0);
+  RoutingPlanner          planner(RoutingConfig{}, sessions, pipeline());
+  FakeTransport           transport;
+  DistributedRuleStrategy strategy(planner, transport);
+
+  const auto first = strategy.onRequest("s1");
+  ASSERT_FALSE(first.hops.empty());
+  EXPECT_EQ(strategy.stats().plansComputed, 1);
+
+  // Take the first hop out of rotation, the way a drain does. Only the Dead
+  // phase runs onReplicaLost, so nothing else tells the strategy -- and the
+  // standing path was reused unexamined, which is how a drained replica kept
+  // taking new turns of every session that already existed.
+  const std::string drained = first.hops.front().name;
+  planner.setReady(drained, false);
+
+  const auto second = strategy.onRequest("s1");
+  EXPECT_EQ(strategy.stats().plansComputed, 2) << "the stale path was reused instead of being replanned";
+  EXPECT_NE(hopNames(second).front(), drained) << "the session is still being routed to a replica that is draining";
+
+  // The rules published for the old path are withdrawn, or the replicas
+  // holding them keep forwarding along a path this coordinator has replaced.
+  ASSERT_FALSE(transport.revoked.empty());
+  EXPECT_EQ(transport.revoked.back().sessionId, "s1");
+  EXPECT_EQ(transport.revoked.back().generation, first.generation);
+
+  // And the replacement is then stable again: replanning is the exception.
+  const auto third = strategy.onRequest("s1");
+  EXPECT_EQ(hopNames(third), hopNames(second));
+  EXPECT_EQ(strategy.stats().plansComputed, 2);
+}

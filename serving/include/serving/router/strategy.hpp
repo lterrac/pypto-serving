@@ -70,6 +70,12 @@ class RoutingPlanner
   /// Mark a replica unroutable across whichever partition owns it.
   void setReady(const std::string &replicaName, bool ready);
 
+  /// Whether a replica named in a path planned earlier can still be sent to.
+  /// A path is planned once and reused for the life of a session, so something
+  /// has to re-ask: a replica that has since started draining or gone pending
+  /// is still in the path, and nothing else would notice.
+  [[nodiscard]] bool routable(const ReplicaSpec &replica);
+
   void acquire(const ReplicaSpec &replica);
   void release(const ReplicaSpec &replica);
 
