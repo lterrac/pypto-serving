@@ -83,8 +83,16 @@ class Engine
 
   [[nodiscard]] std::string generateRequestId();
 
-  /// Tokens admitted but not yet generated; the router's load signal.
+  /// Tokens admitted but not yet generated: the prompt still to prefill plus
+  /// the generation still to come. The prefill half is the expensive one and
+  /// the dominant part of a backlog, so a load signal that omitted it would
+  /// report a replica sitting on thousands of queued prompt tokens as idle.
   [[nodiscard]] int pendingTokenLoad() const;
+
+  /// Requests admitted and not yet finished. The scaling policy's queue-depth
+  /// signal: unlike a token count it does not move with how long each answer
+  /// happens to be.
+  [[nodiscard]] int outstandingRequests() const;
 
   /// Requests preempted since start. A running request is preempted when the KV
   /// pool cannot grow it, and it then replays its prompt and everything it had

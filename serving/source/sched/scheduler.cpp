@@ -268,7 +268,7 @@ SchedulerOutput Scheduler::schedule()
     }
 
     const bool isPrefill         = request->isPrefill();
-    const int  speculativeTokens = (!isPrefill && request->temperature <= 0.0) ? _config.numSpeculativeTokens : 0;
+    const int  speculativeTokens = speculativeCapacity(*request, isPrefill, numNew);
     const int  scheduledTokens   = numNew + speculativeTokens;
     if (scheduledTokens > tokenBudget)
     {
@@ -421,6 +421,12 @@ void Scheduler::releaseWaitingPrefixBlocks(const RequestPtr &request)
 {
   freeRequestBlocks(*request);
   request->numComputedTokens = 0;
+  // The count of published blocks goes with the blocks. Left standing, it tells
+  // cacheCompletedBlocks that the leading blocks are already in the prefix
+  // cache after they have been dropped, so it skips them for the rest of the
+  // request's life and nothing can ever hit that prefix again. Preemption
+  // resets it for the same reason.
+  request->numBlocksCached = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,12 +458,23 @@ void Scheduler::advanceAfterSchedule(SchedulerOutput &output)
   }
 }
 
+int Scheduler::speculativeCapacity(const Request &request, bool isPrefill, int numNewTokens) const
+{
+  // Only greedy decode steps get speculative capacity.
+  if (isPrefill || request.temperature > 0.0) { return 0; }
+  // Clamped to what is left of the context. Unclamped, a request one token from
+  // max_seq_len still reserves the full speculative width, so blocksNeeded asks
+  // for a block past the request's budget and the executor is handed decode
+  // positions beyond the length the model was compiled for.
+  const int remaining = _config.maxSeqLen - request.numComputedTokens - numNewTokens;
+  return std::max(0, std::min(_config.numSpeculativeTokens, remaining));
+}
+
 int Scheduler::speculativeTokensFor(const Request &request, const ScheduledRequest &scheduled) const
 {
-  // Mirrors the accounting schedule() uses when allocating: only greedy decode
-  // steps get speculative capacity.
-  if (scheduled.isPrefill || request.temperature > 0.0) { return 0; }
-  return _config.numSpeculativeTokens;
+  // Mirrors the accounting schedule() used when allocating, so the async
+  // reconcile reclaims exactly what was reserved.
+  return speculativeCapacity(request, scheduled.isPrefill, scheduled.numNewTokens);
 }
 
 std::vector<RequestOutput> Scheduler::updateFromOutput(const SchedulerOutput &output, const std::unordered_map<std::string, std::vector<int>> &newTokenIds)
@@ -542,7 +559,14 @@ std::vector<RequestOutput> Scheduler::updateFromOutput(const SchedulerOutput &ou
   for (const std::string &requestId : finishedIds)
   {
     const auto it = _requests.find(requestId);
-    if (it != _requests.end()) { freeRequestBlocks(*it->second); }
+    if (it != _requests.end())
+    {
+      freeRequestBlocks(*it->second);
+      // Erased, not just unlinked from `running`. The entry owns the prompt,
+      // everything generated and the block hashes; a server that keeps one per
+      // request it has ever served grows without bound.
+      _requests.erase(it);
+    }
     dropFromRunning(requestId);
   }
 

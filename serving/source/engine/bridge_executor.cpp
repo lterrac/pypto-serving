@@ -83,22 +83,43 @@ int BridgeExecutor::registerModel()
 {
   // Called from Engine::start() while the process is still single-threaded --
   // this is the call that forks simpler's per-chip children.
+  //
+  // Loading the model is the common failure, and every exit from here has to
+  // hand the GIL back. Thrown out while still holding it, no other thread can
+  // ever enter Python again -- including the close() this object's own
+  // destructor runs on the way out.
+  const auto releaseGil = [this] {
+    if (_impl->mainState == nullptr) { _impl->mainState = PyEval_SaveThread(); }
+  };
+  const auto fail = [&](const char *what) {
+    std::string message = takePythonError(what);
+    if (message.empty()) { message = std::string{what} + ": failed"; }
+    releaseGil();
+    return std::runtime_error(message);
+  };
+
   PyObject *pages = PyObject_CallMethod(
     _impl->bridge, "open_model", "sisiii", _config.modelDir.c_str(), _config.deviceId, _config.platform.c_str(), _config.maxModelLen, _config.blockSize, _config.maxNumSeqs);
-  if (pages == nullptr) { throw std::runtime_error(takePythonError("bridge.open_model")); }
+  if (pages == nullptr) { throw fail("bridge.open_model"); }
   const long numPages = PyLong_AsLong(pages);
   Py_DECREF(pages);
+  // -1 with an exception set is how PyLong_AsLong reports a non-integer. Left
+  // unchecked it both feeds a bogus page count to the KV pool and leaves the
+  // exception pending for whatever calls Python next.
+  if (numPages == -1 && PyErr_Occurred() != nullptr) { throw fail("bridge.open_model returned a non-integer page count"); }
 
   PyObject *pageSize = PyObject_CallMethod(_impl->bridge, "page_size", nullptr);
-  if (pageSize == nullptr) { throw std::runtime_error(takePythonError("bridge.page_size")); }
-  _pageSize = static_cast<int>(PyLong_AsLong(pageSize));
+  if (pageSize == nullptr) { throw fail("bridge.page_size"); }
+  const long reportedPageSize = PyLong_AsLong(pageSize);
   Py_DECREF(pageSize);
+  if (reportedPageSize == -1 && PyErr_Occurred() != nullptr) { throw fail("bridge.page_size returned a non-integer"); }
+  _pageSize = static_cast<int>(reportedPageSize);
 
   // Hand the GIL back.
   //
   // Py_Initialize leaves the GIL with this thread. The engine thread takes it
   // per step, so it is released here once the model is up.
-  if (_impl->mainState == nullptr) { _impl->mainState = PyEval_SaveThread(); }
+  releaseGil();
 
   return static_cast<int>(numPages);
 }
@@ -150,10 +171,17 @@ StepResult BridgeExecutor::executeStep(const StepCommand &command)
     PyGILState_Release(gil);
     return result;
   }
+  // A bridge that returned something other than a str sets a TypeError here.
+  // Clearing it before handing the GIL back matters as much as reporting it:
+  // an exception left pending surfaces at the next unrelated Python call and
+  // is attributed to the wrong request.
   const char *utf8 = PyUnicode_AsUTF8(response);
-  std::string body = utf8 == nullptr ? std::string{} : std::string{utf8};
+  std::string body;
+  if (utf8 == nullptr) { result.error = takePythonError("bridge.step did not return a string"); }
+  else { body = utf8; }
   Py_DECREF(response);
   PyGILState_Release(gil);
+  if (!result.error.empty()) { return result; }
 
   try
   {

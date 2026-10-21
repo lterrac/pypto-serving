@@ -661,3 +661,77 @@ TEST(SchedulerPreemptionTest, AReplaySamplesOnceAtTheEndNotAtTheEndOfThePrompt)
   // chunk that crosses the prompt does not emit a duplicate token.
   EXPECT_EQ(request->sampleAtLength(), 5);
 }
+
+TEST(SchedulerTest, AFinishedRequestLeavesTheRequestMap)
+{
+  KvCacheManager kv(8, 4, false);
+  SchedulerConfig config = baseConfig();
+  Scheduler       scheduler(config, kv);
+
+  // One token of generation, so the next update finishes it by length.
+  auto request = makeRequest("r", {1, 2, 3, 4}, 1);
+  scheduler.addRequest(request);
+  ASSERT_NE(scheduler.lookup("r"), nullptr);
+
+  const SchedulerOutput prefill = scheduler.schedule();
+  ASSERT_FALSE(prefill.scheduledRequests.empty());
+  (void)scheduler.updateFromOutput(prefill, {{"r", {42}}});
+
+  ASSERT_TRUE(serving::sched::isFinished(request->status));
+  // Erased, not merely dropped from `running`. Each retained entry holds the
+  // prompt, everything generated and the block hashes, so a server that kept
+  // one per request it ever served would grow without bound.
+  EXPECT_EQ(scheduler.lookup("r"), nullptr);
+  EXPECT_TRUE(scheduler.running().empty());
+  EXPECT_EQ(kv.numFreeBlocks(), kv.numBlocks());
+}
+
+TEST(SchedulerTest, ADeferredRequestCanStillPublishItsPrefixBlocks)
+{
+  // One block of room, a two-block prompt: the admission cannot fit, so the
+  // request is deferred and its prefix reference released.
+  KvCacheManager  kv(1, 4, true);
+  SchedulerConfig config    = baseConfig();
+  config.enablePrefixCache  = true;
+  Scheduler scheduler(config, kv);
+
+  auto request = makeRequest("r", {1, 2, 3, 4, 5, 6, 7, 8}, 4);
+  scheduler.addRequest(request);
+
+  // Pretend the lookup had hit, which is what leaves numBlocksCached set.
+  request->numBlocksCached   = 2;
+  request->numComputedTokens = 8;
+
+  const SchedulerOutput first = scheduler.schedule();
+  // Deferral has to take the bookkeeping back with the blocks. Left standing,
+  // numBlocksCached tells cacheCompletedBlocks those blocks are already
+  // published, so they never are -- and nothing can hit that prefix again.
+  EXPECT_EQ(request->numComputedTokens, 0);
+  EXPECT_EQ(request->numBlocksCached, 0);
+}
+
+TEST(SchedulerTest, SpeculativeTokensCannotRunPastTheContext)
+{
+  KvCacheManager  kv(64, 4, false);
+  SchedulerConfig config    = baseConfig();
+  config.numSpeculativeTokens = 4;
+  config.maxSeqLen            = 16;
+  Scheduler scheduler(config, kv);
+
+  // Greedy, and one token from the end of its context.
+  auto request               = runningDecodeRequest("r", {1, 2});
+  request->maxNewTokens      = 16;
+  request->outputTokenIds.assign(13, 7);
+  request->numComputedTokens = 15;
+  request->temperature       = 0.0;
+  scheduler.addRequest(request);
+  request->status = RequestStatus::Running;
+
+  const SchedulerOutput output = scheduler.schedule();
+  for (const ScheduledRequest &scheduled : output.scheduledRequests)
+  {
+    // Unclamped this reserved the full speculative width and handed the
+    // executor decode positions past the length the model was compiled for.
+    EXPECT_LE(scheduled.numComputedTokens + scheduled.numNewTokens, config.maxSeqLen);
+  }
+}

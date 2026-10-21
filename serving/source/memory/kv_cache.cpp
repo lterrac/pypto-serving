@@ -78,6 +78,11 @@ void KvCacheManager::initialize(const config::RuntimeConfig &runtime, int numBlo
     // Same message as the Python: it is what a failed kernel compile surfaces as.
     throw std::runtime_error("Worker reported invalid KV cache block count: " + std::to_string(numBlocks));
   }
+  // Checked here rather than at each division. The block size reaches this from
+  // a command-line flag with no range of its own, and every consumer divides by
+  // it: an unchecked zero loads the model, compiles the kernels, starts the
+  // server and only then crashes on the first scheduled request.
+  if (runtime.pageSize <= 0) { throw std::invalid_argument("KV block size must be positive, got " + std::to_string(runtime.pageSize)); }
   initBlocks(numBlocks, runtime.pageSize);
 }
 
@@ -217,6 +222,7 @@ std::vector<KVCacheBlock *> KvCacheManager::getComputedBlocks(const std::vector<
 
   // Hold back the last token by default: the scheduler needs to recompute logits
   // without writing into the final shared prefix-cache block.
+  if (_blockSize <= 0) { return hitBlocks; }
   const int limitTokens  = maxCacheHitTokens.value_or(std::max(0, numTokens - 1));
   const int maxHitBlocks = std::max(0, limitTokens) / _blockSize;
 

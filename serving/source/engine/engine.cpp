@@ -54,6 +54,10 @@ void Engine::stop()
 {
   if (!_running.exchange(false)) { return; }
   if (_thread.joinable()) { _thread.join(); }
+  // Cleared with `_running`: `_started` is start()'s idempotence guard, so an
+  // engine stopped without clearing it can never be started again -- start()
+  // returns success having done nothing and isReady() stays false for good.
+  _started = false;
 
   std::vector<std::shared_ptr<RequestStream>> streams;
   {
@@ -73,8 +77,24 @@ int Engine::pendingTokenLoad() const
 {
   const std::lock_guard<std::mutex> lock(_mutex);
   int                               pending = 0;
-  for (const auto &[id, ctx] : _contexts) { pending += std::max(0, ctx.request->maxNewTokens - static_cast<int>(ctx.request->outputTokenIds.size())); }
+  for (const auto &[id, ctx] : _contexts)
+  {
+    const sched::Request &request = *ctx.request;
+    // Both halves. A request queued behind a full KV pool has computed none of
+    // its prompt, and that prefill is the work the deployment is actually
+    // behind on.
+    pending += std::max(0, request.numPromptTokens() - request.numComputedTokens);
+    pending += std::max(0, request.maxNewTokens - static_cast<int>(request.outputTokenIds.size()));
+  }
   return pending;
+}
+
+int Engine::outstandingRequests() const
+{
+  const std::lock_guard<std::mutex> lock(_mutex);
+  // A context exists from admission until the request finishes or fails, which
+  // is exactly "in flight".
+  return static_cast<int>(_contexts.size());
 }
 
 std::shared_ptr<RequestStream> Engine::addRequest(const std::string &requestId, const std::vector<int> &promptTokenIds, const config::GenerateConfig &generateConfig)
@@ -153,7 +173,16 @@ void Engine::runOneStep()
   sched::SchedulerOutput output;
   {
     const std::lock_guard<std::mutex> lock(_mutex);
-    if (_scheduler->hasWork()) { output = _scheduler->schedule(); }
+    if (_scheduler->hasWork())
+    {
+      output = _scheduler->schedule();
+      // Async scheduling advances the request optimistically so the next step
+      // can be planned before this one's token comes back. Without this call
+      // updateFromOutput still took the async path, which only ever subtracts:
+      // numComputedTokens stayed at zero, the same prefill chunk was scheduled
+      // for ever and the request never produced a token.
+      _scheduler->advanceAfterSchedule(output);
+    }
   }
   _preemptions += static_cast<int>(output.preemptedRequests.size());
 
@@ -295,7 +324,12 @@ void Engine::deliver(const std::vector<sched::RequestOutput> &outputs)
 
     TokenOutput update;
     update.requestId    = out.requestId;
-    update.delta        = text.size() >= lastText.size() ? text.substr(lastText.size()) : std::string{};
+    // Only when the new text actually extends what the client already has.
+    // finalize() re-decodes the whole output rather than extending the windowed
+    // text, so it can disagree with it before this offset; slicing on length
+    // alone would then cut at a byte that is no longer the end of what was
+    // sent, and can land inside a multi-byte character.
+    update.delta        = text.compare(0, lastText.size(), lastText) == 0 ? text.substr(lastText.size()) : std::string{};
     update.tokenId      = out.newTokenId;
     update.finished     = finished;
     update.finishReason = finishReason;

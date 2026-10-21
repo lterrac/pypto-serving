@@ -191,6 +191,8 @@ class Scheduler
   /// "prefill", "decode" or nullopt when the kernel imposes no single-phase contract.
   [[nodiscard]] std::optional<std::string> groupedCachePhase();
 
+  /// Speculative positions a step may reserve, clamped to the context left.
+  [[nodiscard]] int speculativeCapacity(const Request &request, bool isPrefill, int numNewTokens) const;
   [[nodiscard]] int speculativeTokensFor(const Request &request, const ScheduledRequest &scheduled) const;
 
   void reconcileAsyncOutput(const RequestPtr &request, const ScheduledRequest &scheduled, const std::vector<int> &tokenIds, std::vector<RequestOutput> &outputs);
