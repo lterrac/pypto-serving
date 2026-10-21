@@ -1,5 +1,7 @@
 #include <serving/router/proxy.hpp>
 
+#include <serving/util/http_relay.hpp>
+
 #include <serving/util/blocking_queue.hpp>
 
 #include <algorithm>
@@ -21,7 +23,7 @@
 namespace serving::router
 {
 
-using ChunkQueue = util::BlockingQueue<std::string>;
+using ChunkQueue = util::ChunkQueue;
 
 namespace
 {
@@ -103,19 +105,10 @@ ReplicaProxy::ReplicaProxy(ReplicaRegistry &registry, std::mutex &registryMutex,
 {}
 
 /// One attempt against one replica, up to the point where the answer starts.
-struct ReplicaProxy::Attempt
+/// The relay itself is shared with the replica-side forward; what is proxy's
+/// own is the retry across siblings and the slot it has to release.
+struct ReplicaProxy::Attempt : util::Relay
 {
-  std::shared_ptr<ChunkQueue> queue;
-  /// Atomic because the upstream thread keeps writing them after `send()` has
-  /// returned: a transfer that dies mid-body sets `transportFailed` long after
-  /// the caller has read it to decide whether to retry, and the chunked
-  /// provider reads it from a third thread again.
-  std::shared_ptr<std::atomic<int>>  status;
-  std::shared_ptr<httplib::Headers>  headers;
-  std::shared_ptr<std::atomic<bool>> transportFailed;
-
-  /// Nothing reached the client and nothing will: safe to try elsewhere.
-  [[nodiscard]] bool unreachable() const { return transportFailed->load() && status->load() == 0; }
 };
 
 /// Fires the request at one replica and returns once its status is known --
@@ -127,10 +120,10 @@ ReplicaProxy::send(const ReplicaSpec &replica, const httplib::Request &request, 
   httplib::Headers requestHeaders;
   for (const auto &[key, value] : request.headers)
   {
-    // Content-Type is set below, and the session header is replaced rather than
-    // added to: httplib's headers are a multimap and set_header appends, so
-    // copying the client's through would leave two field lines. Two
-    // Content-Types make the message malformed for any standards-respecting
+    // Content-Type is set by the relay, and the session header is replaced
+    // rather than added to: httplib's headers are a multimap and set_header
+    // appends, so copying the client's through would leave two field lines.
+    // Two Content-Types make the message malformed for any standards-respecting
     // intermediary, and two session ids let the client echo back the wrong one.
     if (dropFromRequest(key)) { continue; }
     if (lower(key) == "content-type" || lower(key) == lower(std::string(SESSION_HEADER))) { continue; }
@@ -141,64 +134,8 @@ ReplicaProxy::send(const ReplicaSpec &replica, const httplib::Request &request, 
   requestHeaders.emplace(std::string(SESSION_HEADER), sessionId);
 
   Attempt attempt;
-  attempt.queue           = std::make_shared<ChunkQueue>(MAX_CHUNKS_IN_FLIGHT);
-  attempt.status          = std::make_shared<std::atomic<int>>(0);
-  attempt.headers         = std::make_shared<httplib::Headers>();
-  attempt.transportFailed = std::make_shared<std::atomic<bool>>(false);
-
-  // The upstream status and headers must be known before the body is relayed,
-  // so the thread signals once the response handler has fired.
-  auto headersReady  = std::make_shared<std::promise<void>>();
-  auto headersFuture = headersReady->get_future();
-  auto signalled     = std::make_shared<std::once_flag>();
-
-  const std::string host           = replica.host;
-  const int         port           = replica.port;
-  const double      connectTimeout = _connectTimeoutSeconds;
-  const double      requestTimeout = _requestTimeoutSeconds;
-
-  auto queue           = attempt.queue;
-  auto upstreamStatus  = attempt.status;
-  auto upstreamHeaders = attempt.headers;
-  auto transportFailed = attempt.transportFailed;
-
-  std::thread upstream([=] {
-    httplib::Client client(host, port);
-    client.set_connection_timeout(static_cast<time_t>(connectTimeout), 0);
-    client.set_read_timeout(static_cast<time_t>(requestTimeout), 0);
-    client.set_write_timeout(static_cast<time_t>(requestTimeout), 0);
-
-    httplib::Request upstreamRequest;
-    upstreamRequest.method  = "POST";
-    upstreamRequest.path    = path;
-    upstreamRequest.body    = body;
-    upstreamRequest.headers = requestHeaders;
-    upstreamRequest.set_header("Content-Type", "application/json");
-
-    upstreamRequest.response_handler = [=](const httplib::Response &upstreamResponse) {
-      upstreamStatus->store(upstreamResponse.status);
-      *upstreamHeaders = upstreamResponse.headers;
-      std::call_once(*signalled, [&] { headersReady->set_value(); });
-      return true;
-    };
-    upstreamRequest.content_receiver = [=](const char *data, size_t length, uint64_t, uint64_t) {
-      if (queue->closed()) { return false; } // the client hung up; stop pulling
-      queue->push(std::string(data, length));
-      return true;
-    };
-
-    httplib::Response upstreamResponse;
-    httplib::Error    error = httplib::Error::Success;
-    const bool        ok    = client.send(upstreamRequest, upstreamResponse, error);
-    if (!ok || error != httplib::Error::Success) { transportFailed->store(true); }
-
-    // Unblock the caller even when the handler never fired.
-    std::call_once(*signalled, [&] { headersReady->set_value(); });
-    queue->close();
-  });
-  upstream.detach();
-
-  headersFuture.wait();
+  static_cast<util::Relay &>(attempt) =
+    util::startRelay(replica.host, replica.port, path, body, requestHeaders, _connectTimeoutSeconds, _requestTimeoutSeconds, MAX_CHUNKS_IN_FLIGHT);
   return attempt;
 }
 

@@ -1,7 +1,7 @@
 #include <serving/server/http_server.hpp>
 
 #include <serving/router/proxy.hpp>
-#include <serving/util/blocking_queue.hpp>
+#include <serving/util/http_relay.hpp>
 #include <serving/util/http_serving.hpp>
 
 #include <atomic>
@@ -30,7 +30,9 @@ constexpr int MAX_FORWARD_DEPTH = 8;
 /// wait. Bounded so a client slower than the hop cannot grow the queue without
 /// limit; the same bound the router's proxy uses.
 constexpr size_t MAX_CHUNKS_IN_FLIGHT = 256;
-using ChunkQueue                      = serving::util::BlockingQueue<std::string>;
+/// Silence from the next hop that means it is gone. Between chunks, not across
+/// the answer: a generation longer than this is ordinary.
+constexpr double NEXT_HOP_IDLE_SECONDS = 300.0;
 /// Carries the count above between replicas.
 constexpr const char *FORWARD_DEPTH_HEADER = "x-serving-forward-depth";
 
@@ -268,61 +270,25 @@ bool HttpServer::forwardTo(const replica::NextHop &hop, const httplib::Request &
 
   // Relayed as it arrives, not buffered. The forward decision is taken before
   // the stream flag is ever read, so a `"stream": true` request whose session
-  // has a rule came through here: httplib's plain Post accumulates the whole
-  // SSE body and replays it in one write, which turns time-to-first-token into
-  // time-to-last-token, and the read timeout is wall-clock over the whole body
-  // so a long generation returned 502 with the answer already discarded.
-  auto queue           = std::make_shared<ChunkQueue>(MAX_CHUNKS_IN_FLIGHT);
-  auto upstreamStatus  = std::make_shared<std::atomic<int>>(0);
-  auto upstreamType    = std::make_shared<std::string>("application/json");
-  auto transportFailed = std::make_shared<std::atomic<bool>>(false);
-  auto headersReady    = std::make_shared<std::promise<void>>();
-  auto headersFuture   = headersReady->get_future();
-  auto signalled       = std::make_shared<std::once_flag>();
-
+  // has a rule came through here: a buffering client accumulates the whole SSE
+  // body and replays it in one write, which turns time-to-first-token into
+  // time-to-last-token, and its read timeout is wall-clock over the whole body
+  // so a long generation returns 502 with the answer already discarded.
+  //
+  // The same relay the router's proxy uses. What is this side's own is the one
+  // fixed next hop and the forwarding-depth header; there is no retry, because
+  // a rule names one replica and there is no sibling to fall back to.
   httplib::Headers headers;
   headers.emplace(std::string(router::SESSION_HEADER), sessionId);
   headers.emplace(std::string(FORWARD_DEPTH_HEADER), std::to_string(depth + 1));
-  const std::string body = request.body;
 
-  std::thread upstream([=] {
-    httplib::Client client(host, port);
-    client.set_connection_timeout(5, 0);
-    // Between chunks, not over the whole answer: a generation longer than this
-    // is normal, a silence this long is not.
-    client.set_read_timeout(300, 0);
+  const util::Relay relay = util::startRelay(host, port, path, request.body, headers, 5.0, NEXT_HOP_IDLE_SECONDS, MAX_CHUNKS_IN_FLIGHT);
 
-    httplib::Request upstreamRequest;
-    upstreamRequest.method  = "POST";
-    upstreamRequest.path    = path;
-    upstreamRequest.body    = body;
-    upstreamRequest.headers = headers;
-    upstreamRequest.set_header("Content-Type", "application/json");
-
-    upstreamRequest.response_handler = [=](const httplib::Response &fromHop) {
-      upstreamStatus->store(fromHop.status);
-      if (fromHop.has_header("Content-Type")) { *upstreamType = fromHop.get_header_value("Content-Type"); }
-      std::call_once(*signalled, [&] { headersReady->set_value(); });
-      return true;
-    };
-    upstreamRequest.content_receiver = [=](const char *data, size_t length, uint64_t, uint64_t) {
-      // A client that has gone closes the queue, which stops the upstream read
-      // and so closes the connection to the next hop -- the only cancellation
-      // this path has.
-      if (queue->closed()) { return false; }
-      queue->push(std::string(data, length));
-      return true;
-    };
-
-    httplib::Response ignored;
-    httplib::Error    error = httplib::Error::Success;
-    if (!client.send(upstreamRequest, ignored, error)) { transportFailed->store(true); }
-    std::call_once(*signalled, [&] { headersReady->set_value(); });
-    queue->close();
-  });
-  upstream.detach();
-
-  headersFuture.wait();
+  auto queue           = relay.queue;
+  auto upstreamStatus  = relay.status;
+  auto transportFailed = relay.transportFailed;
+  std::string contentType = "application/json";
+  if (const auto it = relay.headers->find("Content-Type"); it != relay.headers->end()) { contentType = it->second; }
 
   if (upstreamStatus->load() == 0)
   {
@@ -343,7 +309,7 @@ bool HttpServer::forwardTo(const replica::NextHop &hop, const httplib::Request &
   // blocked on a full queue for ever.
   std::shared_ptr<void> closeOnDestroy(nullptr, [queue](void *) { queue->close(); });
 
-  response.set_chunked_content_provider(*upstreamType, [queue, transportFailed, closeOnDestroy](size_t, httplib::DataSink &sink) {
+  response.set_chunked_content_provider(contentType, [queue, transportFailed, closeOnDestroy](size_t, httplib::DataSink &sink) {
     auto chunk = queue->pop();
     if (!chunk.has_value())
     {
