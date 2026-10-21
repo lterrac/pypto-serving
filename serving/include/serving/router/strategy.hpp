@@ -20,6 +20,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -157,6 +158,21 @@ class RoutingStrategy
    */
   [[nodiscard]] virtual std::optional<RoutingPath> peek(const std::string & /*sessionId*/) { return std::nullopt; }
 
+  /**
+   * Perform any transport work the last call deferred.
+   *
+   * Publishing a rule is a blocking HTTP round trip per hop, and a revoke is
+   * one per replica. Done inline they ran with the coordinator's routing lock
+   * held, so the router planned one session at a time and a replica that
+   * accepted a connection and never answered froze all routing for its whole
+   * timeout -- at precisely the moment a replica dies, which is when the loss
+   * path issues the most revokes.
+   *
+   * Callers take the decision under the lock and then call this without it.
+   * Safe to call when nothing is pending.
+   */
+  virtual void flush() {}
+
   [[nodiscard]] virtual RoutingMode  mode() const  = 0;
   [[nodiscard]] virtual RoutingStats stats() const = 0;
 };
@@ -208,10 +224,32 @@ class DistributedRuleStrategy : public RoutingStrategy
   /// Sessions with a standing path.
   [[nodiscard]] size_t activePaths() const { return _paths.size(); }
 
+  void flush() override;
+
   private:
 
   void publish(const RoutingPath &path);
   void forget(const std::string &sessionId);
+
+  /// One deferred transport call. A publish carries a holder and a next hop; a
+  /// revoke carries neither, which is what tells them apart.
+  struct Deferred
+  {
+    bool        isRevoke = false;
+    ReplicaSpec holder;
+    std::string sessionId;
+    ReplicaSpec nextHop;
+    uint64_t    generation = 0;
+  };
+
+  /// Queue one deferred transport call.
+  void defer(Deferred operation);
+
+  /// Guards `_outbox` alone, and is never held across a transport call. The
+  /// routing lock the caller holds does not cover flush(), which is the whole
+  /// point of deferring.
+  std::mutex            _outboxMutex;
+  std::vector<Deferred> _outbox;
 
   struct Standing
   {

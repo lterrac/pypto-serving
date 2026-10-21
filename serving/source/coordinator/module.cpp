@@ -62,8 +62,15 @@ uint64_t Coordinator::syncedVersion() const
 
 SyncReport Coordinator::syncFromMap()
 {
-  const std::lock_guard<std::mutex> lock(_routingMutex);
-  return syncLocked();
+  SyncReport report;
+  {
+    const std::lock_guard<std::mutex> lock(_routingMutex);
+    report = syncLocked();
+  }
+  // A replica dropped from the map revokes the sessions that ran through it,
+  // which is transport work and must not happen under the routing lock.
+  flushRouting();
+  return report;
 }
 
 // Caller holds _routingMutex.
@@ -163,11 +170,34 @@ std::optional<router::RoutingPath> Coordinator::peekRoute(const std::string &ses
   return _strategy->peek(sessionId);
 }
 
+void Coordinator::flushRouting()
+{
+  // The flush lock is taken first and held across the strategy lookup, so a
+  // concurrent finalize() cannot destroy the strategy between reading the
+  // pointer and sending through it.
+  const std::lock_guard<std::mutex> flushLock(_flushMutex);
+  router::RoutingStrategy          *strategy = nullptr;
+  {
+    const std::lock_guard<std::mutex> lock(_routingMutex);
+    strategy = _strategy.get();
+  }
+  if (strategy != nullptr) { strategy->flush(); }
+}
+
 router::RoutingPath Coordinator::routeFor(const std::string &sessionId)
 {
-  const std::lock_guard<std::mutex> lock(_routingMutex);
-  if (_strategy == nullptr) { throw std::runtime_error("coordinator is not initialized"); }
-  return _strategy->onRequest(sessionId);
+  router::RoutingPath path;
+  {
+    const std::lock_guard<std::mutex> lock(_routingMutex);
+    if (_strategy == nullptr) { throw std::runtime_error("coordinator is not initialized"); }
+    path = _strategy->onRequest(sessionId);
+  }
+  // Publishing is a blocking round trip per hop. Held under the routing lock it
+  // meant the router could plan exactly one session at a time, and one hop that
+  // accepted a connection without answering stalled every other request's
+  // routing for its whole timeout.
+  flushRouting();
+  return path;
 }
 
 void Coordinator::reportReplicaLost(const std::string &replicaName)
@@ -188,24 +218,37 @@ void Coordinator::service()
   {
     // Nothing reported, but the map may have moved under us: a writer marks a
     // replica draining or dead and the tick is what acts on it.
-    const std::lock_guard<std::mutex> lock(_routingMutex);
-    if (_stateMap.version() != _syncedVersion) { syncLocked(); }
+    {
+      const std::lock_guard<std::mutex> lock(_routingMutex);
+      if (_stateMap.version() != _syncedVersion) { syncLocked(); }
+    }
+    // syncLocked's loss path queues revokes too.
+    flushRouting();
     return;
   }
 
   // Applied on the service tick, so a heartbeat signal never runs routing policy
   // on the reporting thread.
-  const std::lock_guard<std::mutex> lock(_routingMutex);
-  if (_strategy == nullptr) { return; }
-  for (const std::string &replicaName : losses)
   {
-    _strategy->onReplicaLost(replicaName);
-    _lossesApplied += 1;
+    const std::lock_guard<std::mutex> lock(_routingMutex);
+    if (_strategy == nullptr) { return; }
+    for (const std::string &replicaName : losses)
+    {
+      _strategy->onReplicaLost(replicaName);
+      _lossesApplied += 1;
+    }
   }
+  // A loss revokes once per affected session, each a round trip to every
+  // replica. This is the moment a replica has just died -- exactly when routing
+  // must not freeze -- so the sending happens with the lock released.
+  flushRouting();
 }
 
 void Coordinator::finalize()
 {
+  // Same order as flushRouting: flush lock first. Holding it here is what makes
+  // destroying the strategy safe against a send still running through it.
+  const std::lock_guard<std::mutex> flushLock(_flushMutex);
   const std::lock_guard<std::mutex> lock(_routingMutex);
   _strategy.reset();
   _planner.reset();

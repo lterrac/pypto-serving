@@ -222,6 +222,7 @@ TEST(DistributedRulesTest, RoutesOncePerSessionAndPublishesTheRules)
   EXPECT_EQ(strategy.stats().plansComputed, 1) << "routing must happen once per session";
 
   // Three partitions means two forwarding rules: the last hop has nowhere to go.
+  strategy.flush(); // the rules are queued under the caller's lock and sent after it
   const auto rules = transport.rulesFor("s1");
   ASSERT_EQ(rules.size(), 2u);
   EXPECT_EQ(rules[0].holder, first.hops[0].name);
@@ -241,6 +242,7 @@ TEST(DistributedRulesTest, DistinctSessionsGetTheirOwnPaths)
   (void)strategy.onRequest("s2");
   EXPECT_EQ(strategy.stats().plansComputed, 2);
   EXPECT_EQ(strategy.activePaths(), 2u);
+  strategy.flush();
   EXPECT_EQ(transport.rulesFor("s1").size(), 2u);
   EXPECT_EQ(transport.rulesFor("s2").size(), 2u);
 }
@@ -256,6 +258,7 @@ TEST(DistributedRulesTest, GenerationsIncreaseSoAStaleRuleIsRecognisable)
   const auto second = strategy.onRequest("s2");
   EXPECT_GT(second.generation, first.generation);
 
+  strategy.flush();
   for (const auto &rule : transport.rulesFor("s1")) { EXPECT_EQ(rule.generation, first.generation); }
 }
 
@@ -268,6 +271,7 @@ TEST(DistributedRulesTest, ALostReplicaRevokesAndReplansOnlyTheAffectedSessions)
 
   const auto s1 = strategy.onRequest("s1");
   (void)strategy.onRequest("s2");
+  strategy.flush();
   const size_t before = transport.published.size();
 
   // Kill a replica s1 depends on.
@@ -276,6 +280,7 @@ TEST(DistributedRulesTest, ALostReplicaRevokesAndReplansOnlyTheAffectedSessions)
 
   // Its rules are withdrawn rather than left forwarding into a dead node.
   EXPECT_EQ(strategy.stats().pathsInvalidated, 1);
+  strategy.flush();
   ASSERT_FALSE(transport.revoked.empty());
   EXPECT_EQ(transport.revoked.front().sessionId, "s1");
 
@@ -283,6 +288,7 @@ TEST(DistributedRulesTest, ALostReplicaRevokesAndReplansOnlyTheAffectedSessions)
   const auto replanned = strategy.onRequest("s1");
   EXPECT_NE(replanned.hops[1].name, lost);
   EXPECT_GT(replanned.generation, s1.generation);
+  strategy.flush();
   EXPECT_GT(transport.published.size(), before) << "the new path must be published";
   EXPECT_EQ(strategy.stats().plansComputed, 3); // s1, s2, then s1 again
 }
@@ -348,6 +354,7 @@ TEST(DistributedRulesTest, BoundsStandingPathsAndRevokesWhatItDrops)
   EXPECT_EQ(strategy.activePaths(), 3u);
 
   // Dropping a path without revoking would leave replicas forwarding along it.
+  strategy.flush();
   EXPECT_FALSE(transport.revoked.empty());
   EXPECT_EQ(transport.revoked.front().sessionId, "s0");
 }
@@ -432,6 +439,7 @@ TEST(DistributedRulesTest, AHopThatStartsDrainingIsReplannedRatherThanKeptInTheP
 
   // The rules published for the old path are withdrawn, or the replicas
   // holding them keep forwarding along a path this coordinator has replaced.
+  strategy.flush();
   ASSERT_FALSE(transport.revoked.empty());
   EXPECT_EQ(transport.revoked.back().sessionId, "s1");
   EXPECT_EQ(transport.revoked.back().generation, first.generation);
@@ -440,4 +448,39 @@ TEST(DistributedRulesTest, AHopThatStartsDrainingIsReplannedRatherThanKeptInTheP
   const auto third = strategy.onRequest("s1");
   EXPECT_EQ(hopNames(third), hopNames(second));
   EXPECT_EQ(strategy.stats().plansComputed, 2);
+}
+
+TEST(DistributedRulesTest, NoTransportCallHappensWhileTheDecisionIsBeingTaken)
+{
+  SessionDirectory        sessions(600.0);
+  RoutingPlanner          planner(RoutingConfig{}, sessions, pipeline());
+  FakeTransport           transport;
+  DistributedRuleStrategy strategy(planner, transport);
+
+  // Planning a session decides where it goes and queues the rules; it does not
+  // send them. The caller holds the routing lock across this, and a publish is
+  // a blocking round trip per hop -- so sending here meant the router could
+  // plan one session at a time, and a hop that accepted a connection without
+  // answering stalled everyone else's routing for its whole timeout.
+  const auto path = strategy.onRequest("s1");
+  EXPECT_TRUE(transport.published.empty()) << "a rule was sent while the routing decision was still being taken";
+  EXPECT_TRUE(transport.revoked.empty());
+
+  // The sending happens afterwards, with no lock held.
+  strategy.flush();
+  EXPECT_EQ(transport.rulesFor("s1").size(), 2u);
+
+  // Same for the loss path, which is the worst moment to freeze routing: a
+  // revoke goes to every replica, once per affected session.
+  const size_t sentSoFar = transport.published.size();
+  strategy.onReplicaLost(path.hops.front().name);
+  EXPECT_TRUE(transport.revoked.empty()) << "a revoke was sent while the loss was being applied";
+  strategy.flush();
+  EXPECT_FALSE(transport.revoked.empty());
+
+  // Flushing an empty outbox is a no-op rather than a repeat.
+  const size_t afterLoss = transport.published.size();
+  strategy.flush();
+  EXPECT_EQ(transport.published.size(), afterLoss);
+  EXPECT_GE(afterLoss, sentSoFar);
 }

@@ -123,6 +123,13 @@ class Coordinator
   /// anything. For inspection endpoints; see RoutingStrategy::peek.
   [[nodiscard]] std::optional<router::RoutingPath> peekRoute(const std::string &sessionId);
 
+  private:
+
+  /// Send whatever the last decision queued, with the routing lock released.
+  void flushRouting();
+
+  public:
+
   /// Bring routing to the map, now, and say what changed. `service()` calls
   /// this; a test calls it directly.
   SyncReport syncFromMap();
@@ -167,6 +174,20 @@ class Coordinator
   /// platform's timer drives service(), and both reach the same strategy,
   /// planner and session directory.
   mutable std::mutex _routingMutex;
+
+  /// Serialises the deferred transport sends, and nothing else.
+  ///
+  /// Taking the decision and sending the rules are now separate, so two
+  /// threads can reach the sending at once -- and a rule and the revoke that
+  /// replaces it must not overtake each other, or a replica keeps a rule this
+  /// coordinator has withdrawn. One sender at a time restores that ordering
+  /// without putting the routing lock back in front of the network: a slow
+  /// replica delays other senders, not the next routing decision.
+  ///
+  /// Always taken before `_routingMutex`, never after, so the two cannot
+  /// invert. Held across finalize() as well, so a strategy cannot be destroyed
+  /// while a send is still running through it.
+  mutable std::mutex _flushMutex;
   int                _lossesApplied = 0;
 
   /// What runs where. Guarded by `_routingMutex` like the routing state it

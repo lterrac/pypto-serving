@@ -146,7 +146,7 @@ RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
     // A hop has gone. Withdraw the rules published for it before planning
     // again, or the replicas holding them keep forwarding along a path this
     // coordinator has replaced.
-    _transport.revoke(sessionId, existing->second.path.generation);
+    defer(Deferred{true, {}, sessionId, {}, existing->second.path.generation});
     forget(sessionId);
     _stats.pathsInvalidated += 1;
   }
@@ -162,7 +162,7 @@ RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
     // this coordinator no longer knows about.
     const std::string oldest = _order.front();
     const auto        it     = _paths.find(oldest);
-    if (it != _paths.end()) { _transport.revoke(oldest, it->second.path.generation); }
+    if (it != _paths.end()) { defer(Deferred{true, {}, oldest, {}, it->second.path.generation}); }
     forget(oldest);
   }
 
@@ -178,6 +178,30 @@ bool RoutingPlanner::routable(const ReplicaSpec &replica)
   const ReplicaState *state = registry->state(replica.name);
   // Gone from the registry is gone: a name with no state cannot be sent to.
   return state != nullptr && state->routable();
+}
+
+void DistributedRuleStrategy::defer(Deferred operation)
+{
+  const std::lock_guard<std::mutex> lock(_outboxMutex);
+  _outbox.push_back(std::move(operation));
+}
+
+void DistributedRuleStrategy::flush()
+{
+  // Drained under the outbox lock and then sent with no lock held at all, so a
+  // replica that never answers delays only this call. Ordering is preserved:
+  // a revoke queued before a publish is sent before it, or a replica could be
+  // told to forget a rule it has not been given yet.
+  std::vector<Deferred> pending;
+  {
+    const std::lock_guard<std::mutex> lock(_outboxMutex);
+    pending.swap(_outbox);
+  }
+  for (const Deferred &operation : pending)
+  {
+    if (operation.isRevoke) { _transport.revoke(operation.sessionId, operation.generation); }
+    else { _transport.publish(operation.holder, operation.sessionId, operation.nextHop, operation.generation); }
+  }
 }
 
 void DistributedRuleStrategy::forget(const std::string &sessionId)
@@ -210,7 +234,7 @@ void DistributedRuleStrategy::publish(const RoutingPath &path)
   // Each hop is told where to forward next; the last hop has nowhere to go.
   for (size_t i = 0; i + 1 < path.hops.size(); ++i)
   {
-    _transport.publish(path.hops[i], path.sessionId, path.hops[i + 1], path.generation);
+    defer(Deferred{false, path.hops[i], path.sessionId, path.hops[i + 1], path.generation});
     _stats.rulesPublished += 1;
   }
 }
@@ -235,7 +259,7 @@ void DistributedRuleStrategy::onReplicaLost(const std::string &replicaName)
 
   for (const std::string &sessionId : affected)
   {
-    _transport.revoke(sessionId, _paths.at(sessionId).path.generation);
+    defer(Deferred{true, {}, sessionId, {}, _paths.at(sessionId).path.generation});
     forget(sessionId);
     _stats.pathsInvalidated += 1;
   }
