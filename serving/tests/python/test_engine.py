@@ -139,3 +139,30 @@ def test_a_python_executor_sees_each_requests_sampling_params():
     assert seen.top_k == 40
     assert seen.seed == 1234
     assert repr(seen) == "SamplingParams(temperature=0.7, top_p=0.95, top_k=40, seed=1234)"
+
+
+def test_a_finished_request_is_reported_to_a_python_executor():
+    """The release has to reach the executor on this path too.
+
+    A deployer replica runs `python3 -m pypto_serving.cpp`, so the executor is
+    a Python object and the command reaches it through the bindings rather than
+    through the native binary's JSON. StepCommand.finished was not exposed, so
+    the engine reported requests that had ended and nothing on this path could
+    see them -- the sampler kept a generator per seeded request for the life of
+    every deployment started by the launcher.
+    """
+    tok, ex = WordTokenizer(), CountingExecutor()
+    engine = s.Engine(config(), tok, ex)
+
+    with running(engine):
+        prompt = tok.encode("one two three")
+        drain(engine.add_request("done-1", prompt, s.GenerateConfig(max_new_tokens=1)))
+
+        # Carried on the next step rather than sent on its own, so give the
+        # loop more work and let it run.
+        for i in range(20):
+            if "done-1" in ex.released:
+                break
+            drain(engine.add_request(f"filler-{i}", prompt, s.GenerateConfig(max_new_tokens=1)))
+
+        assert "done-1" in ex.released, "a finished request never reached the Python executor"

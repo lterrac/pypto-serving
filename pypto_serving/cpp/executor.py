@@ -76,7 +76,12 @@ class PyptoModelExecutor(cpp.ModelExecutor):
             }
             for item in command.decode
         ]
-        return cpp.StepResult(new_tokens=bridge.run_step(prefill, decode))
+        # Requests that ended since the last step. Without this the sampler
+        # keeps a torch.Generator per seeded request for the life of the
+        # process: the engine reports them, and this is the path that has to
+        # carry them for a replica started by the deployer.
+        finished = list(command.finished)
+        return cpp.StepResult(new_tokens=bridge.run_step(prefill, decode, finished))
 
     def close(self) -> None:
         bridge.close()

@@ -97,6 +97,11 @@ void bindExecutorTypes(py::module_ &m)
   py::class_<engine::StepCommand>(m, "StepCommand", "What the engine asks the executor to run: prefill chunks and decode slots for one step.")
     .def_readonly("prefill", &engine::StepCommand::prefill)
     .def_readonly("decode", &engine::StepCommand::decode)
+    // Exposed, or a Python executor cannot see it. This is the entry point a
+    // deployer replica runs, so leaving it off meant the release reached the
+    // bridge only through the native binary's JSON and the per-request sampler
+    // state leaked on every deployment that uses the launcher.
+    .def_readonly("finished", &engine::StepCommand::finished)
     .def_property_readonly("empty", &engine::StepCommand::empty);
 
   py::class_<engine::StepResult>(m, "StepResult", "Tokens produced per request, or an error that fails every request in the step.")

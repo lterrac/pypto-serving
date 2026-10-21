@@ -52,6 +52,9 @@ class CountingExecutor(s.ModelExecutor):
         self.max_steps = 100_000
         #: The sampling parameters the latest step carried, per request id.
         self.sampling: dict = {}
+        #: Request ids the engine reported as finished. A real executor drops
+        #: its sampler generator and device state for these.
+        self.released: list = []
 
     def register_model(self):
         self.registered += 1
@@ -59,6 +62,7 @@ class CountingExecutor(s.ModelExecutor):
 
     def execute_step(self, command):
         self.steps += 1
+        self.released.extend(command.finished)
         if self.steps > self.max_steps:
             raise RuntimeError(f"executor gave up after {self.max_steps} steps: the schedule is not making progress")
         new = {}
