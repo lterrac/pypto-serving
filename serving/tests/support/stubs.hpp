@@ -74,7 +74,7 @@ class ScriptedExecutor : public engine::ModelExecutor
     steps += 1;
     {
       const std::lock_guard<std::mutex> lock(_decodedMutex);
-      for (const std::string &id : command.finished) { released.push_back(id); }
+      for (const std::string &id : command.finished) { _released.push_back(id); }
     }
     // Stands in for a wedged kernel: the loop thread is blocked inside the
     // executor, which is where a real hang leaves it.
@@ -116,17 +116,23 @@ class ScriptedExecutor : public engine::ModelExecutor
   std::map<std::string, int> promptLengths;
   int                        promptLength = 0;
   std::string                failWith;
-  /// Requests the engine reported as finished, in the order it reported them.
-  /// A real executor drops its sampler and device state for these.
-  std::vector<std::string> released;
   /// How long each step blocks inside the executor. 0 returns at once.
   std::atomic<int> blockMilliseconds{0};
   std::atomic<int> steps{0};
-  std::atomic<int>           registered{0};
-  std::atomic<int>           closed{0};
-  std::atomic<int>           lastPrefillChunks{0};
+  std::atomic<int> registered{0};
+  std::atomic<int> closed{0};
+  std::atomic<int> lastPrefillChunks{0};
 
   /// Every decode slot asked for, in order. Written on the engine thread.
+  /// Requests the engine reported as finished, in the order it reported them.
+  /// A real executor drops its sampler and device state for these. A copy taken
+  /// under the lock: the engine thread appends while a test is reading.
+  std::vector<std::string> releasedIds()
+  {
+    const std::lock_guard<std::mutex> lock(_decodedMutex);
+    return _released;
+  }
+
   std::vector<std::string> decodedIds()
   {
     const std::lock_guard<std::mutex> lock(_decodedMutex);
@@ -157,6 +163,7 @@ class ScriptedExecutor : public engine::ModelExecutor
 
   std::mutex                                    _decodedMutex;
   std::vector<std::string>                      _decodedIds;
+  std::vector<std::string>                      _released;
   std::map<std::string, engine::SamplingParams> _sampling;
   std::vector<int>                              _script;
   int                                           _numPages;

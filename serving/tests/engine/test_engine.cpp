@@ -426,7 +426,7 @@ TEST(EngineTest, AStepThatNeverReturnsIsUnhealthyWhileStillBeingReady)
   ScriptedExecutor    executor({'a', 'b', 'c'});
   executor.promptLength = 2;
 
-  EngineConfig config    = makeConfig();
+  EngineConfig config = makeConfig();
   // Far below any real step, so the test does not have to wait one out.
   config.stepStallSeconds = 0.05;
 
@@ -496,7 +496,8 @@ TEST(EngineTest, TellsTheExecutorWhichRequestsHaveEnded)
     // one more step to run.
     (void)engine.addRequest("keepgoing" + std::to_string(waited), {'h', 'i'}, generate);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    reported = std::find(executor.released.begin(), executor.released.end(), "r") != executor.released.end();
+    const auto released = executor.releasedIds();
+    reported            = std::find(released.begin(), released.end(), "r") != released.end();
   }
   EXPECT_TRUE(reported) << "a finished request was never reported to the executor";
 
