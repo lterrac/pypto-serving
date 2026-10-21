@@ -180,6 +180,21 @@ class StateMap
 };
 
 /**
+ * Whether a node or replica name is safe to carry through the control plane.
+ *
+ * Names are not decoration: they are interpolated into pid-file paths that a
+ * shell on another node evaluates (`infra/remote_starter.cpp`), into process
+ * command lines, and into routing keys. A document arrives over RPC from a
+ * deployer this process did not write, so the name is checked once, here, at
+ * every point one enters the map rather than at each place one is used.
+ *
+ * Letters, digits, dot, underscore and dash, 1..64 characters. Deliberately
+ * narrower than a hostname: anything a shell, a URL or a JSON key treats
+ * specially is out.
+ */
+[[nodiscard]] bool isUsableName(const std::string &name);
+
+/**
  * Everything wrong with the deployment the map describes, one message per
  * problem, each naming its subject.
  *

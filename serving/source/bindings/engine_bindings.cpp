@@ -38,8 +38,14 @@ class PyModelExecutor : public engine::ModelExecutor
     {
       PYBIND11_OVERRIDE_PURE_NAME(engine::StepResult, ModelExecutor, "execute_step", executeStep, command);
     }
-    catch (const py::error_already_set &e)
+    catch (const std::exception &e)
     {
+      // Every exception, not only the ones Python raised. pybind11 throws
+      // py::cast_error when the override returns something that is not a
+      // StepResult, and pybind11_fail when the subclass has no execute_step at
+      // all; neither derives from error_already_set. Escaping here, they reach
+      // Engine::loop's silent catch, which advances nothing and fails nothing
+      // -- so every request in that step hangs for ever while the loop spins.
       engine::StepResult failed;
       failed.error = e.what();
       return failed;

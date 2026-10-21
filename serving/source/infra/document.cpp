@@ -46,6 +46,19 @@ std::string requireString(const json &object, const char *key, const Context &ct
   return value.get<std::string>();
 }
 
+/// A name that will be interpolated into shell commands, paths and routing
+/// keys. Rejected here rather than carried into the map: `isUsableName` states
+/// why, and this is the edge a document from another process crosses.
+std::string requireName(const json &object, const char *key, const Context &ctx)
+{
+  const std::string value = requireString(object, key, ctx);
+  if (!isUsableName(value))
+  {
+    throw ctx.error(std::string("'") + key + "' must be 1-64 characters of letters, digits, '.', '_' or '-'; got '" + value + "'");
+  }
+  return value;
+}
+
 std::string optionalString(const json &object, const char *key, const std::string &fallback, const Context &ctx)
 {
   const auto it = object.find(key);
@@ -158,7 +171,7 @@ StateMap readDocument(const std::string &text, const std::string &source)
       rejectUnknownKeys(entry, {"name", "host", "devices"}, ctx);
 
       Node node;
-      node.name    = requireString(entry, "name", ctx);
+      node.name    = requireName(entry, "name", ctx);
       node.host    = optionalString(entry, "host", "", ctx);
       node.devices = deviceList(entry, "devices", ctx);
       map.addNode(std::move(node));
@@ -176,7 +189,7 @@ StateMap readDocument(const std::string &text, const std::string &source)
       rejectUnknownKeys(entry, {"name", "partition", "node", "devices", "port", "scheme", "instance", "phase", "desired_phase"}, ctx);
 
       Replica replica;
-      replica.name      = requireString(entry, "name", ctx);
+      replica.name      = requireName(entry, "name", ctx);
       replica.partition = static_cast<PartitionId>(optionalInteger(entry, "partition", 0, 0, 1 << 20, ctx));
       replica.node      = optionalString(entry, "node", "", ctx);
       replica.devices   = deviceList(entry, "devices", ctx);

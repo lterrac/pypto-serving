@@ -373,3 +373,61 @@ TEST(DiscoveryTest, BuildsANodeTheMapAccepts)
   EXPECT_TRUE(validate(map).empty()) << joined(validate(map));
   EXPECT_EQ(map.devicesFree("hg-atlas-01"), (std::vector<int>{0, 1, 2, 3, 5, 6, 7}));
 }
+
+TEST(StateMapTest, ARejectedNameIsOneThatCouldReachAShell)
+{
+  using serving::infra::isUsableName;
+
+  EXPECT_TRUE(isUsableName("qwen-0"));
+  EXPECT_TRUE(isUsableName("p0.auto_3"));
+
+  // These are the ones that matter: the name is interpolated into a pid-file
+  // path that a shell on another node evaluates, so a space splits the command
+  // and a separator runs a second one.
+  EXPECT_FALSE(isUsableName("qwen 0"));
+  EXPECT_FALSE(isUsableName("qwen;rm -rf /"));
+  EXPECT_FALSE(isUsableName("qwen$(id)"));
+  EXPECT_FALSE(isUsableName("qwen`id`"));
+  EXPECT_FALSE(isUsableName("../../etc/passwd"));
+  EXPECT_FALSE(isUsableName(""));
+  EXPECT_FALSE(isUsableName(std::string(65, 'a')));
+}
+
+TEST(StateMapTest, ValidateRefusesAReplicaNameAShellWouldSplit)
+{
+  StateMap map;
+  map.addNode(atlas());
+
+  Replica r;
+  r.name    = "qwen 0; rm -rf /";
+  r.node    = "hg-atlas-01";
+  r.devices = {4};
+  r.phase   = Phase::Active;
+  map.addReplica(r);
+
+  const auto problems = validate(map);
+  ASSERT_FALSE(problems.empty());
+  EXPECT_NE(joined(problems).find("letters, digits"), std::string::npos) << joined(problems);
+}
+
+TEST(StateMapTest, APendingReplicaStillHoldsTheCardItIsLoadingOnto)
+{
+  StateMap map;
+  map.addNode(atlas());
+
+  // Pending is the whole of a model load -- minutes. Treating the card as free
+  // during it let a scale-up land a second model on top of the first.
+  Replica loading;
+  loading.name    = "qwen-0";
+  loading.node    = "hg-atlas-01";
+  loading.devices = {4};
+  loading.phase   = Phase::Pending;
+  map.addReplica(loading);
+
+  EXPECT_EQ(map.devicesInUse("hg-atlas-01"), (std::vector<int>{4}));
+  EXPECT_EQ(map.devicesFree("hg-atlas-01"), (std::vector<int>{0, 1, 2, 3, 5, 6, 7}));
+
+  // And it is given back once the replica is gone for good.
+  map.setPhase("qwen-0", Phase::Dead);
+  EXPECT_TRUE(map.devicesInUse("hg-atlas-01").empty());
+}

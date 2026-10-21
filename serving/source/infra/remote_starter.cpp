@@ -69,7 +69,12 @@ std::string RemoteStarter::remoteCommand(const Replica &replica) const
   //
   // `$$` is recorded before `exec` so the file names the replica rather than a
   // wrapper, and `exec` leaves no wrapper to signal separately.
-  const std::string file = pidFileFor(replica);
+  // The path is quoted because it embeds the replica's name, which arrives from
+  // a deployment document this process did not write. A name carrying a space
+  // would otherwise split the redirect and leave the pid file unwritten, so the
+  // replica could never be stopped; one carrying `;` or a backtick would run on
+  // the far side as the ssh user.
+  const std::string file = quoted(pidFileFor(replica));
   return "sh -c " + quoted("echo $$ > " + file + "; exec " + ProcessStarter(_template).commandFor(replica));
 }
 
@@ -112,7 +117,9 @@ void RemoteStarter::stop(const Replica &replica)
     // side holding its card, so the far side is told first and the reach is
     // torn down after. Failure here is not reported: the node may already be
     // gone, which is frequently why it is being stopped.
-    const std::string file = pidFileFor(replica);
+    // Quoted for the same reason the launch side quotes it: the name inside the
+    // path is not this process's to trust.
+    const std::string file = quoted(pidFileFor(replica));
     // The group first, because the replica forks its own workers, then the pid
     // itself: without `setsid` the replica may not lead a group of its own, and
     // a kill that silently reaches nothing is how one gets left holding a card.

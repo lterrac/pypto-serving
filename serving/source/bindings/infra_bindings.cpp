@@ -1,5 +1,6 @@
 #include <serving/bindings/bindings.hpp>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -109,10 +110,42 @@ void bindInfra(py::module_ &m)
     .def_property_readonly("nodes", &infra::StateMap::nodes)
     .def_property_readonly("replicas", &infra::StateMap::replicas)
     .def_property_readonly("channels", &infra::StateMap::channels)
-    .def("node", &infra::StateMap::node, py::arg("name"), py::return_value_policy::reference_internal)
-    .def("replica", &infra::StateMap::replica, py::arg("name"), py::return_value_policy::reference_internal)
-    .def("replicas_on", &infra::StateMap::replicasOn, py::arg("node"), py::return_value_policy::reference_internal)
-    .def("replicas_in", &infra::StateMap::replicasIn, py::arg("partition"), py::return_value_policy::reference_internal)
+    // Copies, not references into the map. These return pointers into
+    // std::vector members that add_replica/remove_replica reallocate, and
+    // reference_internal only keeps the StateMap alive -- it cannot keep the
+    // vector's buffer alive, so a handle held across one add_replica reads and
+    // writes freed memory. The KV pool solves the same problem by never
+    // resizing; the map resizes by design, so Python gets a copy.
+    .def(
+      "node",
+      [](const infra::StateMap &map, const std::string &name) -> std::optional<infra::Node> {
+        const infra::Node *found = map.node(name);
+        return found == nullptr ? std::nullopt : std::optional<infra::Node>{*found};
+      },
+      py::arg("name"))
+    .def(
+      "replica",
+      [](const infra::StateMap &map, const std::string &name) -> std::optional<infra::Replica> {
+        const infra::Replica *found = map.replica(name);
+        return found == nullptr ? std::nullopt : std::optional<infra::Replica>{*found};
+      },
+      py::arg("name"))
+    .def(
+      "replicas_on",
+      [](const infra::StateMap &map, const std::string &node) {
+        std::vector<infra::Replica> out;
+        for (const infra::Replica *replica : map.replicasOn(node)) { out.push_back(*replica); }
+        return out;
+      },
+      py::arg("node"))
+    .def(
+      "replicas_in",
+      [](const infra::StateMap &map, infra::PartitionId partition) {
+        std::vector<infra::Replica> out;
+        for (const infra::Replica *replica : map.replicasIn(partition)) { out.push_back(*replica); }
+        return out;
+      },
+      py::arg("partition"))
     .def("partitions", &infra::StateMap::partitions)
     .def("devices_in_use", &infra::StateMap::devicesInUse, py::arg("node"))
     .def("devices_free", &infra::StateMap::devicesFree, py::arg("node"))

@@ -1,6 +1,7 @@
 #include <serving/infra/state.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <set>
 
@@ -18,6 +19,12 @@ const T *findByName(const std::vector<T> &items, const std::string &name)
 }
 
 } // namespace
+
+bool isUsableName(const std::string &name)
+{
+  if (name.empty() || name.size() > 64) { return false; }
+  return std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isalnum(c) != 0 || c == '.' || c == '_' || c == '-'; });
+}
 
 bool Node::owns(int device) const { return std::find(devices.begin(), devices.end(), device) != devices.end(); }
 
@@ -44,10 +51,17 @@ std::optional<Phase> parsePhase(const std::string &text)
   return std::nullopt;
 }
 
-// A draining replica is still serving what it has and a reserved one is loaded
-// and waiting, so both are holding their devices; only pending and dead have
-// released them.
-bool holdsDevices(Phase phase) { return phase == Phase::Active || phase == Phase::Draining || phase == Phase::Reserved; }
+// A draining replica is still serving what it has, a reserved one is loaded and
+// waiting, and a pending one is loading its model onto the cards it was placed
+// on -- all three are holding their devices. Only dead has given them back.
+//
+// Pending counts. It was once excluded on the reading that a replica which has
+// not started cannot be occupying anything, but a replica is pending for the
+// whole of its model load: minutes during which the map advertised its card as
+// free and a scale-up in that window was placed on top of it, so two models
+// loaded onto one device and neither came up. A replica holds its cards from
+// placement until it is confirmed stopped.
+bool holdsDevices(Phase phase) { return phase == Phase::Active || phase == Phase::Draining || phase == Phase::Reserved || phase == Phase::Pending; }
 
 const char *actionName(Action action)
 {
@@ -192,6 +206,7 @@ std::vector<std::string> validate(const StateMap &map)
   for (const Node &n : map.nodes())
   {
     if (n.name.empty()) { problems.emplace_back("node: name is empty"); }
+    else if (!isUsableName(n.name)) { problems.emplace_back("node '" + n.name + "': name must be 1-64 characters of letters, digits, '.', '_' or '-'"); }
     else if (!nodeNames.insert(n.name).second) { problems.emplace_back("node '" + n.name + "': declared twice"); }
 
     std::set<int> devices;
@@ -210,6 +225,7 @@ std::vector<std::string> validate(const StateMap &map)
   {
     const std::string who = "replica '" + r.name + "'";
     if (r.name.empty()) { problems.emplace_back("replica: name is empty"); }
+    else if (!isUsableName(r.name)) { problems.emplace_back(who + ": name must be 1-64 characters of letters, digits, '.', '_' or '-'"); }
     else if (!replicaNames.insert(r.name).second) { problems.emplace_back(who + ": declared twice"); }
 
     if (r.partition < 0) { problems.emplace_back(who + ": partition is negative"); }
