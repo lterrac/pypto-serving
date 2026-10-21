@@ -40,11 +40,15 @@ MonitorReport HealthMonitor::service()
 
   for (const std::string &name : serving)
   {
-    const Replica *replica = _map.replica(name);
-    if (replica == nullptr) { continue; }
+    // Copied for the same reason the supervisor copies: the probe blocks, and a
+    // pointer into the map's replica vector does not survive another thread
+    // adding a replica while this one waits on a socket.
+    const Replica *found = _map.replica(name);
+    if (found == nullptr) { continue; }
+    const Replica replica = *found;
 
     report.probed += 1;
-    const Readiness readiness = _probe.check(*replica);
+    const Readiness readiness = _probe.check(replica);
 
     if (readiness == Readiness::Ready)
     {

@@ -68,12 +68,17 @@ SupervisionReport Supervisor::service()
   // reconcile() says what is missing; this decides nothing beyond when to try.
   for (const PendingAction &action : reconcile(_map))
   {
-    const Replica *replica = _map.replica(action.replica);
-    if (replica == nullptr) { continue; }
+    // Copied, not pointed at. The map's replicas live in a vector that
+    // `addReplica` reallocates, and the work below blocks: a probe, and a stop
+    // that waits out a grace period. A pointer held across either is a pointer
+    // into freed memory the moment anything else adds a replica.
+    const Replica *found = _map.replica(action.replica);
+    if (found == nullptr) { continue; }
+    const Replica replica = *found;
 
     if (action.action == Action::Stop)
     {
-      _starter.stop(*replica);
+      _starter.stop(replica);
       _map.setPhase(action.replica, Phase::Dead);
       _attempts.erase(action.replica);
       report.stopped.push_back(action.replica);
@@ -90,12 +95,12 @@ SupervisionReport Supervisor::service()
     {
       // Started, waiting for it to say it is serving. Its own /health is the
       // authority: a process that exists is not a replica that can serve.
-      const Readiness readiness = _probe.check(*replica);
+      const Readiness readiness = _probe.check(replica);
       if (readiness == Readiness::Ready)
       {
         // To the phase the deployment asked for, not always Active: a spare is
         // started so it can wait, and promoting it to serving would defeat it.
-        _map.setPhase(action.replica, replica->desiredPhase == Phase::Reserved ? Phase::Reserved : Phase::Active);
+        _map.setPhase(action.replica, replica.desiredPhase == Phase::Reserved ? Phase::Reserved : Phase::Active);
         _attempts.erase(action.replica);
         report.promoted.push_back(action.replica);
         continue;
@@ -111,7 +116,7 @@ SupervisionReport Supervisor::service()
       }
 
       // It never came up. Count it and wait before trying again.
-      _starter.stop(*replica);
+      _starter.stop(replica);
       attempt.inFlight = false;
       attempt.failures += 1;
       attempt.nextTryAt = now + _backoff.delayAfter(attempt.failures);
@@ -137,9 +142,9 @@ SupervisionReport Supervisor::service()
     // run that leaked a replica left one holding a card, and the next
     // deployment adopted it, reporting a replica as serving that it had never
     // started and could not stop. A pending or dead replica gets launched.
-    if (replica->phase == Phase::Reserved && _probe.check(*replica) == Readiness::Ready)
+    if (replica.phase == Phase::Reserved && _probe.check(replica) == Readiness::Ready)
     {
-      _map.setPhase(action.replica, replica->desiredPhase == Phase::Reserved ? Phase::Reserved : Phase::Active);
+      _map.setPhase(action.replica, replica.desiredPhase == Phase::Reserved ? Phase::Reserved : Phase::Active);
       _attempts.erase(action.replica);
       report.promoted.push_back(action.replica);
       continue;
@@ -151,7 +156,7 @@ SupervisionReport Supervisor::service()
       continue;
     }
 
-    if (!_starter.start(*replica))
+    if (!_starter.start(replica))
     {
       attempt.failures += 1;
       attempt.nextTryAt = now + _backoff.delayAfter(attempt.failures);
@@ -169,7 +174,7 @@ SupervisionReport Supervisor::service()
     attempt.startedAt = now;
     // Pending until its health says otherwise. A replica that was dead and is
     // being rebuilt goes back to pending rather than straight to active.
-    if (replica->phase != Phase::Pending) { _map.setPhase(action.replica, Phase::Pending); }
+    if (replica.phase != Phase::Pending) { _map.setPhase(action.replica, Phase::Pending); }
     report.started.push_back(action.replica);
   }
 

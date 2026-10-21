@@ -39,9 +39,10 @@ json describe(const Replica &replica, const ReplicaLoad *load)
 
 } // namespace
 
-DeploymentServer::DeploymentServer(DeploymentServerConfig config, StateMap &map, CapacityProvider &provider, ScalingConfig scaling)
+DeploymentServer::DeploymentServer(DeploymentServerConfig config, StateMap &map, std::mutex &mapMutex, CapacityProvider &provider, ScalingConfig scaling)
   : _config(std::move(config)),
     _map(map),
+    _mutex(mapMutex),
     _provider(provider),
     _scaling(scaling),
     _server(std::make_unique<httplib::Server>())
@@ -85,7 +86,8 @@ LoadSnapshot DeploymentServer::collectLoad() const
     try
     {
       const auto body = nlohmann::json::parse(response->body);
-      snapshot.replicas.push_back(ReplicaLoad{replica.name, 0, body.value("pending_tokens", 0), body.value("preemptions", 0)});
+      snapshot.replicas.push_back(
+        ReplicaLoad{replica.name, body.value("outstanding", 0), body.value("pending_tokens", 0), body.value("preemptions", 0)});
     }
     catch (const std::exception &)
     {
@@ -157,6 +159,11 @@ void DeploymentServer::registerRoutes()
     }
     const auto partition = body.at("partition").get<PartitionId>();
 
+    // Probed before the lock is taken: collectLoad dials every replica, and the
+    // map's lock is the one the deployer's ticker needs. A drain also has to
+    // know what each replica is carrying before it can pick the lightest.
+    const LoadSnapshot load = direction == "down" ? collectLoad() : LoadSnapshot{};
+
     const std::lock_guard<std::mutex> lock(_mutex);
     if (_map.replicasIn(partition).empty())
     {
@@ -172,14 +179,11 @@ void DeploymentServer::registerRoutes()
     else
     {
       // Drain the least loaded of the ones that are actually serving: it has
-      // the least in flight to finish, so the capacity comes back soonest.
+      // the least in flight to finish, so the capacity comes back soonest. The
+      // same helper the automatic policy uses, so an operator's scale-down and
+      // the advice they were shown pick the same replica.
       decision.action       = ScalingAction::ScaleDown;
-      const Replica *victim = nullptr;
-      for (const Replica *candidate : _map.replicasIn(partition))
-      {
-        if (candidate->phase != Phase::Active) { continue; }
-        if (victim == nullptr) { victim = candidate; }
-      }
+      const Replica *victim = leastLoadedServing(_map, partition, load);
       if (victim == nullptr)
       {
         sendError(response, "partition " + std::to_string(partition) + " has no serving replica to drain", 409);

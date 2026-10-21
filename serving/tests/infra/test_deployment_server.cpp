@@ -1,5 +1,7 @@
 #include <string>
 
+#include <mutex>
+
 #include <gtest/gtest.h>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -45,6 +47,10 @@ ScalingConfig scaling()
 struct Fixture
 {
   StateMap                          map = deployment();
+  /// The map's lock. In a deployment the coordinator owns it and the deployer's
+  /// ticker takes it too; here the fixture owns it because nothing else edits
+  /// the map.
+  std::mutex                        mapMutex;
   LocalCapacity                     provider{map};
   std::unique_ptr<DeploymentServer> server;
 
@@ -54,7 +60,7 @@ struct Fixture
     config.host                = "127.0.0.1";
     config.port                = 0;
     config.probeTimeoutSeconds = 0.3; // nothing is listening; do not wait on it
-    server                     = std::make_unique<DeploymentServer>(config, map, provider, scaling());
+    server                     = std::make_unique<DeploymentServer>(config, map, mapMutex, provider, scaling());
     server->start();
   }
 

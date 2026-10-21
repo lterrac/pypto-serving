@@ -107,6 +107,22 @@ class Coordinator
   [[nodiscard]] infra::StateMap       &stateMap() { return _stateMap; }
   [[nodiscard]] const infra::StateMap &stateMap() const { return _stateMap; }
 
+  /**
+   * The lock that guards the map, for the other threads that edit it.
+   *
+   * The coordinator owns the map, so it owns the lock. A deployer's ticker and
+   * an operator's HTTP handler both reach `stateMap()` directly; without one
+   * shared lock between them `addReplica` reallocates the replica vector under
+   * a `const Replica *` another thread is still holding. The coordinator's own
+   * entry points take this internally, so a caller that holds it must not call
+   * back into them.
+   */
+  [[nodiscard]] std::mutex &stateMapMutex() const { return _routingMutex; }
+
+  /// The path a session already has, without planning or publishing one. For
+  /// inspection endpoints; see RoutingStrategy::peek.
+  [[nodiscard]] std::optional<router::RoutingPath> peekRoute(const std::string &sessionId) const;
+
   /// Bring routing to the map, now, and say what changed. `service()` calls
   /// this; a test calls it directly.
   SyncReport syncFromMap();

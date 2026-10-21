@@ -63,7 +63,14 @@ class DeploymentServer
 {
   public:
 
-  DeploymentServer(DeploymentServerConfig config, StateMap &map, CapacityProvider &provider, ScalingConfig scaling);
+  /**
+   * `mapMutex` guards `map`, and it belongs to whoever owns the map rather than
+   * to this server. The deployer's ticker edits the same map from its own
+   * thread, so a lock private to the request threads would guard them against
+   * each other and against nothing else -- `addReplica` reallocates the
+   * replica vector while the ticker is holding a `const Replica *` into it.
+   */
+  DeploymentServer(DeploymentServerConfig config, StateMap &map, std::mutex &mapMutex, CapacityProvider &provider, ScalingConfig scaling);
   ~DeploymentServer();
 
   DeploymentServer(const DeploymentServer &)            = delete;
@@ -91,8 +98,9 @@ class DeploymentServer
   CapacityProvider      &_provider;
   ScalingConfig          _scaling;
 
-  /// Guards the map against the request threads that read and edit it.
-  mutable std::mutex _mutex;
+  /// Guards the map. Owned by the map's owner, not by this server: every thread
+  /// that touches the map takes this one lock.
+  std::mutex &_mutex;
 
   std::unique_ptr<httplib::Server> _server;
   std::thread                      _thread;

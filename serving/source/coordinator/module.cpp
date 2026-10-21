@@ -141,11 +141,26 @@ SyncReport Coordinator::syncLocked()
     for (const std::string &name : stale)
     {
       _strategy->onReplicaLost(name);
+      // Actually taken out, not just marked unready. onReplicaLost only clears
+      // the ready flag, so the entry stayed in the registry for ever: every
+      // later tick found the same ghost and counted it removed again, and a
+      // replacement replica registered under the same name was skipped by the
+      // `state(name) == nullptr` test above -- keeping the dead host and port
+      // and losing its instance id, so channel rules for it silently stopped
+      // being published.
+      registry->remove(name);
       _instanceByName.erase(name);
       report.removed += 1;
     }
   }
   return report;
+}
+
+std::optional<router::RoutingPath> Coordinator::peekRoute(const std::string &sessionId) const
+{
+  const std::lock_guard<std::mutex> lock(_routingMutex);
+  if (_strategy == nullptr) { return std::nullopt; }
+  return _strategy->peek(sessionId);
 }
 
 router::RoutingPath Coordinator::routeFor(const std::string &sessionId)

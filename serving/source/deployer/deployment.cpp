@@ -347,7 +347,7 @@ void Deployment::start()
   infra::DeploymentServerConfig operatorConfig;
   operatorConfig.host = _config.operatorHost;
   operatorConfig.port = _config.operatorPort;
-  _operator           = std::make_unique<infra::DeploymentServer>(operatorConfig, map(), *_capacity, _config.scaling);
+  _operator           = std::make_unique<infra::DeploymentServer>(operatorConfig, map(), _coordinator->stateMapMutex(), *_capacity, _config.scaling);
 
   // The ingress registry holds the partition requests enter at: a pinned hop
   // that cannot be reached falls back to a sibling, and a sibling must be one
@@ -381,23 +381,59 @@ void Deployment::start()
 
 void Deployment::refreshRouting()
 {
-  if (_ingress == nullptr) { return; }
-
   struct Live
   {
     router::ReplicaSpec spec;
     infra::Phase        phase;
+    uint64_t            instance = 0;
   };
+
+  // Every replica in the deployment, not just this partition's: the rule
+  // transport publishes to holders in other partitions, so it needs them all.
+  std::vector<Live> everything;
+  {
+    const std::lock_guard<std::mutex> mapLock(_coordinator->stateMapMutex());
+    const infra::StateMap            &current = map();
+    for (const infra::Replica &replica : current.replicas())
+    {
+      const infra::Node *node = current.node(replica.node);
+      if (node == nullptr) { continue; }
+      everything.push_back({router::ReplicaSpec{replica.name, replica.partition, node->host, replica.port, replica.scheme}, replica.phase, replica.instance});
+    }
+  }
+
+  if (_transport != nullptr)
+  {
+    // The transport's idea of which replicas exist, and which can be reached,
+    // comes from the map on every tick. Fixed at startup it could not see a
+    // scaled-up replica at all -- publishing its rules with instance 0 -- and
+    // its unreachable set was only ever cleared by the monitor's "recovered"
+    // list, which by construction never names a replica that was declared dead
+    // and rebuilt. Those sessions' rules were dropped silently for ever.
+    std::vector<router::ReplicaSpec>  specs;
+    std::map<std::string, uint64_t>   instances;
+    std::vector<std::string>          reachable;
+    for (const Live &entry : everything)
+    {
+      specs.push_back(entry.spec);
+      instances[entry.spec.name] = entry.instance;
+      if (entry.phase == infra::Phase::Active) { reachable.push_back(entry.spec.name); }
+    }
+    _transport->setReplicas(std::move(specs), std::move(instances));
+    // Active in the map is reachable, whatever an earlier failure recorded.
+    for (const std::string &name : reachable) { _transport->markReachable(name); }
+  }
+
+  if (_ingress == nullptr) { return; }
 
   std::vector<Live> live;
   {
-    const infra::StateMap &current = map();
-    for (const infra::Replica &replica : current.replicas())
+    // Reuses the snapshot taken above, so the map's lock is not taken twice and
+    // the ingress sees the same picture the transport was given.
+    for (const Live &entry : everything)
     {
-      if (replica.partition != _config.partition) { continue; }
-      const infra::Node *node = current.node(replica.node);
-      if (node == nullptr) { continue; }
-      live.push_back({router::ReplicaSpec{replica.name, replica.partition, node->host, replica.port, replica.scheme}, replica.phase});
+      if (entry.spec.partition != _config.partition) { continue; }
+      live.push_back(entry);
     }
   }
 
@@ -438,7 +474,10 @@ TickReport Deployment::service()
 
   if (_supervisor != nullptr)
   {
-    const auto supervision = _supervisor->service();
+    // The supervisor starts, stops and rephases replicas, all of which edit the
+    // map. It is the coordinator's lock because the coordinator owns the map.
+    const std::lock_guard<std::mutex> mapLock(_coordinator->stateMapMutex());
+    const auto                        supervision = _supervisor->service();
     report.started         = supervision.started;
     report.promoted        = supervision.promoted;
     report.retrying        = supervision.retrying;
@@ -447,7 +486,11 @@ TickReport Deployment::service()
     report.lost = supervision.gaveUp;
   }
 
-  const auto health = _monitor->service();
+  // The monitor marks replicas dead, which is a map edit like any other.
+  const auto health = [&] {
+    const std::lock_guard<std::mutex> mapLock(_coordinator->stateMapMutex());
+    return _monitor->service();
+  }();
   report.lost.insert(report.lost.end(), health.lost.begin(), health.lost.end());
   for (const auto &name : report.lost)
   {
@@ -466,7 +509,8 @@ TickReport Deployment::service()
 
   refreshRouting();
 
-  const uint64_t version = map().version();
+  const std::lock_guard<std::mutex> mapLock(_coordinator->stateMapMutex());
+  const uint64_t                    version = map().version();
   if (_config.persist && version != _persistedVersion)
   {
     infra::saveDocument(map(), _config.documentOut);
