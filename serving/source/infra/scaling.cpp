@@ -53,6 +53,32 @@ const ReplicaLoad *LoadSnapshot::find(const std::string &replicaName) const
   return it == replicas.end() ? nullptr : &*it;
 }
 
+const Replica *leastLoadedServing(const StateMap &map, PartitionId partition, const LoadSnapshot &load)
+{
+  const auto active = serving(map, partition);
+  if (active.empty()) { return nullptr; }
+
+  // A replica that did not answer the load probe contributes nothing rather
+  // than a zero, which would make an unreachable replica look like the best
+  // one to drain.
+  const Replica *victim  = active.front();
+  const auto      sampleOf = [&](const Replica *replica) {
+    const ReplicaLoad *sample = load.find(replica->name);
+    return sample == nullptr ? 0 : sample->outstanding;
+  };
+  int lowest = sampleOf(victim);
+  for (const Replica *candidate : active)
+  {
+    const int current = sampleOf(candidate);
+    if (current < lowest)
+    {
+      lowest = current;
+      victim = candidate;
+    }
+  }
+  return victim;
+}
+
 double LoadSnapshot::meanOutstanding(const std::vector<const Replica *> &members) const
 {
   if (members.empty()) { return 0.0; }
@@ -121,20 +147,8 @@ std::vector<ScalingDecision> decideScaling(const StateMap &map, const LoadSnapsh
 
     if (mean < config.scaleDownBelow && count > config.minReplicas && !active.empty())
     {
-      // Drain the least loaded: it has the least in flight to finish, so the
-      // capacity comes back soonest.
-      const Replica *victim = active.front();
-      int            lowest = load.find(victim->name) == nullptr ? 0 : load.find(victim->name)->outstanding;
-      for (const Replica *candidate : active)
-      {
-        const ReplicaLoad *sample  = load.find(candidate->name);
-        const int          current = sample == nullptr ? 0 : sample->outstanding;
-        if (current < lowest)
-        {
-          lowest = current;
-          victim = candidate;
-        }
-      }
+      const Replica *victim = leastLoadedServing(map, partition, load);
+      if (victim == nullptr) { continue; }
       decisions.push_back({partition, ScalingAction::ScaleDown, victim->name, "mean outstanding " + number(mean) + " below " + number(config.scaleDownBelow)});
     }
   }

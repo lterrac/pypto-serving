@@ -52,6 +52,17 @@ struct LoadSnapshot
   [[nodiscard]] int    totalPreemptions(const std::vector<const Replica *> &members) const;
 };
 
+/**
+ * The serving replica of a partition carrying the least, or nullptr when the
+ * partition has none serving.
+ *
+ * Draining the least loaded is what makes a scale-down cheap: it has the least
+ * in flight to finish, so the capacity comes back soonest. Shared so the
+ * automatic policy and an operator's explicit scale-down cannot disagree about
+ * which replica that is.
+ */
+[[nodiscard]] const Replica *leastLoadedServing(const StateMap &map, PartitionId partition, const LoadSnapshot &load);
+
 struct ScalingConfig
 {
   /// Add capacity when the mean outstanding per routable replica is above this.

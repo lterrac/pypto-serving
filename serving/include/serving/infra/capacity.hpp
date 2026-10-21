@@ -117,6 +117,11 @@ class LocalCapacity final : public CapacityProvider
 
   private:
 
+  /// The lowest auto-name index this partition is not already using, counted
+  /// from the map and the outstanding grants rather than from a per-process
+  /// counter that a restart would reset.
+  [[nodiscard]] int nextAutoIndex(PartitionId partition) const;
+
   const StateMap &_map;
   /// Devices handed out but not yet in the map, so two acquires in a row do not
   /// both get the same card. Cleared as the caller places them.

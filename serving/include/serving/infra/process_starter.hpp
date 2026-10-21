@@ -57,8 +57,22 @@ class ProcessStarter final : public ReplicaStarter
 
   private:
 
-  std::string                _template;
-  std::map<std::string, int> _pids;
+  /// One launch. The leader is kept after it has been reaped, because the
+  /// replica's workers live in the leader's process group and outlive it: a
+  /// wrapper script whose python child crashed leaves them holding the card,
+  /// and forgetting the group is what makes them unreachable.
+  struct Launch
+  {
+    int  leader = 0;
+    bool reaped = false;
+  };
+
+  /// Collect the leader if it has exited. True once there is nothing left to
+  /// wait for, so a caller can poll it without reaping twice.
+  [[nodiscard]] static bool reap(Launch &launch);
+
+  std::string                   _template;
+  std::map<std::string, Launch> _pids;
 };
 
 /**

@@ -1,5 +1,6 @@
 #include <serving/infra/process_starter.hpp>
 
+#include <signal.h>
 #include <csignal>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -18,6 +19,10 @@ namespace
 /// How long a replica is given to exit on SIGTERM before it is killed.
 constexpr int GRACE_MILLISECONDS = 5000;
 constexpr int POLL_MILLISECONDS  = 50;
+/// How long to keep reaping after SIGKILL. The signal is delivered promptly,
+/// but not before the next instruction, which is why a single WNOHANG here
+/// never collected anything.
+constexpr int KILL_REAP_MILLISECONDS = 500;
 
 void replaceAll(std::string &text, const std::string &token, const std::string &value)
 {
@@ -40,11 +45,12 @@ ProcessStarter::ProcessStarter(std::string commandTemplate)
 ProcessStarter::~ProcessStarter()
 {
   // A supervisor going away must not leave replicas holding cards.
-  for (const auto &[name, pid] : _pids)
+  for (const auto &[name, launch] : _pids)
   {
-    ::kill(-pid, SIGTERM);
+    ::kill(-launch.leader, SIGTERM);
+    if (launch.reaped) { continue; }
     int status = 0;
-    ::waitpid(pid, &status, 0);
+    ::waitpid(launch.leader, &status, 0);
   }
 }
 
@@ -76,7 +82,15 @@ bool ProcessStarter::start(const Replica &replica)
   // group reaches whatever the template actually started.
   posix_spawnattr_t attributes;
   if (::posix_spawnattr_init(&attributes) != 0) { return false; }
-  ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+  // The mask is reset as well as the group. This process blocks SIGINT and
+  // SIGTERM before it starts any thread, and a spawned child inherits that
+  // mask: the replica's own signal handler would never run, so every stop
+  // would wait out the grace period and end in SIGKILL with no graceful engine
+  // shutdown and no chance to release its device cleanly.
+  sigset_t empty;
+  ::sigemptyset(&empty);
+  ::posix_spawnattr_setsigmask(&attributes, &empty);
+  ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK);
   ::posix_spawnattr_setpgroup(&attributes, 0);
 
   pid_t     pid = 0;
@@ -84,7 +98,7 @@ bool ProcessStarter::start(const Replica &replica)
   ::posix_spawnattr_destroy(&attributes);
   if (rc != 0) { return false; }
 
-  _pids[replica.name] = pid;
+  _pids[replica.name] = Launch{pid, false};
   return true;
 }
 
@@ -93,7 +107,8 @@ void ProcessStarter::stop(const Replica &replica)
   const auto it = _pids.find(replica.name);
   if (it == _pids.end()) { return; }
 
-  const pid_t leader = it->second;
+  Launch     &launch = it->second;
+  const pid_t leader = launch.leader;
   // Negative pid: the whole group, so a wrapper that spawned the replica
   // rather than exec'ing it does not leave it behind holding a card.
   ::kill(-leader, SIGTERM);
@@ -102,16 +117,33 @@ void ProcessStarter::stop(const Replica &replica)
   // after this would keep its device out of the pool for good.
   for (int waited = 0; waited < GRACE_MILLISECONDS; waited += POLL_MILLISECONDS)
   {
-    int         status = 0;
-    const pid_t reaped = ::waitpid(leader, &status, WNOHANG);
-    if (reaped != 0) { break; }
+    if (reap(launch)) { break; }
     ::usleep(POLL_MILLISECONDS * 1000);
   }
   ::kill(-leader, SIGKILL);
-  int status = 0;
-  ::waitpid(leader, &status, WNOHANG);
+  // Reaped with a wait that can actually succeed. WNOHANG issued the instant
+  // after SIGKILL always returns 0 -- the signal has not been delivered yet --
+  // so the old code reaped nothing and then dropped the pid, leaving a zombie
+  // per forced stop until the process table filled.
+  for (int waited = 0; waited < KILL_REAP_MILLISECONDS; waited += POLL_MILLISECONDS)
+  {
+    if (reap(launch)) { break; }
+    ::usleep(POLL_MILLISECONDS * 1000);
+  }
 
   _pids.erase(it);
+}
+
+bool ProcessStarter::reap(Launch &launch)
+{
+  if (launch.reaped) { return true; }
+  int         status = 0;
+  const pid_t waited = ::waitpid(launch.leader, &status, WNOHANG);
+  if (waited == 0) { return false; }
+  // Reaped, or already gone. Either way there is nothing left to wait for, and
+  // waiting again on a reaped pid would block or fail.
+  launch.reaped = true;
+  return true;
 }
 
 bool ProcessStarter::running(const std::string &replica)
@@ -119,11 +151,15 @@ bool ProcessStarter::running(const std::string &replica)
   const auto it = _pids.find(replica);
   if (it == _pids.end()) { return false; }
 
-  int         status = 0;
-  const pid_t waited = ::waitpid(it->second, &status, WNOHANG);
-  if (waited == 0) { return true; }
+  if (!reap(it->second)) { return true; }
 
-  // Exited or vanished: reap it so the pid is not reused under us.
+  // The leader is gone, but its group may not be: the documented launch is a
+  // wrapper, and the replica's per-chip workers were forked into that group.
+  // They still hold the card's memory, so the replica is still running and the
+  // entry has to stay -- dropping it here made every later stop() return early
+  // and left those workers unreachable for the life of the process.
+  if (::kill(-it->second.leader, 0) == 0) { return true; }
+
   _pids.erase(it);
   return false;
 }
