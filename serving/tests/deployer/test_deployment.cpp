@@ -133,7 +133,7 @@ struct Fixture
     // The ingress starts its replicas unready; one tick plus a probe makes them
     // routable, which is what a launched deployment waits for too.
     deployment->service();
-    deployment->coordinator().stateMap();
+    (void)deployment->coordinator().stateMap();
   }
 
   ~Fixture()

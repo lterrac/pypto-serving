@@ -260,7 +260,7 @@ TEST(ReplicaRegistryTest, AnExpiredPinReRoutesByLoad)
   SessionDirectory sessions(60.0, clock.fn());
   ReplicaRegistry  registry(RoutingConfig{}, sessions, twoReplicas());
 
-  registry.select("s1");
+  (void)registry.select("s1");
   clock.now = 120.0;
   EXPECT_FALSE(registry.select("s1").affinityHit) << "an expired pin is not an affinity hit";
 }
@@ -407,7 +407,7 @@ TEST(ReplicaRegistryTest, TheRotatingTiebreakStaysInRangeAfterRemoval)
   SessionDirectory sessions(600.0, clock.fn());
   ReplicaRegistry  registry(RoutingConfig{}, sessions, {spec("a", 1), spec("b", 2), spec("c", 3)});
 
-  for (int i = 0; i < 6; ++i) { registry.select("s" + std::to_string(i)); }
+  for (int i = 0; i < 6; ++i) { (void)registry.select("s" + std::to_string(i)); }
   registry.remove("a");
 
   std::set<std::string> reached;

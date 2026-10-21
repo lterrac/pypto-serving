@@ -25,7 +25,6 @@ namespace serving::bindings
 namespace
 {
 
-std::string show(infra::Phase phase) { return std::string("'") + infra::phaseName(phase) + "'"; }
 
 } // namespace
 

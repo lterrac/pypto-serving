@@ -364,7 +364,7 @@ TEST(ScalingApplyTest, TheLocalNodeStaysSeparateFromTheGrantedOnes)
   {
     const auto decisions = decideScaling(map, busy({{"p0a", 99}}), c);
     if (decisions.empty()) { break; }
-    applyScaling(map, provider, decisions, c);
+    (void)applyScaling(map, provider, decisions, c);
   }
 
   // Each grant is its own machine, each with its own card: nothing is

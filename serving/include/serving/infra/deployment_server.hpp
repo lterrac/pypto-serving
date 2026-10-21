@@ -95,12 +95,14 @@ class DeploymentServer
 
   DeploymentServerConfig _config;
   StateMap              &_map;
-  CapacityProvider      &_provider;
-  ScalingConfig          _scaling;
 
   /// Guards the map. Owned by the map's owner, not by this server: every thread
-  /// that touches the map takes this one lock.
+  /// that touches the map takes this one lock. Declared next to what it guards
+  /// and before the members initialised after it.
   std::mutex &_mutex;
+
+  CapacityProvider &_provider;
+  ScalingConfig     _scaling;
 
   std::unique_ptr<httplib::Server> _server;
   std::thread                      _thread;
