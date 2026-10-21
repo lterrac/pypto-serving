@@ -2,6 +2,7 @@
 
 #include <serving/router/proxy.hpp>
 #include <serving/util/blocking_queue.hpp>
+#include <serving/util/http_serving.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -142,31 +143,11 @@ HttpServer::~HttpServer() { stop(); }
 
 void HttpServer::start()
 {
-  if (_config.port == 0)
-  {
-    // bind_to_port(host, 0) reports success without telling us which port the
-    // kernel chose; bind_to_any_port returns it.
-    const int port = _server->bind_to_any_port(_config.host.c_str());
-    if (port <= 0) { throw std::runtime_error("could not bind " + _config.host + " to an ephemeral port"); }
-    _boundPort = port;
-  }
-  else
-  {
-    if (!_server->bind_to_port(_config.host.c_str(), _config.port)) { throw std::runtime_error("could not bind " + _config.host + ":" + std::to_string(_config.port)); }
-    _boundPort = _config.port;
-  }
-
-  _thread = std::thread([this] { _server->listen_after_bind(); });
-  // listen_after_bind returns only when the server stops, so wait for it to be
-  // accepting rather than racing the first request against the accept loop.
-  _server->wait_until_ready();
+  _boundPort = util::bindAndServe(*_server, _config.host, _config.port, _thread, "serving");
+  _serving   = true;
 }
 
-void HttpServer::stop()
-{
-  if (_server) { _server->stop(); }
-  if (_thread.joinable()) { _thread.join(); }
-}
+void HttpServer::stop() { util::stopServing(_server.get(), _thread, _serving); }
 
 /// The coordinator's half of Option B, over HTTP: it publishes where a session
 /// goes next and withdraws it when the path is replanned. A deployment with a

@@ -1,5 +1,7 @@
 #include <serving/router/router_server.hpp>
 
+#include <serving/util/http_serving.hpp>
+
 #include <chrono>
 #include <stdexcept>
 
@@ -29,25 +31,11 @@ RouterServer::~RouterServer() { stop(); }
 
 void RouterServer::start()
 {
-  if (_config.port == 0)
-  {
-    const int port = _server->bind_to_any_port(_config.host.c_str());
-    if (port <= 0) { throw std::runtime_error("router could not bind an ephemeral port"); }
-    _boundPort = port;
-  }
-  else
-  {
-    if (!_server->bind_to_port(_config.host.c_str(), _config.port)) { throw std::runtime_error("router could not bind " + _config.host + ":" + std::to_string(_config.port)); }
-    _boundPort = _config.port;
-  }
-
+  // The bind and the accept loop are the shared part; the health poller is
+  // this server's own, and stop() below still has to wake and join it.
   _running = true;
-  if (_config.startHealthPoller)
-  {
-    _healthThread = std::thread([this] { healthLoop(); });
-  }
-  _serverThread = std::thread([this] { _server->listen_after_bind(); });
-  _server->wait_until_ready();
+  if (_config.startHealthPoller) { _healthThread = std::thread([this] { healthLoop(); }); }
+  _boundPort = util::bindAndServe(*_server, _config.host, _config.port, _serverThread, "router");
 }
 
 void RouterServer::stop()

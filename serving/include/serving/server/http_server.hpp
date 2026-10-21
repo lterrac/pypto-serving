@@ -97,6 +97,9 @@ class HttpServer
 
   std::unique_ptr<httplib::Server> _server;
   std::thread                      _thread;
+  /// Exchanged by stop(), so a destructor and an explicit stop cannot both
+  /// join the same thread.
+  std::atomic<bool>                _serving{false};
   std::atomic<int>                 _boundPort{0};
 };
 

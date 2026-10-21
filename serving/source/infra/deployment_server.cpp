@@ -1,5 +1,7 @@
 #include <serving/infra/deployment_server.hpp>
 
+#include <serving/util/http_serving.hpp>
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -209,31 +211,10 @@ void DeploymentServer::registerRoutes()
 
 void DeploymentServer::start()
 {
-  if (_config.port == 0)
-  {
-    // bind_to_port(host, 0) reports success without saying which port the
-    // kernel chose; bind_to_any_port returns it.
-    const int port = _server->bind_to_any_port(_config.host.c_str());
-    if (port <= 0) { throw std::runtime_error("deployment server could not bind " + _config.host + " to an ephemeral port"); }
-    _boundPort.store(port);
-  }
-  else
-  {
-    if (!_server->bind_to_port(_config.host.c_str(), _config.port))
-    {
-      throw std::runtime_error("deployment server could not bind " + _config.host + ":" + std::to_string(_config.port));
-    }
-    _boundPort.store(_config.port);
-  }
-
-  _thread = std::thread([this] { _server->listen_after_bind(); });
-  _server->wait_until_ready();
+  _boundPort.store(util::bindAndServe(*_server, _config.host, _config.port, _thread, "deployment server"));
+  _serving = true;
 }
 
-void DeploymentServer::stop()
-{
-  if (_server) { _server->stop(); }
-  if (_thread.joinable()) { _thread.join(); }
-}
+void DeploymentServer::stop() { util::stopServing(_server.get(), _thread, _serving); }
 
 } // namespace serving::infra
