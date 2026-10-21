@@ -22,6 +22,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+
+#include <serving/util/lru_map.hpp>
 #include <string>
 #include <vector>
 
@@ -251,11 +253,6 @@ class DistributedRuleStrategy : public RoutingStrategy
   std::mutex            _outboxMutex;
   std::vector<Deferred> _outbox;
 
-  struct Standing
-  {
-    RoutingPath                      path;
-    std::list<std::string>::iterator position;
-  };
 
   RoutingPlanner &_planner;
   RuleTransport  &_transport;
@@ -263,11 +260,8 @@ class DistributedRuleStrategy : public RoutingStrategy
   /// A standing path is keyed by a client-supplied session id and reused for as
   /// long as it exists, so without a bound the map grows with the number of
   /// distinct ids a caller sends. Mirrors SessionDirectory's cap.
-  size_t                          _maxPaths;
-  std::map<std::string, Standing> _paths;
-  /// Least recently used at the front.
-  std::list<std::string> _order;
-  uint64_t               _epoch;
+  util::LruMap<RoutingPath> _paths;
+  uint64_t                  _epoch;
   uint32_t               _counter = 0;
   RoutingStats           _stats;
 };

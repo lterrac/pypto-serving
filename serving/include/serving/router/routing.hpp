@@ -18,6 +18,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <serving/util/lru_map.hpp>
 
 namespace serving::router
 {
@@ -86,7 +87,7 @@ class SessionDirectory
 
   explicit SessionDirectory(double ttlSeconds, Clock clock = {}, size_t maxSessions = DEFAULT_MAX_SESSIONS);
 
-  [[nodiscard]] size_t size() const { return _index.size(); }
+  [[nodiscard]] size_t size() const { return _pins.size(); }
 
   /// The pinned replica name, dropping the pin if it has expired.
   [[nodiscard]] std::optional<std::string> lookup(const std::string &sessionId);
@@ -116,17 +117,13 @@ class SessionDirectory
     double      lastSeen = 0.0;
   };
 
-  /// Most-recently pinned at the back, so eviction pops the front.
-  using Order = std::list<std::string>;
-
-  void touch(Order::iterator it);
-
   double _ttl;
   Clock  _clock;
-  size_t _max;
 
-  Order                                                              _order;
-  std::unordered_map<std::string, std::pair<Entry, Order::iterator>> _index;
+  /// Most-recently pinned at the back, so eviction drops the front. The TTL is
+  /// this directory's own policy and is applied before the bound: an expired
+  /// pin is reclaimed in preference to a live one.
+  util::LruMap<Entry> _pins;
 };
 
 /// Mutable routing state for one replica.

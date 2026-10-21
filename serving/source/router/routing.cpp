@@ -40,95 +40,63 @@ std::string newSessionId()
 SessionDirectory::SessionDirectory(double ttlSeconds, Clock clock, size_t maxSessions)
   : _ttl(ttlSeconds),
     _clock(clock ? std::move(clock) : Clock{monotonicSeconds}),
-    _max(maxSessions)
+    _pins(maxSessions)
 {
   if (ttlSeconds <= 0) { throw std::invalid_argument("ttl_seconds must be positive"); }
   if (maxSessions < 1) { throw std::invalid_argument("max_sessions must be positive"); }
 }
 
-void SessionDirectory::touch(Order::iterator it)
-{
-  // Move to the back: most recently pinned.
-  _order.splice(_order.end(), _order, it);
-}
-
 std::optional<std::string> SessionDirectory::lookup(const std::string &sessionId)
 {
-  const auto it = _index.find(sessionId);
-  if (it == _index.end()) { return std::nullopt; }
-  if (_clock() - it->second.first.lastSeen > _ttl)
+  const Entry *pin = _pins.peek(sessionId);
+  if (pin == nullptr) { return std::nullopt; }
+  if (_clock() - pin->lastSeen > _ttl)
   {
-    _order.erase(it->second.second);
-    _index.erase(it);
+    // Expired on the way past: a lookup is the cheapest moment to notice.
+    _pins.erase(sessionId);
     return std::nullopt;
   }
-  return it->second.first.replicaName;
+  // A live pin that was just used goes to the back.
+  (void)_pins.find(sessionId);
+  return pin->replicaName;
 }
 
 void SessionDirectory::pin(const std::string &sessionId, const std::string &replicaName)
 {
-  const auto it = _index.find(sessionId);
-  if (it != _index.end())
-  {
-    it->second.first = Entry{replicaName, _clock()};
-    touch(it->second.second);
-  }
-  else
-  {
-    _order.push_back(sessionId);
-    auto position     = std::prev(_order.end());
-    _index[sessionId] = {Entry{replicaName, _clock()}, position};
-  }
+  _pins.put(sessionId, Entry{replicaName, _clock()});
 
-  // Expired pins are reclaimed before anything live is evicted.
-  if (_index.size() > _max) { sweep(); }
-  while (_index.size() > _max)
-  {
-    const std::string evicted = _order.front();
-    _order.pop_front();
-    _index.erase(evicted);
-  }
+  // Expired pins are reclaimed before anything live is evicted: dropping a
+  // session that is still in use to make room for one that is not would
+  // unstick an active conversation from its replica.
+  if (_pins.size() > _pins.capacity()) { (void)sweep(); }
+  _pins.trim([](const std::string &, const Entry &) {});
 }
 
-void SessionDirectory::forget(const std::string &sessionId)
-{
-  const auto it = _index.find(sessionId);
-  if (it == _index.end()) { return; }
-  _order.erase(it->second.second);
-  _index.erase(it);
-}
+void SessionDirectory::forget(const std::string &sessionId) { _pins.erase(sessionId); }
 
 int SessionDirectory::forgetReplica(const std::string &replicaName)
 {
-  int dropped = 0;
-  for (auto it = _index.begin(); it != _index.end();)
+  std::vector<std::string> dropped;
+  for (const std::string &sessionId : _pins.keysInUseOrder())
   {
-    if (it->second.first.replicaName == replicaName)
-    {
-      _order.erase(it->second.second);
-      it = _index.erase(it);
-      dropped += 1;
-    }
-    else { ++it; }
+    const Entry *pin = _pins.peek(sessionId);
+    if (pin != nullptr && pin->replicaName == replicaName) { dropped.push_back(sessionId); }
   }
-  return dropped;
+  for (const std::string &sessionId : dropped) { _pins.erase(sessionId); }
+  return static_cast<int>(dropped.size());
 }
 
 int SessionDirectory::sweep()
 {
-  const double now     = _clock();
-  int          expired = 0;
-  for (auto it = _index.begin(); it != _index.end();)
+  const double             now = _clock();
+  std::vector<std::string> expired;
+  for (const std::string &sessionId : _pins.keysInUseOrder())
   {
-    if (now - it->second.first.lastSeen > _ttl)
-    {
-      _order.erase(it->second.second);
-      it = _index.erase(it);
-      expired += 1;
-    }
-    else { ++it; }
+    const Entry *pin = _pins.peek(sessionId);
+    if (pin != nullptr && now - pin->lastSeen > _ttl) { expired.push_back(sessionId); }
   }
-  return expired;
+  for (const std::string &sessionId : expired) { _pins.erase(sessionId); }
+  return static_cast<int>(expired.size());
 }
 
 // ---------------------------------------------------------------------------

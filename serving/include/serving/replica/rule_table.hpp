@@ -32,6 +32,7 @@
 #include <unordered_map>
 
 #include <serving/coordinator/rule_message.hpp>
+#include <serving/util/lru_map.hpp>
 
 namespace serving::replica
 {
@@ -106,7 +107,7 @@ class RuleTable
   [[nodiscard]] std::optional<NextHop> peek(const std::string &sessionId) const;
 
   [[nodiscard]] size_t size() const;
-  [[nodiscard]] size_t capacity() const { return _max; }
+  [[nodiscard]] size_t capacity() const { return _rules.capacity(); }
 
   /// Rules dropped because the table was full.
   [[nodiscard]] int evicted() const;
@@ -115,18 +116,11 @@ class RuleTable
 
   private:
 
-  using Order = std::list<std::string>;
-
-  void touch(Order::iterator it);
-
   /// Guards everything below. Mutable because `peek` reorders nothing but
   /// still reads state another thread may be rewriting.
   mutable std::mutex _mutex;
 
-  size_t                                                               _max;
-  Order                                                                _order;
-  std::unordered_map<std::string, std::pair<NextHop, Order::iterator>> _index;
-  int                                                                  _evicted = 0;
+  util::LruMap<NextHop> _rules;
 };
 
 } // namespace serving::replica

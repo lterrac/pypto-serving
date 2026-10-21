@@ -120,14 +120,13 @@ void CoordinatorIngressStrategy::onReplicaLost(const std::string &replicaName)
 DistributedRuleStrategy::DistributedRuleStrategy(RoutingPlanner &planner, RuleTransport &transport, size_t maxPaths, uint64_t epoch)
   : _planner(planner),
     _transport(transport),
-    _maxPaths(maxPaths == 0 ? 1 : maxPaths),
+    _paths(maxPaths),
     _epoch(epoch != 0 ? epoch : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()) & 0xFFFFFFFFULL)
 {}
 
 RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
 {
-  const auto existing = _paths.find(sessionId);
-  if (existing != _paths.end())
+  if (const RoutingPath *existing = _paths.peek(sessionId); existing != nullptr)
   {
     // The standing path is reused without consulting the planner. Routing
     // happens once per session -- that is what keeps the decision off the
@@ -137,16 +136,16 @@ RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
     // the whole life of the LRU entry. A drain issued before a rolling restart
     // then never converged, because the thing being drained was still being
     // sent work.
-    if (std::all_of(existing->second.path.hops.begin(), existing->second.path.hops.end(), [&](const ReplicaSpec &hop) { return _planner.routable(hop); }))
+    if (std::all_of(existing->hops.begin(), existing->hops.end(), [&](const ReplicaSpec &hop) { return _planner.routable(hop); }))
     {
-      _order.splice(_order.end(), _order, existing->second.position);
-      return existing->second.path;
+      // find() rather than peek(): reusing a path is a use, and counts.
+      return *_paths.find(sessionId);
     }
 
     // A hop has gone. Withdraw the rules published for it before planning
     // again, or the replicas holding them keep forwarding along a path this
     // coordinator has replaced.
-    defer(Deferred{true, {}, sessionId, {}, existing->second.path.generation});
+    defer(Deferred{true, {}, sessionId, {}, existing->generation});
     forget(sessionId);
     _stats.pathsInvalidated += 1;
   }
@@ -156,18 +155,10 @@ RoutingPath DistributedRuleStrategy::onRequest(const std::string &sessionId)
   path.generation  = makeGeneration(_epoch, ++_counter);
   publish(path);
 
-  while (_paths.size() >= _maxPaths && !_order.empty())
-  {
-    // Evicting without revoking would leave replicas forwarding along a path
-    // this coordinator no longer knows about.
-    const std::string oldest = _order.front();
-    const auto        it     = _paths.find(oldest);
-    if (it != _paths.end()) { defer(Deferred{true, {}, oldest, {}, it->second.path.generation}); }
-    forget(oldest);
-  }
-
-  const auto position = _order.insert(_order.end(), sessionId);
-  _paths.emplace(sessionId, Standing{path, position});
+  _paths.put(sessionId, path);
+  // Evicting without revoking would leave replicas forwarding along a path this
+  // coordinator no longer knows about.
+  _paths.trim([this](const std::string &dropped, const RoutingPath &gone) { defer(Deferred{true, {}, dropped, {}, gone.generation}); });
   return path;
 }
 
@@ -204,20 +195,14 @@ void DistributedRuleStrategy::flush()
   }
 }
 
-void DistributedRuleStrategy::forget(const std::string &sessionId)
-{
-  const auto it = _paths.find(sessionId);
-  if (it == _paths.end()) { return; }
-  _order.erase(it->second.position);
-  _paths.erase(it);
-}
+void DistributedRuleStrategy::forget(const std::string &sessionId) { _paths.erase(sessionId); }
 
 std::optional<RoutingPath> DistributedRuleStrategy::peek(const std::string &sessionId)
 {
-  const auto it = _paths.find(sessionId);
   // A standing path is reported as it stands, and the LRU order is deliberately
-  // left alone: looking at one session must not make another the next evicted.
-  if (it != _paths.end()) { return it->second.path; }
+  // left alone -- peek, not find: looking at one session must not make another
+  // the next evicted.
+  if (const RoutingPath *held = _paths.peek(sessionId); held != nullptr) { return *held; }
 
   // No standing path, so work out what this session would get -- but commit to
   // none of it. onRequest would bump the generation, publish a rule to every
@@ -251,15 +236,17 @@ void DistributedRuleStrategy::onReplicaLost(const std::string &replicaName)
   // replan -- the generation on the new rule is what lets a replica holding the
   // old one recognise it as stale.
   std::vector<std::string> affected;
-  for (const auto &[sessionId, standing] : _paths)
+  for (const std::string &sessionId : _paths.keysInUseOrder())
   {
-    const bool touches = std::any_of(standing.path.hops.begin(), standing.path.hops.end(), [&](const ReplicaSpec &hop) { return hop.name == replicaName; });
+    const RoutingPath *standing = _paths.peek(sessionId);
+    if (standing == nullptr) { continue; }
+    const bool touches = std::any_of(standing->hops.begin(), standing->hops.end(), [&](const ReplicaSpec &hop) { return hop.name == replicaName; });
     if (touches) { affected.push_back(sessionId); }
   }
 
   for (const std::string &sessionId : affected)
   {
-    defer(Deferred{true, {}, sessionId, {}, _paths.at(sessionId).path.generation});
+    if (const RoutingPath *standing = _paths.peek(sessionId); standing != nullptr) { defer(Deferred{true, {}, sessionId, {}, standing->generation}); }
     forget(sessionId);
     _stats.pathsInvalidated += 1;
   }
