@@ -418,3 +418,50 @@ TEST(EngineTest, GeneratesDistinctRequestIds)
   EXPECT_EQ(engine.generateRequestId(), "serving-req-1");
   EXPECT_EQ(engine.generateRequestId(), "serving-req-2");
 }
+
+TEST(EngineTest, AStepThatNeverReturnsIsUnhealthyWhileStillBeingReady)
+{
+  const CharTokenizer tokenizer;
+  ScriptedExecutor    executor({'a', 'b', 'c'});
+  executor.promptLength = 2;
+
+  EngineConfig config    = makeConfig();
+  // Far below any real step, so the test does not have to wait one out.
+  config.stepStallSeconds = 0.05;
+
+  Engine engine(config, tokenizer, executor);
+  engine.start();
+
+  // Healthy with nothing to do: an idle engine has made no progress either, and
+  // calling that stalled would have every idle replica rebuilt.
+  EXPECT_TRUE(engine.isHealthy());
+  EXPECT_DOUBLE_EQ(engine.stepElapsedSeconds(), 0.0);
+
+  // Now wedge the executor, which is where a hung kernel leaves the loop.
+  executor.blockMilliseconds.store(400);
+  const auto stream = engine.addRequest("r", {'h', 'i'}, serving::config::GenerateConfig{});
+
+  // The loop thread is blocked inside the step, not gone: the old check asked
+  // only whether the thread existed and so answered 200 for ever.
+  bool sawStalled = false;
+  for (int waited = 0; waited < 200 && !sawStalled; ++waited)
+  {
+    if (engine.isReady() && !engine.isHealthy()) { sawStalled = true; }
+    else { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+  }
+  EXPECT_TRUE(sawStalled) << "a step outstanding past the deadline still reported healthy";
+  EXPECT_TRUE(engine.isReady()) << "the engine is wedged, not down -- isReady should still say it is up";
+
+  // And it recovers on its own once steps come back.
+  executor.blockMilliseconds.store(0);
+  bool recovered = false;
+  for (int waited = 0; waited < 200 && !recovered; ++waited)
+  {
+    if (engine.isHealthy()) { recovered = true; }
+    else { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+  }
+  EXPECT_TRUE(recovered) << "the engine never reported healthy again after the steps resumed";
+
+  engine.abortRequest("r");
+  engine.stop();
+}

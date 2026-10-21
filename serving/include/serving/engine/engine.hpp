@@ -58,6 +58,16 @@ struct EngineConfig
 
   /// How long the engine thread waits when there is nothing to do.
   int idlePollMicroseconds = 200;
+
+  /// How long a step may take before the engine calls itself stalled.
+  ///
+  /// Liveness needs a progress signal, not a pulse: a kernel or collective that
+  /// hangs blocks the loop thread without it exiting, so a check that asks only
+  /// whether the thread exists answers yes for ever and nothing rebuilds the
+  /// replica. Measured only against scheduled work -- an idle engine is healthy,
+  /// however long it has been idle -- and set well above the longest legitimate
+  /// step, because declaring a slow prefill dead is worse than the hang.
+  double stepStallSeconds = 300.0;
 };
 
 class Engine
@@ -75,8 +85,18 @@ class Engine
 
   void stop();
 
-  /// Whether the engine is up and its loop alive -- what /health reports.
+  /// Whether the engine is up and its loop alive.
   [[nodiscard]] bool isReady() const;
+
+  /// Seconds the current step has been outstanding, or 0 when the engine is
+  /// idle or between steps. A step is outstanding from the moment it is handed
+  /// to the executor until its result comes back.
+  [[nodiscard]] double stepElapsedSeconds() const;
+
+  /// Up, and getting somewhere -- what /health reports. False when a step has
+  /// been outstanding longer than `stepStallSeconds`: the loop is alive but
+  /// wedged, which is the state a liveness check exists to find.
+  [[nodiscard]] bool isHealthy() const;
 
   /// Admit a prompt that the caller has already tokenized.
   std::shared_ptr<RequestStream> addRequest(const std::string &requestId, const std::vector<int> &promptTokenIds, const config::GenerateConfig &generateConfig);
@@ -141,6 +161,11 @@ class Engine
   std::atomic<bool> _loopAlive{false};
   std::atomic<int>  _preemptions{0};
   std::atomic<int>  _requestCounter{0};
+
+  /// When the step now in flight was handed to the executor, as steady-clock
+  /// seconds; 0 when no step is outstanding. Written by the engine thread,
+  /// read by whichever thread is answering /health.
+  std::atomic<double> _stepStartedAt{0.0};
 };
 
 } // namespace serving::engine

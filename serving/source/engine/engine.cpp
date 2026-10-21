@@ -1,5 +1,6 @@
 #include <serving/engine/engine.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 
@@ -69,7 +70,32 @@ void Engine::stop()
   _executor.close();
 }
 
+namespace
+{
+
+/// Steady-clock seconds. Monotonic, so a wall-clock adjustment cannot make a
+/// step look as though it finished before it started.
+double steadySeconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+} // namespace
+
 bool Engine::isReady() const { return _started.load() && _running.load() && _loopAlive.load(); }
+
+double Engine::stepElapsedSeconds() const
+{
+  const double startedAt = _stepStartedAt.load();
+  if (startedAt <= 0.0) { return 0.0; }
+  return std::max(0.0, steadySeconds() - startedAt);
+}
+
+bool Engine::isHealthy() const
+{
+  if (!isReady()) { return false; }
+  // Only a step that is actually outstanding counts against the deadline. An
+  // engine with nothing to do has made no progress either, and calling that
+  // unhealthy would have every idle replica rebuilt.
+  return _config.stepStallSeconds <= 0.0 || stepElapsedSeconds() <= _config.stepStallSeconds;
+}
 
 std::string Engine::generateRequestId() { return "serving-req-" + std::to_string(++_requestCounter); }
 
@@ -196,7 +222,12 @@ void Engine::runOneStep()
   }
 
   const StepCommand command = buildStepCommand(output);
-  const StepResult  result  = _executor.executeStep(command);
+  // Marked before the call and cleared after it, so the window measured is
+  // exactly the one that can hang: the executor, which is where a wedged
+  // kernel or a collective that never returns leaves the loop thread blocked.
+  _stepStartedAt.store(steadySeconds());
+  const StepResult result = _executor.executeStep(command);
+  _stepStartedAt.store(0.0);
 
   if (!result.error.empty())
   {

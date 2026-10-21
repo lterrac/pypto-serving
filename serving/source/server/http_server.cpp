@@ -311,6 +311,16 @@ void HttpServer::registerRoutes()
       sendJson(response, json{{"status", "not_ready"}}, 503);
       return;
     }
+    // Up is not the same as working. A hung kernel leaves the loop thread
+    // blocked without it exiting, so a check that asks only whether the engine
+    // exists answers 200 for ever and the monitor never marks the replica
+    // dead -- the recovery path then never runs, and every request pinned here
+    // waits out its full timeout instead.
+    if (!_engine.isHealthy())
+    {
+      sendJson(response, json{{"status", "stalled"}, {"step_seconds", _engine.stepElapsedSeconds()}}, 503);
+      return;
+    }
     sendJson(response, json{{"status", "ok"}});
   });
 
