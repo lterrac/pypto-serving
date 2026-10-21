@@ -51,18 +51,21 @@ artifacts such as `build_output/`, caches, and compiled files out of commits.
 
 ## NPU Verification
 
-Device verification usually runs through `task-submit`. Preserve the runtime
-environment variables used by the examples unless the task explicitly changes
-them:
+Device verification usually runs through `task-submit`:
 
 ```bash
 task-submit --device auto --max-time 0 --run \
-  "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
-  pypto-serving --model /data/linyifan/models/Qwen3-14B \
+  "pypto-serving --model /data/linyifan/models/Qwen3-14B \
     --prompt 'Huawei is' \
     --platform a2a3 \
     --max-model-len 512 \
     --generate-config '{\"max_new_tokens\": 5}'"
 ```
+
+The `PTO2_RING_HEAP`, `PTO2_RING_TASK_WINDOW` and `PTO2_RING_DEP_POOL` this
+command used to set are retired: the runtime lists all three in `kRetired` and
+warns that they are no longer read (`runtime_maker.cpp`). Ring sizes are per
+task now, through `CallConfig.runtime_env`. Setting them does nothing but
+print a warning per run.
 
 Use `--profile` for timing reports.
