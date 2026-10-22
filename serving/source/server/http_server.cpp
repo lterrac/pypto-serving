@@ -145,8 +145,11 @@ HttpServer::~HttpServer() { stop(); }
 
 void HttpServer::start()
 {
-  _boundPort = util::bindAndServe(*_server, _config.host, _config.port, _thread, "serving");
+  // Set before the bind, as RouterServer does: a stop() arriving between the
+  // accept thread starting and the flag being set would return without
+  // joining it, and the destructor would then be left a joinable thread.
   _serving   = true;
+  _boundPort = util::bindAndServe(*_server, _config.host, _config.port, _thread, "serving");
 }
 
 void HttpServer::stop() { util::stopServing(_server.get(), _thread, _serving); }

@@ -211,8 +211,9 @@ void DeploymentServer::registerRoutes()
 
 void DeploymentServer::start()
 {
-  _boundPort.store(util::bindAndServe(*_server, _config.host, _config.port, _thread, "deployment server"));
+  // Set before the bind, for the reason given in HttpServer::start.
   _serving = true;
+  _boundPort.store(util::bindAndServe(*_server, _config.host, _config.port, _thread, "deployment server"));
 }
 
 void DeploymentServer::stop() { util::stopServing(_server.get(), _thread, _serving); }
